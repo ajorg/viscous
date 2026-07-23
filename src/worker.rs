@@ -19,7 +19,7 @@ use crate::{
 };
 
 /// A camera action requested by the UI.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Intent {
     /// Nudge pan/tilt in a direction by the given number of degrees.
     NudgePanTilt(NudgeDirection, f64),
