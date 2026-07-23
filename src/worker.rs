@@ -15,6 +15,7 @@ use crate::{
     focus::{self, FocusDirection},
     pan_tilt::{self, NudgeDirection},
     preset,
+    state::{self, CameraState},
     zoom::{self, ZoomDirection},
 };
 
@@ -31,25 +32,42 @@ pub enum Intent {
     RecallPreset(u8),
     /// Save the current position to the given 1-based preset number.
     SavePreset(u8),
+    /// Query the camera's current pan/tilt/zoom/focus/power state.
+    QueryState,
 }
 
-fn dispatch<T>(camera: &BlockingClient<GenericVisca, T>, intent: Intent) -> Result<(), Error>
+/// The result of dispatching an [`Intent`], carrying data back for
+/// `QueryState` rather than just success/failure.
+#[derive(Debug)]
+pub enum Outcome {
+    /// A command intent completed (or failed) with no data to report.
+    Done(Result<(), Error>),
+    /// A `QueryState` intent completed (or failed).
+    State(Result<CameraState, Error>),
+}
+
+fn dispatch<T>(camera: &BlockingClient<GenericVisca, T>, intent: Intent) -> Outcome
 where
     T: BlockingTransport + HasTransportConfig + 'static,
 {
     match intent {
         Intent::NudgePanTilt(direction, degrees) => {
-            pan_tilt::nudge_pan_tilt(camera, direction, degrees)
+            Outcome::Done(pan_tilt::nudge_pan_tilt(camera, direction, degrees))
         }
-        Intent::NudgeZoom(direction, duration) => zoom::nudge_zoom(camera, direction, duration),
-        Intent::NudgeFocus(direction, duration) => focus::nudge_focus(camera, direction, duration),
-        Intent::RecallPreset(number) => preset::recall_preset(camera, number),
-        Intent::SavePreset(number) => preset::save_preset(camera, number),
+        Intent::NudgeZoom(direction, duration) => {
+            Outcome::Done(zoom::nudge_zoom(camera, direction, duration))
+        }
+        Intent::NudgeFocus(direction, duration) => {
+            Outcome::Done(focus::nudge_focus(camera, direction, duration))
+        }
+        Intent::RecallPreset(number) => Outcome::Done(preset::recall_preset(camera, number)),
+        Intent::SavePreset(number) => Outcome::Done(preset::save_preset(camera, number)),
+        Intent::QueryState => Outcome::State(state::query_state(camera)),
     }
 }
 
 /// Runs camera intents received from `intents` against `camera` until the
-/// channel closes, sending each command's result to `results`.
+/// channel closes, sending each command's outcome to `results`.
 ///
 /// Intended to run on its own thread, started once per connected camera, so
 /// a slow completion round trip never blocks the UI thread. Stops early if
@@ -57,13 +75,13 @@ where
 pub fn run<T>(
     camera: &BlockingClient<GenericVisca, T>,
     intents: &Receiver<Intent>,
-    results: &Sender<Result<(), Error>>,
+    results: &Sender<Outcome>,
 ) where
     T: BlockingTransport + HasTransportConfig + 'static,
 {
     for intent in intents {
-        let result = dispatch(camera, intent);
-        if results.send(result).is_err() {
+        let outcome = dispatch(camera, intent);
+        if results.send(outcome).is_err() {
             break;
         }
     }
@@ -98,11 +116,11 @@ mod tests {
         run(&camera, &intent_rx, &result_tx);
 
         assert!(
-            result_rx.recv().unwrap().is_ok(),
+            matches!(result_rx.recv().unwrap(), Outcome::Done(Ok(()))),
             "preset recall should succeed"
         );
         assert!(
-            result_rx.recv().unwrap().is_ok(),
+            matches!(result_rx.recv().unwrap(), Outcome::Done(Ok(()))),
             "zoom nudge should succeed"
         );
         assert!(result_rx.try_recv().is_err(), "no further results expected");
@@ -128,12 +146,33 @@ mod tests {
         run(&camera, &intent_rx, &result_tx);
 
         assert!(
-            result_rx.recv().unwrap().is_err(),
+            matches!(result_rx.recv().unwrap(), Outcome::Done(Err(_))),
             "first command was scripted to fail"
         );
         assert!(
-            result_rx.recv().unwrap().is_ok(),
+            matches!(result_rx.recv().unwrap(), Outcome::Done(Ok(()))),
             "second command should still run"
         );
+    }
+
+    #[test]
+    fn query_state_intent_reports_state() {
+        let transport = ScriptedBlockingTransport::new(vec![
+            helpers::power_inquiry_response(true),
+            helpers::errors::syntax_error(1), // next inquiry: fine to fail, we just want Outcome::State
+        ]);
+        let camera = grafton_visca::CameraBuilder::new()
+            .build_blocking::<GenericVisca, _>(transport)
+            .expect("camera should build from a scripted transport");
+
+        let (intent_tx, intent_rx) = channel();
+        let (result_tx, result_rx) = channel();
+
+        intent_tx.send(Intent::QueryState).unwrap();
+        drop(intent_tx);
+
+        run(&camera, &intent_rx, &result_tx);
+
+        assert!(matches!(result_rx.recv().unwrap(), Outcome::State(_)));
     }
 }
