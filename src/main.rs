@@ -1,7 +1,7 @@
 use std::process::ExitCode;
 
 use grafton_visca::camera::{Connect, profiles::GenericVisca};
-use viscous::{
+use viscous::connection::{
     DEFAULT_CAMERA_BAUD_RATES, ProbeOutcome, discover_baud_rate, format_version, query_version,
 };
 
