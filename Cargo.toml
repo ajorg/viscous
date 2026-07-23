@@ -6,3 +6,7 @@ description = "A keyboard-driven TUI for controlling a VISCA PTZ camera over ser
 license = "0BSD"
 
 [dependencies]
+grafton-visca = { version = "1.0.0", features = ["transport-serial"] }
+
+[dev-dependencies]
+grafton-visca = { version = "1.0.0", features = ["test-utils"] }
