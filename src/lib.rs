@@ -8,5 +8,6 @@ pub mod keymap;
 pub mod pan_tilt;
 pub mod preset;
 pub mod state;
+pub mod ui;
 pub mod worker;
 pub mod zoom;
