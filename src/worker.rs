@@ -37,11 +37,12 @@ pub enum Intent {
 }
 
 /// The result of dispatching an [`Intent`], carrying data back for
-/// `QueryState` rather than just success/failure.
+/// `QueryState` rather than just success/failure, and the originating
+/// intent for the others so the UI can describe what happened.
 #[derive(Debug)]
 pub enum Outcome {
     /// A command intent completed (or failed) with no data to report.
-    Done(Result<(), Error>),
+    Done(Intent, Result<(), Error>),
     /// A `QueryState` intent completed (or failed).
     State(Result<CameraState, Error>),
 }
@@ -52,16 +53,18 @@ where
 {
     match intent {
         Intent::NudgePanTilt(direction, degrees) => {
-            Outcome::Done(pan_tilt::nudge_pan_tilt(camera, direction, degrees))
+            Outcome::Done(intent, pan_tilt::nudge_pan_tilt(camera, direction, degrees))
         }
         Intent::NudgeZoom(direction, duration) => {
-            Outcome::Done(zoom::nudge_zoom(camera, direction, duration))
+            Outcome::Done(intent, zoom::nudge_zoom(camera, direction, duration))
         }
         Intent::NudgeFocus(direction, duration) => {
-            Outcome::Done(focus::nudge_focus(camera, direction, duration))
+            Outcome::Done(intent, focus::nudge_focus(camera, direction, duration))
         }
-        Intent::RecallPreset(number) => Outcome::Done(preset::recall_preset(camera, number)),
-        Intent::SavePreset(number) => Outcome::Done(preset::save_preset(camera, number)),
+        Intent::RecallPreset(number) => {
+            Outcome::Done(intent, preset::recall_preset(camera, number))
+        }
+        Intent::SavePreset(number) => Outcome::Done(intent, preset::save_preset(camera, number)),
         Intent::QueryState => Outcome::State(state::query_state(camera)),
     }
 }
@@ -116,11 +119,11 @@ mod tests {
         run(&camera, &intent_rx, &result_tx);
 
         assert!(
-            matches!(result_rx.recv().unwrap(), Outcome::Done(Ok(()))),
+            matches!(result_rx.recv().unwrap(), Outcome::Done(_, Ok(()))),
             "preset recall should succeed"
         );
         assert!(
-            matches!(result_rx.recv().unwrap(), Outcome::Done(Ok(()))),
+            matches!(result_rx.recv().unwrap(), Outcome::Done(_, Ok(()))),
             "zoom nudge should succeed"
         );
         assert!(result_rx.try_recv().is_err(), "no further results expected");
@@ -146,11 +149,11 @@ mod tests {
         run(&camera, &intent_rx, &result_tx);
 
         assert!(
-            matches!(result_rx.recv().unwrap(), Outcome::Done(Err(_))),
+            matches!(result_rx.recv().unwrap(), Outcome::Done(_, Err(_))),
             "first command was scripted to fail"
         );
         assert!(
-            matches!(result_rx.recv().unwrap(), Outcome::Done(Ok(()))),
+            matches!(result_rx.recv().unwrap(), Outcome::Done(_, Ok(()))),
             "second command should still run"
         );
     }
