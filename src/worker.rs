@@ -73,6 +73,14 @@ pub fn describe_outcome(outcome: &Outcome) -> String {
     }
 }
 
+/// A short "in progress" description of an intent, shown as soon as it's
+/// sent — before its ACK or Completion is known — so a slow command (a
+/// preset recall can legitimately take tens of seconds) doesn't look like
+/// nothing happened.
+pub fn describe_busy(intent: Intent) -> String {
+    format!("{}...", describe(intent))
+}
+
 fn direction_label(direction: NudgeDirection) -> &'static str {
     match direction {
         NudgeDirection::Up => "up",
@@ -230,6 +238,11 @@ mod tests {
     fn describe_distinguishes_save_from_recall() {
         assert_eq!(describe(Intent::RecallPreset(2)), "recall preset 2");
         assert_eq!(describe(Intent::SavePreset(2)), "save preset 2");
+    }
+
+    #[test]
+    fn describe_busy_marks_the_intent_as_in_progress() {
+        assert_eq!(describe_busy(Intent::RecallPreset(2)), "recall preset 2...");
     }
 
     fn sample_camera_state() -> CameraState {

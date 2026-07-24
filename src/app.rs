@@ -70,6 +70,7 @@ pub fn run(
                 match keymap::map_key(key) {
                     Some(Action::Quit) => return Ok(()),
                     Some(Action::Camera(intent)) => {
+                        state.status = Some(worker::describe_busy(intent));
                         let _ = intents.send(intent);
                         pending_state_query = true;
                         last_command_at = Instant::now();
