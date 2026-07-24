@@ -27,6 +27,16 @@ use crate::{
     worker::{self, Intent, Outcome},
 };
 
+/// Writes one line of output ending in an explicit `\r\n`.
+///
+/// Raw mode (needed for single-keystroke reads) disables the terminal's
+/// usual `\n` → `\r\n` translation on output too, so a bare `writeln!` would
+/// move the cursor down without returning it to the start of the line —
+/// each subsequent line staircasing further right than the last.
+fn write_line(stdout: &mut impl Write, text: &str) -> io::Result<()> {
+    write!(stdout, "{text}\r\n")
+}
+
 /// Runs the bare command loop: prints `connection_summary` and the key
 /// legend once, then reads and acts on keystrokes until the quit key or the
 /// worker thread goes away.
@@ -36,8 +46,8 @@ pub fn run(
     intents: &Sender<Intent>,
     results: &Receiver<Outcome>,
 ) -> io::Result<()> {
-    writeln!(stdout, "{connection_summary}")?;
-    writeln!(stdout, "{KEY_LEGEND}")?;
+    write_line(stdout, connection_summary)?;
+    write_line(stdout, KEY_LEGEND)?;
 
     enable_raw_mode()?;
     let result = run_loop(stdout, intents, results);
@@ -70,7 +80,7 @@ fn run_loop(
 
         loop {
             match results.try_recv() {
-                Ok(outcome) => writeln!(stdout, "{}", worker::describe_outcome(&outcome))?,
+                Ok(outcome) => write_line(stdout, &worker::describe_outcome(&outcome))?,
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => return Ok(()),
             }
@@ -80,5 +90,17 @@ fn run_loop(
             let _ = intents.send(Intent::QueryState);
             pending_state_query = false;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn write_line_terminates_with_a_full_carriage_return_and_newline() {
+        let mut stdout = Vec::new();
+        write_line(&mut stdout, "hello").unwrap();
+        assert_eq!(stdout, b"hello\r\n");
     }
 }
