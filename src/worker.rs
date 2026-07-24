@@ -47,6 +47,33 @@ pub enum Outcome {
     State(Result<CameraState, Error>),
 }
 
+/// A short human description of an intent, for status/log messages.
+pub fn describe(intent: Intent) -> String {
+    match intent {
+        Intent::NudgePanTilt(direction, _) => format!("pan/tilt {}", direction_label(direction)),
+        Intent::NudgeZoom(ZoomDirection::In, _) => "zoom in".to_string(),
+        Intent::NudgeZoom(ZoomDirection::Out, _) => "zoom out".to_string(),
+        Intent::NudgeFocus(FocusDirection::Near, _) => "focus near".to_string(),
+        Intent::NudgeFocus(FocusDirection::Far, _) => "focus far".to_string(),
+        Intent::RecallPreset(number) => format!("recall preset {number}"),
+        Intent::SavePreset(number) => format!("save preset {number}"),
+        Intent::QueryState => "state query".to_string(),
+    }
+}
+
+fn direction_label(direction: NudgeDirection) -> &'static str {
+    match direction {
+        NudgeDirection::Up => "up",
+        NudgeDirection::Down => "down",
+        NudgeDirection::Left => "left",
+        NudgeDirection::Right => "right",
+        NudgeDirection::UpLeft => "up-left",
+        NudgeDirection::UpRight => "up-right",
+        NudgeDirection::DownLeft => "down-left",
+        NudgeDirection::DownRight => "down-right",
+    }
+}
+
 fn dispatch<T>(camera: &BlockingClient<GenericVisca, T>, intent: Intent) -> Outcome
 where
     T: BlockingTransport + HasTransportConfig + 'static,
@@ -177,5 +204,19 @@ mod tests {
         run(&camera, &intent_rx, &result_tx);
 
         assert!(matches!(result_rx.recv().unwrap(), Outcome::State(_)));
+    }
+
+    #[test]
+    fn describe_names_the_pan_tilt_direction() {
+        assert_eq!(
+            describe(Intent::NudgePanTilt(NudgeDirection::UpRight, 2.0)),
+            "pan/tilt up-right"
+        );
+    }
+
+    #[test]
+    fn describe_distinguishes_save_from_recall() {
+        assert_eq!(describe(Intent::RecallPreset(2)), "recall preset 2");
+        assert_eq!(describe(Intent::SavePreset(2)), "save preset 2");
     }
 }

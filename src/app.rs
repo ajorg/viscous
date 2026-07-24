@@ -11,30 +11,31 @@ use grafton_visca::Error;
 use ratatui::DefaultTerminal;
 
 use crate::{
-    focus::FocusDirection,
     keymap::{self, Action},
-    pan_tilt::NudgeDirection,
     state,
     ui::{self, AppState, Connection},
-    worker::{Intent, Outcome},
-    zoom::ZoomDirection,
+    worker::{self, Intent, Outcome},
 };
 
 /// How long to wait for a key event before checking on worker results and
-/// the state-refresh timer.
+/// the quiescence timer.
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-/// How often to request a fresh camera state snapshot.
-const STATE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+/// How long to wait after the most recent camera-changing command before
+/// requesting a fresh state snapshot. Debounces a burst of nudges (e.g.
+/// holding a key down) into a single query once movement actually stops,
+/// rather than polling on a fixed interval regardless of whether anything
+/// changed.
+const QUIESCENCE_INTERVAL: Duration = Duration::from_millis(300);
 
 /// Applies one worker [`Outcome`] to `state`.
 fn apply_outcome(state: &mut AppState, outcome: Outcome) {
     match outcome {
         Outcome::Done(intent, Ok(())) => {
-            state.status = Some(format!("OK: {}", describe(intent)));
+            state.status = Some(format!("OK: {}", worker::describe(intent)));
         }
         Outcome::Done(intent, Err(error)) => {
-            state.status = Some(format!("error ({}): {error}", describe(intent)));
+            state.status = Some(format!("error ({}): {error}", worker::describe(intent)));
         }
         Outcome::State(Ok(camera_state)) => {
             state.camera_state = Some(state::format_state(&camera_state));
@@ -42,33 +43,6 @@ fn apply_outcome(state: &mut AppState, outcome: Outcome) {
         Outcome::State(Err(error)) => {
             state.status = Some(format!("state query failed: {error}"));
         }
-    }
-}
-
-/// A short human description of an intent, for status messages.
-fn describe(intent: Intent) -> String {
-    match intent {
-        Intent::NudgePanTilt(direction, _) => format!("pan/tilt {}", direction_label(direction)),
-        Intent::NudgeZoom(ZoomDirection::In, _) => "zoom in".to_string(),
-        Intent::NudgeZoom(ZoomDirection::Out, _) => "zoom out".to_string(),
-        Intent::NudgeFocus(FocusDirection::Near, _) => "focus near".to_string(),
-        Intent::NudgeFocus(FocusDirection::Far, _) => "focus far".to_string(),
-        Intent::RecallPreset(number) => format!("recall preset {number}"),
-        Intent::SavePreset(number) => format!("save preset {number}"),
-        Intent::QueryState => "state query".to_string(),
-    }
-}
-
-fn direction_label(direction: NudgeDirection) -> &'static str {
-    match direction {
-        NudgeDirection::Up => "up",
-        NudgeDirection::Down => "down",
-        NudgeDirection::Left => "left",
-        NudgeDirection::Right => "right",
-        NudgeDirection::UpLeft => "up-left",
-        NudgeDirection::UpRight => "up-right",
-        NudgeDirection::DownLeft => "down-left",
-        NudgeDirection::DownRight => "down-right",
     }
 }
 
@@ -84,7 +58,11 @@ pub fn run(
         connection,
         ..AppState::default()
     };
-    let mut last_refresh = Instant::now() - STATE_REFRESH_INTERVAL;
+    // Query once up front so the info panel doesn't sit on "(no state yet)"
+    // until the first command; `elapsed() >= QUIESCENCE_INTERVAL` is already
+    // true on the first loop iteration below.
+    let mut pending_state_query = true;
+    let mut last_command_at = Instant::now() - QUIESCENCE_INTERVAL;
 
     loop {
         terminal
@@ -100,6 +78,8 @@ pub fn run(
                     Some(Action::Quit) => return Ok(()),
                     Some(Action::Camera(intent)) => {
                         let _ = intents.send(intent);
+                        pending_state_query = true;
+                        last_command_at = Instant::now();
                     }
                     None => {}
                 }
@@ -114,9 +94,9 @@ pub fn run(
             }
         }
 
-        if last_refresh.elapsed() >= STATE_REFRESH_INTERVAL {
+        if pending_state_query && last_command_at.elapsed() >= QUIESCENCE_INTERVAL {
             let _ = intents.send(Intent::QueryState);
-            last_refresh = Instant::now();
+            pending_state_query = false;
         }
     }
 }
@@ -124,6 +104,7 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::zoom::ZoomDirection;
     use grafton_visca::camera::PanTiltPosition;
     use grafton_visca::types::{FocusPosition, ZoomPosition};
 
@@ -175,19 +156,5 @@ mod tests {
         let mut state = AppState::default();
         apply_outcome(&mut state, Outcome::State(Err(Error::Timeout)));
         assert!(state.status.unwrap().contains("state query failed"));
-    }
-
-    #[test]
-    fn describe_names_the_pan_tilt_direction() {
-        assert_eq!(
-            describe(Intent::NudgePanTilt(NudgeDirection::UpRight, 2.0)),
-            "pan/tilt up-right"
-        );
-    }
-
-    #[test]
-    fn describe_distinguishes_save_from_recall() {
-        assert_eq!(describe(Intent::RecallPreset(2)), "recall preset 2");
-        assert_eq!(describe(Intent::SavePreset(2)), "save preset 2");
     }
 }
