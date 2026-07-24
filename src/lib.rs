@@ -1,6 +1,7 @@
 //! Core logic for the viscous VISCA camera control TUI.
 
 pub mod app;
+pub mod cli;
 pub mod config;
 pub mod connection;
 pub mod drive;

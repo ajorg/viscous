@@ -1,10 +1,11 @@
+use std::io::{self, IsTerminal};
 use std::process::ExitCode;
 use std::sync::mpsc::channel;
 use std::thread;
 
 use grafton_visca::camera::{Connect, profiles::GenericVisca};
 use viscous::{
-    app,
+    app, cli,
     connection::{
         DEFAULT_CAMERA_BAUD_RATES, ProbeOutcome, discover_baud_rate, format_version, query_version,
     },
@@ -12,9 +13,24 @@ use viscous::{
     worker,
 };
 
+/// Parses `viscous [--cli] <serial-port>`, returning whether bare CLI mode
+/// was explicitly requested and the port path.
+fn parse_args(args: impl Iterator<Item = String>) -> Option<(bool, String)> {
+    let mut cli_requested = false;
+    let mut port = None;
+    for arg in args {
+        if arg == "--cli" {
+            cli_requested = true;
+        } else if port.is_none() {
+            port = Some(arg);
+        }
+    }
+    Some((cli_requested, port?))
+}
+
 fn main() -> ExitCode {
-    let Some(port) = std::env::args().nth(1) else {
-        eprintln!("usage: viscous <serial-port>");
+    let Some((cli_requested, port)) = parse_args(std::env::args().skip(1)) else {
+        eprintln!("usage: viscous [--cli] <serial-port>");
         return ExitCode::FAILURE;
     };
 
@@ -51,14 +67,40 @@ fn main() -> ExitCode {
         worker::run(&camera, &intent_rx, &result_tx);
     });
 
-    let connection = Connection::Connected {
-        baud_rate,
-        version: format_version(&version),
-    };
+    let connection_summary = format!(
+        "Connected at {baud_rate} baud \u{2014} {}",
+        format_version(&version)
+    );
 
-    let mut terminal = ratatui::init();
-    let app_result = app::run(&mut terminal, connection, &intent_tx, &result_rx);
-    ratatui::restore();
+    // Fall back to the bare line-oriented mode whenever a full-screen TUI
+    // isn't meaningful to draw (no controlling terminal on either side, as
+    // with piped or redirected stdio) or wasn't wanted (`--cli`, for
+    // scripted verification).
+    let use_bare_cli = cli_requested || !(io::stdin().is_terminal() && io::stdout().is_terminal());
+
+    let app_result = if use_bare_cli {
+        let stdin = io::stdin();
+        let mut stdin = stdin.lock();
+        let stdout = io::stdout();
+        let mut stdout = stdout.lock();
+        cli::run(
+            &mut stdout,
+            &mut stdin,
+            &connection_summary,
+            &intent_tx,
+            &result_rx,
+        )
+        .map_err(|error| grafton_visca::Error::TransportError(error.to_string().into()))
+    } else {
+        let connection = Connection::Connected {
+            baud_rate,
+            version: format_version(&version),
+        };
+        let mut terminal = ratatui::init();
+        let result = app::run(&mut terminal, connection, &intent_tx, &result_rx);
+        ratatui::restore();
+        result
+    };
 
     drop(intent_tx);
     let _ = worker_handle.join();
