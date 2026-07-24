@@ -1,84 +1,28 @@
-//! A bare, line-oriented command mode for when a full-screen TUI isn't
-//! available (piped stdin/stdout, no controlling terminal) or isn't wanted
-//! (scripted verification with a tool like `expect`).
+//! A bare command mode for when the TUI's full-screen redraws are more than
+//! you want to parse from a script (e.g. driving `viscous` over an
+//! `expect`-controlled pseudoterminal).
 //!
-//! Prints the available commands once, then repeatedly reads a line, sends
-//! the corresponding camera intent, and prints the result — the command's
-//! own outcome, followed by the camera's resulting state for anything that
-//! isn't already a state query itself.
+//! Reads the exact same single-keystroke input as the TUI — see
+//! [`keymap`](crate::keymap) — but skips the full-screen rendering: each
+//! command's result is just printed as a plain line of text, so the session
+//! reads as a linear transcript instead of a redrawn frame. Like the TUI,
+//! this needs a real controlling terminal on stdin, since raw mode reads
+//! individual keystrokes without waiting for Enter; it's an alternative to
+//! the full-screen UI, not a way to drive the camera with no terminal at
+//! all.
 
-use std::io::{self, BufRead, Write};
+use std::io::{self, Write};
 use std::sync::mpsc::{Receiver, Sender};
 
+use crossterm::event::{self, Event, KeyEvent};
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+
 use crate::{
-    focus::{FAST_FOCUS_NUDGE_DURATION, FOCUS_NUDGE_DURATION, FocusDirection},
-    pan_tilt::{FAST_NUDGE_DEGREES, NUDGE_DEGREES, NudgeDirection},
+    keymap::{self, Action},
     state,
+    ui::KEY_LEGEND,
     worker::{self, Intent, Outcome},
-    zoom::{FAST_ZOOM_NUDGE_DURATION, ZOOM_NUDGE_DURATION, ZoomDirection},
 };
-
-pub const COMMAND_HELP: &str = "\
-Commands:
-  up, down, left, right                       pan/tilt nudge
-  fast-up, fast-down, fast-left, fast-right    fast pan/tilt nudge
-  zoom-in, zoom-out                            zoom nudge
-  fast-zoom-in, fast-zoom-out                  fast zoom nudge
-  focus-near, focus-far                        focus nudge
-  fast-focus-near, fast-focus-far              fast focus nudge
-  recall <1-6>                                 recall preset
-  save <1-6>                                   save current position to preset
-  state                                        show camera state
-  quit                                         exit";
-
-/// What one line of input means.
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum Command {
-    Camera(Intent),
-    Quit,
-}
-
-fn parse_preset_number(argument: Option<&str>) -> Result<u8, String> {
-    let argument = argument.ok_or("missing preset number")?;
-    argument
-        .parse()
-        .map_err(|_| format!("preset number must be a positive integer, got {argument:?}"))
-}
-
-fn parse_command(line: &str) -> Result<Command, String> {
-    let mut words = line.split_whitespace();
-    let word = words.next().ok_or("empty command")?;
-
-    let intent = match word {
-        "up" => Intent::NudgePanTilt(NudgeDirection::Up, NUDGE_DEGREES),
-        "down" => Intent::NudgePanTilt(NudgeDirection::Down, NUDGE_DEGREES),
-        "left" => Intent::NudgePanTilt(NudgeDirection::Left, NUDGE_DEGREES),
-        "right" => Intent::NudgePanTilt(NudgeDirection::Right, NUDGE_DEGREES),
-        "fast-up" => Intent::NudgePanTilt(NudgeDirection::Up, FAST_NUDGE_DEGREES),
-        "fast-down" => Intent::NudgePanTilt(NudgeDirection::Down, FAST_NUDGE_DEGREES),
-        "fast-left" => Intent::NudgePanTilt(NudgeDirection::Left, FAST_NUDGE_DEGREES),
-        "fast-right" => Intent::NudgePanTilt(NudgeDirection::Right, FAST_NUDGE_DEGREES),
-
-        "zoom-in" => Intent::NudgeZoom(ZoomDirection::In, ZOOM_NUDGE_DURATION),
-        "zoom-out" => Intent::NudgeZoom(ZoomDirection::Out, ZOOM_NUDGE_DURATION),
-        "fast-zoom-in" => Intent::NudgeZoom(ZoomDirection::In, FAST_ZOOM_NUDGE_DURATION),
-        "fast-zoom-out" => Intent::NudgeZoom(ZoomDirection::Out, FAST_ZOOM_NUDGE_DURATION),
-
-        "focus-near" => Intent::NudgeFocus(FocusDirection::Near, FOCUS_NUDGE_DURATION),
-        "focus-far" => Intent::NudgeFocus(FocusDirection::Far, FOCUS_NUDGE_DURATION),
-        "fast-focus-near" => Intent::NudgeFocus(FocusDirection::Near, FAST_FOCUS_NUDGE_DURATION),
-        "fast-focus-far" => Intent::NudgeFocus(FocusDirection::Far, FAST_FOCUS_NUDGE_DURATION),
-
-        "recall" => Intent::RecallPreset(parse_preset_number(words.next())?),
-        "save" => Intent::SavePreset(parse_preset_number(words.next())?),
-
-        "state" => Intent::QueryState,
-        "quit" => return Ok(Command::Quit),
-
-        other => return Err(format!("unknown command: {other}")),
-    };
-    Ok(Command::Camera(intent))
-}
 
 /// A short human description of an [`Outcome`], for the CLI transcript.
 fn describe_outcome(outcome: &Outcome) -> String {
@@ -103,96 +47,79 @@ fn send_and_await(
     results.recv().ok()
 }
 
-/// Runs the bare command loop: prints `connection_summary` and the command
-/// list once, then reads lines from `stdin` until `quit` or end of input.
+/// Handles one key event exactly as the TUI would, but writes the result as
+/// plain text to `stdout` instead of updating a rendered frame.
+///
+/// Returns whether the session should continue: `false` on the quit key, or
+/// once the worker thread has gone away.
+fn handle_key(
+    key: KeyEvent,
+    stdout: &mut impl Write,
+    intents: &Sender<Intent>,
+    results: &Receiver<Outcome>,
+) -> io::Result<bool> {
+    let Some(action) = keymap::map_key(key) else {
+        return Ok(true);
+    };
+    let Action::Camera(intent) = action else {
+        return Ok(false); // Action::Quit
+    };
+
+    let Some(outcome) = send_and_await(intents, results, intent) else {
+        writeln!(stdout, "camera worker is gone")?;
+        return Ok(false);
+    };
+    writeln!(stdout, "{}", describe_outcome(&outcome))?;
+
+    // Show what the command actually did. No bound key maps to
+    // Intent::QueryState itself (the TUI only issues it on its own
+    // quiescence timer), so `outcome` is always `Done` here, never `State`.
+    if matches!(outcome, Outcome::Done(_, Ok(()))) {
+        match send_and_await(intents, results, Intent::QueryState) {
+            Some(state_outcome) => writeln!(stdout, "{}", describe_outcome(&state_outcome))?,
+            None => return Ok(false),
+        }
+    }
+    Ok(true)
+}
+
+/// Runs the bare command loop: prints `connection_summary` and the key
+/// legend once, then reads and acts on keystrokes until the quit key or the
+/// worker thread goes away.
 pub fn run(
     stdout: &mut impl Write,
-    stdin: &mut impl BufRead,
     connection_summary: &str,
     intents: &Sender<Intent>,
     results: &Receiver<Outcome>,
 ) -> io::Result<()> {
     writeln!(stdout, "{connection_summary}")?;
-    writeln!(stdout, "{COMMAND_HELP}")?;
+    writeln!(stdout, "{KEY_LEGEND}")?;
 
-    let mut line = String::new();
-    loop {
-        write!(stdout, "> ")?;
-        stdout.flush()?;
-
-        line.clear();
-        if stdin.read_line(&mut line)? == 0 {
-            return Ok(());
-        }
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-
-        let command = match parse_command(line) {
-            Ok(command) => command,
-            Err(message) => {
-                writeln!(stdout, "{message}")?;
-                continue;
-            }
-        };
-        let Command::Camera(intent) = command else {
-            return Ok(());
-        };
-        let is_state_query = intent == Intent::QueryState;
-
-        let Some(outcome) = send_and_await(intents, results, intent) else {
-            writeln!(stdout, "camera worker is gone")?;
-            return Ok(());
-        };
-        writeln!(stdout, "{}", describe_outcome(&outcome))?;
-
-        // Show what the command actually did, unless it was already a state
-        // query (which just showed it).
-        if !is_state_query && matches!(outcome, Outcome::Done(_, Ok(()))) {
-            match send_and_await(intents, results, Intent::QueryState) {
-                Some(state_outcome) => writeln!(stdout, "{}", describe_outcome(&state_outcome))?,
-                None => return Ok(()),
+    enable_raw_mode()?;
+    let result = (|| -> io::Result<()> {
+        loop {
+            if let Event::Key(key) = event::read()?
+                && !handle_key(key, stdout, intents, results)?
+            {
+                return Ok(());
             }
         }
-    }
+    })();
+    disable_raw_mode()?;
+    result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::{KeyCode, KeyModifiers};
     use grafton_visca::camera::PanTiltPosition;
     use grafton_visca::types::{FocusPosition, ZoomPosition};
-    use std::io::Cursor;
     use std::sync::mpsc::channel;
     use std::thread;
 
-    #[test]
-    fn parse_command_maps_words_to_intents() {
-        assert_eq!(
-            parse_command("up"),
-            Ok(Command::Camera(Intent::NudgePanTilt(
-                NudgeDirection::Up,
-                NUDGE_DEGREES
-            )))
-        );
-        assert_eq!(
-            parse_command("recall 3"),
-            Ok(Command::Camera(Intent::RecallPreset(3)))
-        );
-        assert_eq!(parse_command("quit"), Ok(Command::Quit));
-    }
-
-    #[test]
-    fn parse_command_rejects_unknown_words() {
-        assert!(parse_command("bogus").is_err());
-    }
-
-    #[test]
-    fn parse_command_requires_a_valid_preset_number_for_recall_and_save() {
-        assert!(parse_command("recall").is_err());
-        assert!(parse_command("recall abc").is_err());
-        assert!(parse_command("save").is_err());
+    fn press(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
     }
 
     fn sample_camera_state() -> crate::state::CameraState {
@@ -204,10 +131,9 @@ mod tests {
         }
     }
 
-    /// Runs `run` against scripted input, with a stand-in "worker" thread
-    /// that answers every intent immediately, and returns everything
-    /// written to stdout.
-    fn run_against_input(input: &str) -> String {
+    /// Runs `body` with a stand-in "worker" thread that answers every
+    /// intent it receives immediately.
+    fn with_scripted_worker(body: impl FnOnce(&Sender<Intent>, &Receiver<Outcome>)) {
         let (intent_tx, intent_rx) = channel::<Intent>();
         let (result_tx, result_rx) = channel::<Outcome>();
 
@@ -223,47 +149,72 @@ mod tests {
             }
         });
 
-        let mut stdin = Cursor::new(input.as_bytes());
+        body(&intent_tx, &result_rx);
+
+        drop(intent_tx);
+        responder.join().unwrap();
+    }
+
+    #[test]
+    fn a_mapped_key_reports_confirmation_and_the_resulting_state() {
+        with_scripted_worker(|intents, results| {
+            let mut stdout = Vec::new();
+            let continue_session =
+                handle_key(press(KeyCode::Up), &mut stdout, intents, results).unwrap();
+            assert!(continue_session);
+            let output = String::from_utf8(stdout).unwrap();
+            assert!(output.contains("OK: pan/tilt up"));
+            assert!(output.contains("power=on"));
+        });
+    }
+
+    #[test]
+    fn a_failed_command_is_not_followed_by_a_state_report() {
+        let (intent_tx, intent_rx) = channel::<Intent>();
+        let (result_tx, result_rx) = channel::<Outcome>();
+        let responder = thread::spawn(move || {
+            for intent in intent_rx {
+                if result_tx
+                    .send(Outcome::Done(intent, Err(grafton_visca::Error::Timeout)))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+
         let mut stdout = Vec::new();
-        run(&mut stdout, &mut stdin, "Connected", &intent_tx, &result_rx)
-            .expect("in-memory stdout should never fail to write");
+        let continue_session =
+            handle_key(press(KeyCode::Up), &mut stdout, &intent_tx, &result_rx).unwrap();
+        assert!(continue_session);
 
         drop(intent_tx);
         responder.join().unwrap();
 
-        String::from_utf8(stdout).unwrap()
+        let output = String::from_utf8(stdout).unwrap();
+        assert!(output.contains("error"));
+        assert!(!output.contains("power="));
     }
 
     #[test]
-    fn prints_connection_summary_and_command_help_once() {
-        let output = run_against_input("quit\n");
-        assert!(output.contains("Connected"));
-        assert!(output.contains("Commands:"));
+    fn the_quit_key_ends_the_session_without_writing_anything() {
+        with_scripted_worker(|intents, results| {
+            let mut stdout = Vec::new();
+            let continue_session =
+                handle_key(press(KeyCode::Char('q')), &mut stdout, intents, results).unwrap();
+            assert!(!continue_session);
+            assert!(stdout.is_empty());
+        });
     }
 
     #[test]
-    fn successful_command_reports_confirmation_and_new_state() {
-        let output = run_against_input("up\nquit\n");
-        assert!(output.contains("OK: pan/tilt up"));
-        assert!(output.contains("power=on"));
-    }
-
-    #[test]
-    fn state_command_reports_state_only_once() {
-        let output = run_against_input("state\nquit\n");
-        assert_eq!(output.matches("power=on").count(), 1);
-    }
-
-    #[test]
-    fn unknown_command_reports_an_error_and_the_session_continues() {
-        let output = run_against_input("bogus\nup\nquit\n");
-        assert!(output.contains("unknown command: bogus"));
-        assert!(output.contains("OK: pan/tilt up"));
-    }
-
-    #[test]
-    fn end_of_input_ends_the_session_without_requiring_quit() {
-        let output = run_against_input("up\n");
-        assert!(output.contains("OK: pan/tilt up"));
+    fn an_unbound_key_is_ignored() {
+        with_scripted_worker(|intents, results| {
+            let mut stdout = Vec::new();
+            let continue_session =
+                handle_key(press(KeyCode::Char('z')), &mut stdout, intents, results).unwrap();
+            assert!(continue_session);
+            assert!(stdout.is_empty());
+        });
     }
 }

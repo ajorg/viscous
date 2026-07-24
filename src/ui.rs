@@ -38,7 +38,7 @@ pub struct AppState {
     pub status: Option<String>,
 }
 
-const KEY_LEGEND: &str =
+pub const KEY_LEGEND: &str =
     "arrows/shift+arrows: pan-tilt  []/-=: zoom  ,./<>: focus  1-6: recall preset  q: quit";
 
 /// Renders `state` into `frame`.

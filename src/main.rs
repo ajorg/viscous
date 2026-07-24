@@ -1,4 +1,4 @@
-use std::io::{self, IsTerminal};
+use std::io;
 use std::process::ExitCode;
 use std::sync::mpsc::channel;
 use std::thread;
@@ -72,25 +72,11 @@ fn main() -> ExitCode {
         format_version(&version)
     );
 
-    // Fall back to the bare line-oriented mode whenever a full-screen TUI
-    // isn't meaningful to draw (no controlling terminal on either side, as
-    // with piped or redirected stdio) or wasn't wanted (`--cli`, for
-    // scripted verification).
-    let use_bare_cli = cli_requested || !(io::stdin().is_terminal() && io::stdout().is_terminal());
-
-    let app_result = if use_bare_cli {
-        let stdin = io::stdin();
-        let mut stdin = stdin.lock();
+    let app_result = if cli_requested {
         let stdout = io::stdout();
         let mut stdout = stdout.lock();
-        cli::run(
-            &mut stdout,
-            &mut stdin,
-            &connection_summary,
-            &intent_tx,
-            &result_rx,
-        )
-        .map_err(|error| grafton_visca::Error::TransportError(error.to_string().into()))
+        cli::run(&mut stdout, &connection_summary, &intent_tx, &result_rx)
+            .map_err(|error| grafton_visca::Error::TransportError(error.to_string().into()))
     } else {
         let connection = Connection::Connected {
             baud_rate,
