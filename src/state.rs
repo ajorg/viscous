@@ -36,13 +36,17 @@ where
 
 /// Formats a camera state snapshot for display.
 pub fn format_state(state: &CameraState) -> String {
+    // `ZoomPosition`/`FocusPosition`'s own `Display` impls already read
+    // "Zoom 0x1000"/"Focus 0x1000" (grafton-visca bakes the label in), so
+    // pairing that with our own "zoom="/"focus=" label would double it up;
+    // use the raw value instead.
     format!(
-        "power={} pan={} tilt={} zoom={} focus={}",
+        "power={} pan={} tilt={} zoom=0x{:04X} focus=0x{:04X}",
         if state.power_on { "on" } else { "off" },
         state.pan_tilt.pan,
         state.pan_tilt.tilt,
-        state.zoom,
-        state.focus,
+        state.zoom.value(),
+        state.focus.value(),
     )
 }
 
@@ -65,5 +69,17 @@ mod tests {
         assert!(text.contains("power=on"));
         assert!(text.contains("pan=-120"));
         assert!(text.contains("tilt=45"));
+        assert!(text.contains("zoom=0x1000"));
+        assert!(text.contains("focus=0x2000"));
+    }
+
+    #[test]
+    fn format_state_does_not_double_up_the_zoom_and_focus_labels() {
+        // ZoomPosition/FocusPosition's own Display impls already read
+        // "Zoom 0x1000"/"Focus 0x1000"; make sure format_state doesn't pair
+        // that with its own "zoom="/"focus=" label.
+        let text = format_state(&sample_state());
+        assert!(!text.contains("Zoom"));
+        assert!(!text.contains("Focus"));
     }
 }
