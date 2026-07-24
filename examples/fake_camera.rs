@@ -9,6 +9,13 @@
 //! stdout, and simulated pan/tilt/zoom/focus state actually changes so the
 //! client's info panel visibly reflects what was sent.
 //!
+//! Position-changing commands (pan/tilt move, pan/tilt home, preset recall)
+//! reply with their ACK immediately but delay their Completion by a
+//! simulated travel time — proportional to the distance moved, at a fixed
+//! simulated speed — so the client's "in progress" handling actually has
+//! something to exercise instead of every command resolving instantly. A
+//! few presets are pre-seeded at varied distances from the origin for this.
+//!
 //! Command/inquiry byte layouts below are traced from grafton-visca's own
 //! source (`command::pan_tilt`, `command::zoom`, `command::focus`,
 //! `command::preset`, `command::inquiry_structs`), not guessed.
@@ -18,6 +25,7 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
+use std::time::Duration;
 
 use nix::fcntl::OFlag;
 use nix::pty::{grantpt, posix_openpt, ptsname_r, unlockpt};
@@ -25,7 +33,22 @@ use nix::pty::{grantpt, posix_openpt, ptsname_r, unlockpt};
 const TERMINATOR: u8 = 0xFF;
 const OUR_ADDRESS: u8 = 0x81;
 
-/// A saved preset: enough state to make recall visibly restore something.
+/// Simulated pan/tilt speed, in raw position units per second (a single
+/// 2-degree nudge is about 29 raw units). Chosen so one nudge settles in a
+/// fraction of a second but a large preset recall takes a few visible
+/// seconds — enough to exercise "in progress" handling without making
+/// manual testing tedious.
+const PAN_TILT_UNITS_PER_SEC: f64 = 300.0;
+
+/// Simulated zoom/focus speed, in raw position units per second. Zoom and
+/// focus commands are continuous drives with no distance of their own (the
+/// client decides how long to drive by holding the command open), so this
+/// only matters for preset recall, which jumps straight to a target
+/// position on all four axes at once.
+const ZOOM_FOCUS_UNITS_PER_SEC: f64 = 2000.0;
+
+/// A saved preset: enough state to make recall visibly restore something,
+/// and take a simulated amount of time doing it.
 #[derive(Debug, Clone, Copy)]
 struct Preset {
     pan: i16,
@@ -51,6 +74,12 @@ const ZOOM_FOCUS_STEP: u16 = 0x0400;
 /// per unit of requested degrees-equivalent (see `nibbles_to_i16`).
 const PAN_TILT_SCALE: i16 = 1;
 
+/// How long simulated travel across `distance` raw units takes at
+/// `units_per_sec`.
+fn travel_time(distance: i32, units_per_sec: f64) -> Duration {
+    Duration::from_secs_f64(f64::from(distance.unsigned_abs()) / units_per_sec)
+}
+
 impl CameraSim {
     fn new() -> Self {
         Self {
@@ -59,37 +88,71 @@ impl CameraSim {
             focus: 0x1000,
             pan: 0,
             tilt: 0,
-            presets: HashMap::new(),
+            // Seeded a few presets away from the origin, at varied
+            // distances, so recalling them (1, 2, or 3) demonstrates a
+            // visible range of simulated travel times; 4-6 are left unset,
+            // which recalls instantly as a no-op, same as a real camera
+            // asked to recall a preset that was never saved.
+            presets: HashMap::from([
+                (
+                    0,
+                    Preset {
+                        pan: 400,
+                        tilt: 150,
+                        zoom: 0x1000,
+                        focus: 0x1800,
+                    },
+                ),
+                (
+                    1,
+                    Preset {
+                        pan: -800,
+                        tilt: -300,
+                        zoom: 0x2000,
+                        focus: 0x0800,
+                    },
+                ),
+                (
+                    2,
+                    Preset {
+                        pan: 200,
+                        tilt: -100,
+                        zoom: 0x0800,
+                        focus: 0x1000,
+                    },
+                ),
+            ]),
         }
     }
 
     /// Handles one complete VISCA message (including its trailing
-    /// terminator). Logs what it received and what (if anything) it's
-    /// sending back, and returns the reply bytes to write, if any.
-    fn handle(&mut self, message: &[u8]) -> Option<Vec<u8>> {
+    /// terminator). Logs what it received and returns the reply to send, if
+    /// any.
+    fn handle(&mut self, message: &[u8]) -> Reply {
         if message.len() < 3 || message[0] != OUR_ADDRESS {
             // Not addressed to us (e.g. the broadcast I/F Clear the client
             // sends on connect) — nothing to reply to.
             println!("RECV: {} (ignored)", describe_message(message));
-            return None;
+            return Reply::None;
         }
 
         println!("RECV: {}", describe_message(message));
 
-        let reply = match message[1] {
-            0x09 => self.handle_inquiry(&message[2..message.len() - 1]),
+        match message[1] {
+            0x09 => match self.handle_inquiry(&message[2..message.len() - 1]) {
+                Some(bytes) => Reply::Immediate(bytes),
+                None => Reply::None,
+            },
             0x01 => {
-                self.apply_command(&message[2..message.len() - 1]);
-                Some(ack_then_complete(1))
+                let delay = self.apply_command(&message[2..message.len() - 1]);
+                Reply::Command {
+                    ack: ack_reply(1),
+                    delay,
+                    completion: completion_reply(1),
+                }
             }
-            _ => None,
-        };
-
-        match &reply {
-            Some(bytes) => println!("SEND: {}", describe_reply(bytes)),
-            None => println!("SEND: (no reply)"),
+            _ => Reply::None,
         }
-        reply
     }
 
     fn handle_inquiry(&self, body: &[u8]) -> Option<Vec<u8>> {
@@ -116,8 +179,9 @@ impl CameraSim {
     }
 
     /// Updates simulated state for a command body (bytes after the `0x01`
-    /// command-vs-inquiry marker, up to but excluding the terminator).
-    fn apply_command(&mut self, body: &[u8]) {
+    /// command-vs-inquiry marker, up to but excluding the terminator), and
+    /// returns how long that change should simulate taking to complete.
+    fn apply_command(&mut self, body: &[u8]) -> Duration {
         match body {
             // Pan/tilt relative move: 06 03 VV WW <4 nibbles pan> <4 nibbles tilt>
             [0x06, 0x03, _pan_speed, _tilt_speed, rest @ ..] if rest.len() == 8 => {
@@ -125,38 +189,50 @@ impl CameraSim {
                 let tilt_delta = nibbles_to_i16(&rest[4..8]).saturating_mul(PAN_TILT_SCALE);
                 self.pan = self.pan.saturating_add(pan_delta);
                 self.tilt = self.tilt.saturating_add(tilt_delta);
+                pan_tilt_travel_time(i32::from(pan_delta), i32::from(tilt_delta))
             }
             // Pan/tilt home.
             [0x06, 0x04] => {
+                let delay = pan_tilt_travel_time(-i32::from(self.pan), -i32::from(self.tilt));
                 self.pan = 0;
                 self.tilt = 0;
+                delay
             }
             // Zoom stop: no state change.
-            [0x04, 0x07, 0x00] => {}
+            [0x04, 0x07, 0x00] => Duration::ZERO,
             // Zoom tele (in).
-            [0x04, 0x07, 0x02] => self.zoom = self.zoom.saturating_add(ZOOM_FOCUS_STEP),
+            [0x04, 0x07, 0x02] => {
+                self.zoom = self.zoom.saturating_add(ZOOM_FOCUS_STEP);
+                Duration::ZERO
+            }
             // Zoom wide (out).
-            [0x04, 0x07, 0x03] => self.zoom = self.zoom.saturating_sub(ZOOM_FOCUS_STEP),
+            [0x04, 0x07, 0x03] => {
+                self.zoom = self.zoom.saturating_sub(ZOOM_FOCUS_STEP);
+                Duration::ZERO
+            }
             // Focus stop: no state change.
-            [0x04, 0x08, 0x00] => {}
+            [0x04, 0x08, 0x00] => Duration::ZERO,
             // Focus far, with or without an explicit speed nibble (0x02, or 0x20..=0x2F).
             [0x04, 0x08, b] if *b == 0x02 || (0x20..=0x2F).contains(b) => {
                 self.focus = self.focus.saturating_add(ZOOM_FOCUS_STEP);
+                Duration::ZERO
             }
             // Focus near, with or without an explicit speed nibble (0x03, or 0x30..=0x3F).
             [0x04, 0x08, b] if *b == 0x03 || (0x30..=0x3F).contains(b) => {
                 self.focus = self.focus.saturating_sub(ZOOM_FOCUS_STEP);
+                Duration::ZERO
             }
             // Preset: 04 3F action preset_number
             [0x04, 0x3F, action, number] => self.apply_preset(*action, *number),
-            _ => {}
+            _ => Duration::ZERO,
         }
     }
 
-    fn apply_preset(&mut self, action: u8, number: u8) {
+    fn apply_preset(&mut self, action: u8, number: u8) -> Duration {
         match action {
             0x00 => {
                 self.presets.remove(&number);
+                Duration::ZERO
             }
             0x01 => {
                 self.presets.insert(
@@ -168,18 +244,55 @@ impl CameraSim {
                         focus: self.focus,
                     },
                 );
+                Duration::ZERO
             }
             0x02 => {
-                if let Some(preset) = self.presets.get(&number) {
-                    self.pan = preset.pan;
-                    self.tilt = preset.tilt;
-                    self.zoom = preset.zoom;
-                    self.focus = preset.focus;
-                }
+                let Some(preset) = self.presets.get(&number).copied() else {
+                    return Duration::ZERO;
+                };
+                let delay = pan_tilt_travel_time(
+                    i32::from(preset.pan) - i32::from(self.pan),
+                    i32::from(preset.tilt) - i32::from(self.tilt),
+                )
+                .max(travel_time(
+                    i32::from(preset.zoom) - i32::from(self.zoom),
+                    ZOOM_FOCUS_UNITS_PER_SEC,
+                ))
+                .max(travel_time(
+                    i32::from(preset.focus) - i32::from(self.focus),
+                    ZOOM_FOCUS_UNITS_PER_SEC,
+                ));
+                self.pan = preset.pan;
+                self.tilt = preset.tilt;
+                self.zoom = preset.zoom;
+                self.focus = preset.focus;
+                delay
             }
-            _ => {}
+            _ => Duration::ZERO,
         }
     }
+}
+
+/// How long pan and tilt take to settle when moving simultaneously: as long
+/// as whichever axis has farther to go, not the sum of both.
+fn pan_tilt_travel_time(pan_distance: i32, tilt_distance: i32) -> Duration {
+    travel_time(pan_distance, PAN_TILT_UNITS_PER_SEC)
+        .max(travel_time(tilt_distance, PAN_TILT_UNITS_PER_SEC))
+}
+
+/// What to send back for one handled message.
+enum Reply {
+    /// Nothing to send (an unaddressed or unrecognized message).
+    None,
+    /// A single reply, sent right away (inquiries).
+    Immediate(Vec<u8>),
+    /// A command's ACK, sent right away, followed by its Completion after a
+    /// simulated travel delay.
+    Command {
+        ack: Vec<u8>,
+        delay: Duration,
+        completion: Vec<u8>,
+    },
 }
 
 /// Splits `value` into 4 nibbles, matching grafton-visca's `Nibbles::u16_quad`
@@ -210,15 +323,12 @@ fn inquiry_reply(payload: &[u8]) -> Vec<u8> {
     reply
 }
 
-fn ack_then_complete(socket: u8) -> Vec<u8> {
-    vec![
-        0x90,
-        0x40 | socket,
-        TERMINATOR,
-        0x90,
-        0x50 | socket,
-        TERMINATOR,
-    ]
+fn ack_reply(socket: u8) -> Vec<u8> {
+    vec![0x90, 0x40 | socket, TERMINATOR]
+}
+
+fn completion_reply(socket: u8) -> Vec<u8> {
+    vec![0x90, 0x50 | socket, TERMINATOR]
 }
 
 /// A short human description of a received message, for the log.
@@ -267,6 +377,22 @@ fn describe_reply(reply: &[u8]) -> String {
     format!("{reply:02X?}")
 }
 
+/// Writes `bytes` to `master`, logging the outcome with `label`. Returns
+/// whether the write succeeded (a failure likely just means the client
+/// disconnected, not that the simulator should exit).
+fn send(master: &mut impl Write, label: &str, bytes: &[u8]) -> bool {
+    match master.write_all(bytes).and_then(|()| master.flush()) {
+        Ok(()) => {
+            println!("SEND ({label}): {}", describe_reply(bytes));
+            true
+        }
+        Err(error) => {
+            println!("SEND failed (client likely disconnected): {error}");
+            false
+        }
+    }
+}
+
 fn main() -> std::io::Result<()> {
     let master = posix_openpt(OFlag::O_RDWR).expect("posix_openpt should succeed");
     grantpt(&master).expect("grantpt should succeed");
@@ -290,7 +416,7 @@ fn main() -> std::io::Result<()> {
         // next one instead of exiting.
         if master.read_exact(&mut byte).is_err() {
             message.clear();
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            std::thread::sleep(Duration::from_millis(50));
             continue;
         }
         message.push(byte[0]);
@@ -298,10 +424,24 @@ fn main() -> std::io::Result<()> {
             continue;
         }
 
-        if let Some(reply) = camera.handle(&message)
-            && let Err(error) = master.write_all(&reply).and_then(|()| master.flush())
-        {
-            println!("SEND failed (client likely disconnected): {error}");
+        match camera.handle(&message) {
+            Reply::None => println!("SEND: (no reply)"),
+            Reply::Immediate(bytes) => {
+                send(&mut master, "reply", &bytes);
+            }
+            Reply::Command {
+                ack,
+                delay,
+                completion,
+            } => {
+                if send(&mut master, "ack", &ack) {
+                    if !delay.is_zero() {
+                        println!("(simulating {delay:?} of travel time)");
+                    }
+                    std::thread::sleep(delay);
+                    send(&mut master, "completion", &completion);
+                }
+            }
         }
         message.clear();
     }
