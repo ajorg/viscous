@@ -63,7 +63,12 @@ fn main() -> ExitCode {
     let (intent_tx, intent_rx) = channel::<worker::Intent>();
     let (result_tx, result_rx) = channel::<worker::Outcome>();
 
-    let worker_handle = thread::spawn(move || {
+    // Not joined on the way out: a command already fully written to the
+    // wire is already executing on the camera regardless of whether we
+    // stick around for its reply, so there's nothing to gain by blocking
+    // process exit on an in-flight command's ack/completion round trip
+    // (which, for a preset recall, can be tens of seconds).
+    thread::spawn(move || {
         worker::run(&camera, &intent_rx, &result_tx);
     });
 
@@ -87,9 +92,6 @@ fn main() -> ExitCode {
         ratatui::restore();
         result
     };
-
-    drop(intent_tx);
-    let _ = worker_handle.join();
 
     match app_result {
         Ok(()) => ExitCode::SUCCESS,
