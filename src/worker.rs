@@ -61,6 +61,18 @@ pub fn describe(intent: Intent) -> String {
     }
 }
 
+/// A short description of an [`Outcome`], as a single line of transcript
+/// text. Used directly by the bare CLI; the TUI further routes it into
+/// either the status line or the camera-state panel.
+pub fn describe_outcome(outcome: &Outcome) -> String {
+    match outcome {
+        Outcome::Done(intent, Ok(())) => format!("OK: {}", describe(*intent)),
+        Outcome::Done(intent, Err(error)) => format!("error ({}): {error}", describe(*intent)),
+        Outcome::State(Ok(camera_state)) => state::format_state(camera_state),
+        Outcome::State(Err(error)) => format!("state query failed: {error}"),
+    }
+}
+
 fn direction_label(direction: NudgeDirection) -> &'static str {
     match direction {
         NudgeDirection::Up => "up",
@@ -218,5 +230,44 @@ mod tests {
     fn describe_distinguishes_save_from_recall() {
         assert_eq!(describe(Intent::RecallPreset(2)), "recall preset 2");
         assert_eq!(describe(Intent::SavePreset(2)), "save preset 2");
+    }
+
+    fn sample_camera_state() -> CameraState {
+        CameraState {
+            power_on: true,
+            pan_tilt: grafton_visca::camera::PanTiltPosition::new(0, 0),
+            zoom: grafton_visca::types::ZoomPosition::try_from(0u16).unwrap(),
+            focus: grafton_visca::types::FocusPosition::new(0),
+        }
+    }
+
+    #[test]
+    fn describe_outcome_confirms_a_successful_command() {
+        assert_eq!(
+            describe_outcome(&Outcome::Done(Intent::RecallPreset(2), Ok(()))),
+            "OK: recall preset 2"
+        );
+    }
+
+    #[test]
+    fn describe_outcome_reports_a_failed_command() {
+        let text = describe_outcome(&Outcome::Done(
+            Intent::NudgeZoom(ZoomDirection::In, Duration::ZERO),
+            Err(Error::Timeout),
+        ));
+        assert!(text.contains("error"));
+        assert!(text.contains("zoom in"));
+    }
+
+    #[test]
+    fn describe_outcome_formats_a_successful_state_query() {
+        let text = describe_outcome(&Outcome::State(Ok(sample_camera_state())));
+        assert!(text.contains("power=on"));
+    }
+
+    #[test]
+    fn describe_outcome_reports_a_failed_state_query() {
+        let text = describe_outcome(&Outcome::State(Err(Error::Timeout)));
+        assert!(text.contains("state query failed"));
     }
 }

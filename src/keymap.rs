@@ -89,6 +89,8 @@ pub fn map_key(key: KeyEvent) -> Option<Action> {
         }
 
         KeyCode::Char('q') => Action::Quit,
+        // Ctrl-D is the conventional EOF/quit key for a terminal session.
+        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => Action::Quit,
 
         _ => return None,
     };
@@ -165,6 +167,19 @@ mod tests {
             map_key(press(KeyCode::Char('q'), KeyModifiers::NONE)),
             Some(Action::Quit)
         );
+    }
+
+    #[test]
+    fn ctrl_d_quits() {
+        assert_eq!(
+            map_key(press(KeyCode::Char('d'), KeyModifiers::CONTROL)),
+            Some(Action::Quit)
+        );
+    }
+
+    #[test]
+    fn plain_d_is_unbound() {
+        assert_eq!(map_key(press(KeyCode::Char('d'), KeyModifiers::NONE)), None);
     }
 
     #[test]

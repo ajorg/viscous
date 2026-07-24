@@ -39,7 +39,7 @@ pub struct AppState {
 }
 
 pub const KEY_LEGEND: &str =
-    "arrows/shift+arrows: pan-tilt  []/-=: zoom  ,./<>: focus  1-6: recall preset  q: quit";
+    "arrows/shift+arrows: pan-tilt  []/-=: zoom  ,./<>: focus  1-6: recall preset  q/ctrl-d: quit";
 
 /// Renders `state` into `frame`.
 pub fn render(frame: &mut Frame, state: &AppState) {

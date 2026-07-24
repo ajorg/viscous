@@ -12,37 +12,30 @@ use ratatui::DefaultTerminal;
 
 use crate::{
     keymap::{self, Action},
-    state,
     ui::{self, AppState, Connection},
     worker::{self, Intent, Outcome},
 };
 
 /// How long to wait for a key event before checking on worker results and
-/// the quiescence timer.
-const POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// the quiescence timer. Shared with [`crate::cli`], which drives the same
+/// poll/dispatch/drain loop against plain text instead of a rendered frame.
+pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// How long to wait after the most recent camera-changing command before
 /// requesting a fresh state snapshot. Debounces a burst of nudges (e.g.
 /// holding a key down) into a single query once movement actually stops,
 /// rather than polling on a fixed interval regardless of whether anything
-/// changed.
-const QUIESCENCE_INTERVAL: Duration = Duration::from_millis(300);
+/// changed. Shared with [`crate::cli`]; see [`POLL_INTERVAL`].
+pub(crate) const QUIESCENCE_INTERVAL: Duration = Duration::from_millis(300);
 
-/// Applies one worker [`Outcome`] to `state`.
+/// Applies one worker [`Outcome`] to `state`: everything but a successful
+/// state query becomes the status line; a successful state query updates
+/// the camera-state panel instead.
 fn apply_outcome(state: &mut AppState, outcome: Outcome) {
+    let text = worker::describe_outcome(&outcome);
     match outcome {
-        Outcome::Done(intent, Ok(())) => {
-            state.status = Some(format!("OK: {}", worker::describe(intent)));
-        }
-        Outcome::Done(intent, Err(error)) => {
-            state.status = Some(format!("error ({}): {error}", worker::describe(intent)));
-        }
-        Outcome::State(Ok(camera_state)) => {
-            state.camera_state = Some(state::format_state(&camera_state));
-        }
-        Outcome::State(Err(error)) => {
-            state.status = Some(format!("state query failed: {error}"));
-        }
+        Outcome::State(Ok(_)) => state.camera_state = Some(text),
+        _ => state.status = Some(text),
     }
 }
 
@@ -104,57 +97,32 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::zoom::ZoomDirection;
-    use grafton_visca::camera::PanTiltPosition;
-    use grafton_visca::types::{FocusPosition, ZoomPosition};
 
     fn sample_camera_state() -> crate::state::CameraState {
         crate::state::CameraState {
             power_on: true,
-            pan_tilt: PanTiltPosition::new(0, 0),
-            zoom: ZoomPosition::try_from(0u16).unwrap(),
-            focus: FocusPosition::new(0),
+            pan_tilt: grafton_visca::camera::PanTiltPosition::new(0, 0),
+            zoom: grafton_visca::types::ZoomPosition::try_from(0u16).unwrap(),
+            focus: grafton_visca::types::FocusPosition::new(0),
         }
     }
 
     #[test]
-    fn successful_command_shows_confirmation_with_description() {
+    fn a_successful_state_query_updates_the_camera_state_panel_not_the_status_line() {
         let mut state = AppState {
             status: Some("stale".to_string()),
             ..AppState::default()
         };
-        apply_outcome(&mut state, Outcome::Done(Intent::RecallPreset(3), Ok(())));
-        let status = state.status.unwrap();
-        assert!(status.contains("OK"));
-        assert!(status.contains("preset 3"));
-    }
-
-    #[test]
-    fn failed_command_sets_status_message_with_description() {
-        let mut state = AppState::default();
-        apply_outcome(
-            &mut state,
-            Outcome::Done(
-                Intent::NudgeZoom(ZoomDirection::In, Duration::ZERO),
-                Err(Error::Timeout),
-            ),
-        );
-        let status = state.status.unwrap();
-        assert!(status.contains("error"));
-        assert!(status.contains("zoom in"));
-    }
-
-    #[test]
-    fn successful_state_query_updates_camera_state() {
-        let mut state = AppState::default();
         apply_outcome(&mut state, Outcome::State(Ok(sample_camera_state())));
         assert!(state.camera_state.unwrap().contains("power=on"));
+        assert_eq!(state.status.as_deref(), Some("stale"));
     }
 
     #[test]
-    fn failed_state_query_sets_status_message() {
+    fn anything_else_updates_the_status_line_not_the_camera_state_panel() {
         let mut state = AppState::default();
-        apply_outcome(&mut state, Outcome::State(Err(Error::Timeout)));
-        assert!(state.status.unwrap().contains("state query failed"));
+        apply_outcome(&mut state, Outcome::Done(Intent::RecallPreset(3), Ok(())));
+        assert!(state.status.unwrap().contains("preset 3"));
+        assert_eq!(state.camera_state, None);
     }
 }
