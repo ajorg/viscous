@@ -56,11 +56,30 @@ pub fn discover_baud_rate(
     ProbeOutcome::NoResponse
 }
 
+/// Known VISCA vendor IDs, for naming a vendor instead of just showing its
+/// raw number.
+///
+/// VISCA has no central vendor registry (unlike USB's usb.org); this is the
+/// one ID actually documented in practice — Sony's own, from its FCB-series
+/// SDK documentation as reproduced by the open-source libVISCA2 project.
+/// Anything else just shows as a plain hex number.
+const KNOWN_VENDORS: &[(u16, &str)] = &[(0x0020, "Sony")];
+
+fn vendor_name(vendor: u16) -> Option<&'static str> {
+    KNOWN_VENDORS
+        .iter()
+        .find_map(|&(id, name)| (id == vendor).then_some(name))
+}
+
 /// Formats a camera's version-inquiry reply for display.
 pub fn format_version(info: &VersionInfo) -> String {
+    let vendor = match vendor_name(info.vendor) {
+        Some(name) => format!("{name} (0x{:04X})", info.vendor),
+        None => format!("0x{:04X}", info.vendor),
+    };
     format!(
-        "vendor=0x{:04X} model=0x{:04X} rom=0x{:08X} max_socket={}",
-        info.vendor, info.model, info.rom_version, info.max_socket
+        "vendor={vendor} model=0x{:04X} rom=0x{:08X} max_socket={}",
+        info.model, info.rom_version, info.max_socket
     )
 }
 
@@ -82,6 +101,18 @@ mod tests {
         assert_eq!(
             format_version(&sample_version()),
             "vendor=0x0001 model=0x0002 rom=0x00000304 max_socket=2"
+        );
+    }
+
+    #[test]
+    fn format_version_names_a_known_vendor() {
+        let info = VersionInfo {
+            vendor: 0x0020,
+            ..sample_version()
+        };
+        assert_eq!(
+            format_version(&info),
+            "vendor=Sony (0x0020) model=0x0002 rom=0x00000304 max_socket=2"
         );
     }
 
