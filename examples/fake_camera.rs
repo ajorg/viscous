@@ -22,12 +22,20 @@
 //!
 //! Run with `cargo run --example fake_camera`, then in another terminal:
 //! `cargo run -- <the printed slave path>`.
+//!
+//! That auto-provisioned pty is Unix-only (there's no equivalent trick on
+//! Windows). Everywhere else — including Windows, via a virtual null-modem
+//! pair from [com0com](https://com0com.sourceforge.net/) — pass an existing
+//! port name instead: `cargo run --example fake_camera -- COM10`, then point
+//! `viscous`/a GUI at the pair's other end (`COM11`).
 
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::time::Duration;
 
+#[cfg(unix)]
 use nix::fcntl::OFlag;
+#[cfg(unix)]
 use nix::pty::{grantpt, posix_openpt, ptsname_r, unlockpt};
 
 const TERMINATOR: u8 = 0xFF;
@@ -393,28 +401,67 @@ fn send(master: &mut impl Write, label: &str, bytes: &[u8]) -> bool {
     }
 }
 
-fn main() -> std::io::Result<()> {
-    let master = posix_openpt(OFlag::O_RDWR).expect("posix_openpt should succeed");
-    grantpt(&master).expect("grantpt should succeed");
-    unlockpt(&master).expect("unlockpt should succeed");
-    let slave_path = ptsname_r(&master).expect("ptsname_r should succeed");
+/// Anything the simulator can read VISCA bytes from and write replies to —
+/// either a self-provisioned pty (Unix) or a named port opened directly
+/// (any platform, including a Windows com0com pair).
+trait Transport: Read + Write {}
+impl<T: Read + Write + ?Sized> Transport for T {}
 
-    println!("Fake camera listening on {slave_path}");
-    println!("In another terminal, run: cargo run -- {slave_path}");
+/// Opens the transport to simulate the camera on: a named port if one was
+/// given on the command line (works everywhere, including a com0com pair on
+/// Windows), otherwise a self-provisioned pty pair (Unix only — there's no
+/// equivalent auto-provisioning trick on Windows).
+fn open_transport(port_name: Option<&str>) -> io::Result<Box<dyn Transport>> {
+    if let Some(port_name) = port_name {
+        let port = serialport::new(port_name, 9600)
+            .timeout(Duration::from_millis(500))
+            .open()
+            .map_err(io::Error::other)?;
+        println!("Fake camera listening on {port_name}");
+        return Ok(Box::new(port));
+    }
 
-    let mut master = master;
+    #[cfg(unix)]
+    {
+        let master = posix_openpt(OFlag::O_RDWR).expect("posix_openpt should succeed");
+        grantpt(&master).expect("grantpt should succeed");
+        unlockpt(&master).expect("unlockpt should succeed");
+        let slave_path = ptsname_r(&master).expect("ptsname_r should succeed");
+
+        println!("Fake camera listening on {slave_path}");
+        println!("In another terminal, run: cargo run -- {slave_path}");
+
+        Ok(Box::new(master))
+    }
+
+    #[cfg(not(unix))]
+    {
+        Err(io::Error::other(
+            "no port given, and this platform can't provision one automatically (that's a \
+             Unix-only pty trick) — install com0com (https://com0com.sourceforge.net/), create \
+             a port pair (e.g. COM10 <-> COM11), then run: cargo run --example fake_camera -- \
+             COM10 (and point viscous/the GUI at COM11)",
+        ))
+    }
+}
+
+fn main() -> io::Result<()> {
+    let port_name = std::env::args().nth(1);
+    let mut transport = open_transport(port_name.as_deref())?;
+
     let mut camera = CameraSim::new();
     let mut message = Vec::new();
     let mut byte = [0u8; 1];
 
     loop {
-        // A PTY master reads as EIO once every slave-side file descriptor is
-        // closed, rather than blocking until a new one opens. viscous
+        // A pty master reads as EIO once every slave-side file descriptor is
+        // closed (rather than blocking until a new one opens), and a named
+        // port's read simply times out while nothing's connected. viscous
         // itself disconnects and reconnects during startup (a short
         // discovery probe, then a fresh connection for the real session),
-        // so treat a read error as "no client right now" and wait for the
-        // next one instead of exiting.
-        if master.read_exact(&mut byte).is_err() {
+        // so treat any read failure as "no client right now" and wait for
+        // the next one instead of exiting.
+        if transport.read_exact(&mut byte).is_err() {
             message.clear();
             std::thread::sleep(Duration::from_millis(50));
             continue;
@@ -427,19 +474,19 @@ fn main() -> std::io::Result<()> {
         match camera.handle(&message) {
             Reply::None => println!("SEND: (no reply)"),
             Reply::Immediate(bytes) => {
-                send(&mut master, "reply", &bytes);
+                send(&mut transport, "reply", &bytes);
             }
             Reply::Command {
                 ack,
                 delay,
                 completion,
             } => {
-                if send(&mut master, "ack", &ack) {
+                if send(&mut transport, "ack", &ack) {
                     if !delay.is_zero() {
                         println!("(simulating {delay:?} of travel time)");
                     }
                     std::thread::sleep(delay);
-                    send(&mut master, "completion", &completion);
+                    send(&mut transport, "completion", &completion);
                 }
             }
         }
