@@ -1,0 +1,10 @@
+[package]
+name = "egui_gui"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+eframe = "0.35.0"
+egui = "0.35.0"
+grafton-visca = { version = "1.0.0", features = ["transport-serial"] }
+viscous = { version = "0.1.0", path = ".." }
