@@ -18,17 +18,15 @@ use crate::{
 
 /// How long to wait for a key event before checking on worker results and
 /// the quiescence timer. Shared with [`crate::cli`], which drives the same
-/// poll/dispatch/drain loop against plain text instead of a rendered frame,
-/// and with the optional Flutter GUI's bridge crate, which drives the same
-/// debounce against gestures instead of keystrokes.
-pub const POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// poll/dispatch/drain loop against plain text instead of a rendered frame.
+pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// How long to wait after the most recent camera-changing command before
 /// requesting a fresh state snapshot. Debounces a burst of nudges (e.g.
 /// holding a key down) into a single query once movement actually stops,
 /// rather than polling on a fixed interval regardless of whether anything
 /// changed. Shared with [`crate::cli`]; see [`POLL_INTERVAL`].
-pub const QUIESCENCE_INTERVAL: Duration = Duration::from_millis(300);
+pub(crate) const QUIESCENCE_INTERVAL: Duration = Duration::from_millis(300);
 
 /// Applies one worker [`Outcome`] to `state`: everything but a successful
 /// state query becomes the status line; a successful state query updates
