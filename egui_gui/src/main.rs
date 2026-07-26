@@ -3,6 +3,12 @@
 //! Being plain Rust, it needs no FFI/bridge/mirrored-type layer: it calls
 //! `viscous`'s existing worker/connection/state types directly.
 
+// Windows executables default to the console subsystem, which pops up a
+// terminal alongside the GUI window; switch to the windows subsystem in
+// release builds only, so `cargo run` in debug still shows println!/log
+// output in a normal terminal.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod joystick;
 
 use std::sync::mpsc::{self, Receiver, Sender};
