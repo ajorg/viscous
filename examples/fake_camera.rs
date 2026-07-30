@@ -9,12 +9,18 @@
 //! stdout, and simulated pan/tilt/zoom/focus state actually changes so the
 //! client's info panel visibly reflects what was sent.
 //!
-//! Position-changing commands (pan/tilt move, pan/tilt home, preset recall)
-//! reply with their ACK immediately but delay their Completion by a
-//! simulated travel time — proportional to the distance moved, at a fixed
-//! simulated speed — so the client's "in progress" handling actually has
-//! something to exercise instead of every command resolving instantly. A
-//! few presets are pre-seeded at varied distances from the origin for this.
+//! Commands that travel a known distance (pan/tilt relative move, pan/tilt
+//! home, preset recall) reply with their ACK immediately but delay their
+//! Completion by a simulated travel time — proportional to the distance
+//! moved, at a fixed simulated speed — so the client's "in progress" handling
+//! actually has something to exercise instead of every command resolving
+//! instantly. A few presets are pre-seeded at varied distances from the origin
+//! for this.
+//!
+//! Continuous drive commands (pan/tilt, zoom and focus) instead complete at
+//! once and set a rate, exactly as a real camera does: they have no distance
+//! of their own, so the simulated position keeps moving between messages for
+//! as long as the drive is running and only stops when a stop command arrives.
 //!
 //! Command/inquiry byte layouts below are traced from grafton-visca's own
 //! source (`command::pan_tilt`, `command::zoom`, `command::focus`,
@@ -31,7 +37,7 @@
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use nix::fcntl::OFlag;
@@ -41,19 +47,28 @@ use nix::pty::{grantpt, posix_openpt, ptsname_r, unlockpt};
 const TERMINATOR: u8 = 0xFF;
 const OUR_ADDRESS: u8 = 0x81;
 
-/// Simulated pan/tilt speed, in raw position units per second (a single
-/// 2-degree nudge is about 29 raw units). Chosen so one nudge settles in a
-/// fraction of a second but a large preset recall takes a few visible
-/// seconds — enough to exercise "in progress" handling without making
-/// manual testing tedious.
+/// Simulated pan/tilt speed at full VISCA speed, in raw position units per
+/// second. Chosen so a brief tap of a control moves visibly but a large preset
+/// recall takes a few visible seconds — enough to exercise "in progress"
+/// handling without making manual testing tedious.
 const PAN_TILT_UNITS_PER_SEC: f64 = 300.0;
 
-/// Simulated zoom/focus speed, in raw position units per second. Zoom and
-/// focus commands are continuous drives with no distance of their own (the
-/// client decides how long to drive by holding the command open), so this
-/// only matters for preset recall, which jumps straight to a target
-/// position on all four axes at once.
+/// Simulated zoom/focus drive speed, in raw position units per second.
 const ZOOM_FOCUS_UNITS_PER_SEC: f64 = 2000.0;
+
+/// How far each axis can travel, in raw units. Movement stops at these
+/// bounds rather than wrapping or running away, as it would on real hardware;
+/// the values are `GenericVisca`'s pan/tilt ranges and zoom/focus limits.
+const PAN_LIMITS: (f64, f64) = (-2880.0, 2880.0);
+const TILT_LIMITS: (f64, f64) = (-1440.0, 1440.0);
+const ZOOM_LIMITS: (f64, f64) = (0.0, 65535.0);
+const FOCUS_LIMITS: (f64, f64) = (4096.0, 57344.0);
+
+/// The fastest pan and tilt speeds a VISCA drive command can ask for
+/// (0x18/0x14), restated here rather than shared with the client so the
+/// simulator stays an independent check on what the client sends.
+const MAX_PAN_SPEED: u8 = 24;
+const MAX_TILT_SPEED: u8 = 20;
 
 /// A saved preset: enough state to make recall visibly restore something,
 /// and take a simulated amount of time doing it.
@@ -71,13 +86,17 @@ struct CameraSim {
     focus: u16,
     pan: i16,
     tilt: i16,
+    /// The rate each axis is currently being driven at, in raw units per
+    /// second, and when the positions above were last brought up to date with
+    /// those rates. Zero when the axis isn't being driven.
+    pan_rate: f64,
+    tilt_rate: f64,
+    zoom_rate: f64,
+    focus_rate: f64,
+    last_advance: Instant,
     presets: HashMap<u8, Preset>,
 }
 
-/// How far a single zoom/focus start command nudges simulated state, since
-/// this simulator answers instantly rather than tracking real elapsed drive
-/// time between start and stop.
-const ZOOM_FOCUS_STEP: u16 = 0x0400;
 /// How far a single pan/tilt relative-move command nudges simulated state
 /// per unit of requested degrees-equivalent (see `nibbles_to_i16`).
 const PAN_TILT_SCALE: i16 = 1;
@@ -88,6 +107,34 @@ fn travel_time(distance: i32, units_per_sec: f64) -> Duration {
     Duration::from_secs_f64(f64::from(distance.unsigned_abs()) / units_per_sec)
 }
 
+/// Where an axis being driven at `rate` units per second ends up after
+/// `seconds`, stopping at either end of its travel.
+fn advanced(position: f64, rate: f64, seconds: f64, limits: (f64, f64)) -> f64 {
+    (position + rate * seconds).clamp(limits.0, limits.1)
+}
+
+/// Which way one axis of a drive command was told to move.
+///
+/// VISCA gives each axis its own direction byte, where 0x03 means "leave this
+/// axis alone" — and the two axes disagree about which of 0x01/0x02 is the
+/// positive one, so the caller says which byte counts as positive (pan 0x01 is
+/// left, tilt 0x01 is up).
+fn axis_sign(direction: u8, positive: u8) -> f64 {
+    match direction {
+        _ if direction == positive => 1.0,
+        0x01 | 0x02 => -1.0,
+        _ => 0.0,
+    }
+}
+
+/// A drive command's rate along one axis, in raw units per second: its
+/// direction, at a speed scaled from VISCA's `1..=max_speed` range onto the
+/// simulated top speed.
+fn drive_rate(direction: u8, positive: u8, speed: u8, max_speed: u8) -> f64 {
+    axis_sign(direction, positive) * PAN_TILT_UNITS_PER_SEC * f64::from(speed.clamp(1, max_speed))
+        / f64::from(max_speed)
+}
+
 impl CameraSim {
     fn new() -> Self {
         Self {
@@ -96,6 +143,11 @@ impl CameraSim {
             focus: 0x1000,
             pan: 0,
             tilt: 0,
+            pan_rate: 0.0,
+            tilt_rate: 0.0,
+            zoom_rate: 0.0,
+            focus_rate: 0.0,
+            last_advance: Instant::now(),
             // Seeded a few presets away from the origin, at varied
             // distances, so recalling them (1, 2, or 3) demonstrates a
             // visible range of simulated travel times; 4-6 are left unset,
@@ -133,10 +185,34 @@ impl CameraSim {
         }
     }
 
+    /// Brings simulated positions up to date with however long the drives
+    /// currently running have been running for.
+    ///
+    /// A continuous drive has no distance of its own — it runs until something
+    /// stops it — so the only way to simulate one is to integrate its rate over
+    /// real elapsed time. Doing that before every message means a position
+    /// inquiry answers with where the camera would actually be by now.
+    fn advance(&mut self) {
+        let seconds = self.last_advance.elapsed().as_secs_f64();
+        self.last_advance = Instant::now();
+
+        self.pan = advanced(f64::from(self.pan), self.pan_rate, seconds, PAN_LIMITS) as i16;
+        self.tilt = advanced(f64::from(self.tilt), self.tilt_rate, seconds, TILT_LIMITS) as i16;
+        self.zoom = advanced(f64::from(self.zoom), self.zoom_rate, seconds, ZOOM_LIMITS) as u16;
+        self.focus = advanced(
+            f64::from(self.focus),
+            self.focus_rate,
+            seconds,
+            FOCUS_LIMITS,
+        ) as u16;
+    }
+
     /// Handles one complete VISCA message (including its trailing
     /// terminator). Logs what it received and returns the reply to send, if
     /// any.
     fn handle(&mut self, message: &[u8]) -> Reply {
+        self.advance();
+
         if message.len() < 3 || message[0] != OUR_ADDRESS {
             // Not addressed to us (e.g. the broadcast I/F Clear the client
             // sends on connect) — nothing to reply to.
@@ -191,6 +267,21 @@ impl CameraSim {
     /// returns how long that change should simulate taking to complete.
     fn apply_command(&mut self, body: &[u8]) -> Duration {
         match body {
+            // Pan/tilt drive: 06 01 VV WW XX YY. A velocity the camera holds
+            // until it's told otherwise, so it completes at once and the
+            // movement it starts shows up in `advance` instead of here.
+            [
+                0x06,
+                0x01,
+                pan_speed,
+                tilt_speed,
+                pan_direction,
+                tilt_direction,
+            ] => {
+                self.pan_rate = drive_rate(*pan_direction, 0x02, *pan_speed, MAX_PAN_SPEED);
+                self.tilt_rate = drive_rate(*tilt_direction, 0x01, *tilt_speed, MAX_TILT_SPEED);
+                Duration::ZERO
+            }
             // Pan/tilt relative move: 06 03 VV WW <4 nibbles pan> <4 nibbles tilt>
             [0x06, 0x03, _pan_speed, _tilt_speed, rest @ ..] if rest.len() == 8 => {
                 let pan_delta = nibbles_to_i16(&rest[0..4]).saturating_mul(PAN_TILT_SCALE);
@@ -206,28 +297,34 @@ impl CameraSim {
                 self.tilt = 0;
                 delay
             }
-            // Zoom stop: no state change.
-            [0x04, 0x07, 0x00] => Duration::ZERO,
-            // Zoom tele (in).
-            [0x04, 0x07, 0x02] => {
-                self.zoom = self.zoom.saturating_add(ZOOM_FOCUS_STEP);
+            // Zoom stop.
+            [0x04, 0x07, 0x00] => {
+                self.zoom_rate = 0.0;
                 Duration::ZERO
             }
-            // Zoom wide (out).
-            [0x04, 0x07, 0x03] => {
-                self.zoom = self.zoom.saturating_sub(ZOOM_FOCUS_STEP);
+            // Zoom tele (in), with or without an explicit speed nibble.
+            [0x04, 0x07, b] if *b == 0x02 || (0x20..=0x2F).contains(b) => {
+                self.zoom_rate = ZOOM_FOCUS_UNITS_PER_SEC;
                 Duration::ZERO
             }
-            // Focus stop: no state change.
-            [0x04, 0x08, 0x00] => Duration::ZERO,
+            // Zoom wide (out), with or without an explicit speed nibble.
+            [0x04, 0x07, b] if *b == 0x03 || (0x30..=0x3F).contains(b) => {
+                self.zoom_rate = -ZOOM_FOCUS_UNITS_PER_SEC;
+                Duration::ZERO
+            }
+            // Focus stop.
+            [0x04, 0x08, 0x00] => {
+                self.focus_rate = 0.0;
+                Duration::ZERO
+            }
             // Focus far, with or without an explicit speed nibble (0x02, or 0x20..=0x2F).
             [0x04, 0x08, b] if *b == 0x02 || (0x20..=0x2F).contains(b) => {
-                self.focus = self.focus.saturating_add(ZOOM_FOCUS_STEP);
+                self.focus_rate = ZOOM_FOCUS_UNITS_PER_SEC;
                 Duration::ZERO
             }
             // Focus near, with or without an explicit speed nibble (0x03, or 0x30..=0x3F).
             [0x04, 0x08, b] if *b == 0x03 || (0x30..=0x3F).contains(b) => {
-                self.focus = self.focus.saturating_sub(ZOOM_FOCUS_STEP);
+                self.focus_rate = -ZOOM_FOCUS_UNITS_PER_SEC;
                 Duration::ZERO
             }
             // Preset: 04 3F action preset_number
@@ -347,11 +444,21 @@ fn describe_message(message: &[u8]) -> String {
     let addr = message[0];
     let body = &message[2..message.len() - 1];
     let kind = match (message.get(1), body) {
+        (Some(0x01), [0x06, 0x01, pan_speed, tilt_speed, 0x03, 0x03]) => {
+            format!("pan/tilt stop (speeds {pan_speed}/{tilt_speed})")
+        }
+        (Some(0x01), [0x06, 0x01, pan_speed, tilt_speed, ..]) => {
+            format!("pan/tilt drive at {pan_speed}/{tilt_speed}")
+        }
         (Some(0x01), [0x06, 0x03, ..]) => "pan/tilt relative move".to_string(),
         (Some(0x01), [0x06, 0x04]) => "pan/tilt home".to_string(),
         (Some(0x01), [0x04, 0x07, 0x00]) => "zoom stop".to_string(),
-        (Some(0x01), [0x04, 0x07, 0x02]) => "zoom tele (in)".to_string(),
-        (Some(0x01), [0x04, 0x07, 0x03]) => "zoom wide (out)".to_string(),
+        (Some(0x01), [0x04, 0x07, b]) if *b == 0x02 || (0x20..=0x2F).contains(b) => {
+            "zoom tele (in)".to_string()
+        }
+        (Some(0x01), [0x04, 0x07, b]) if *b == 0x03 || (0x30..=0x3F).contains(b) => {
+            "zoom wide (out)".to_string()
+        }
         (Some(0x01), [0x04, 0x08, 0x00]) => "focus stop".to_string(),
         (Some(0x01), [0x04, 0x08, b]) if *b == 0x02 || (0x20..=0x2F).contains(b) => {
             "focus far".to_string()

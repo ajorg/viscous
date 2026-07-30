@@ -13,28 +13,21 @@ mod joystick;
 
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use eframe::egui;
 use grafton_visca::camera::{Connect, profiles::GenericVisca};
 use viscous::{
-    app::{POLL_INTERVAL, QUIESCENCE_INTERVAL},
     connection::{
         DEFAULT_CAMERA_BAUD_RATES, ProbeOutcome, discover_baud_rate, format_version, query_version,
     },
     focus::FocusDirection,
+    pan_tilt::Velocity,
+    session::{POLL_INTERVAL, QUIESCENCE_INTERVAL},
     state,
     worker::{self, Intent, Outcome},
     zoom::ZoomDirection,
 };
-
-/// How long a single zoom or focus tap drives the camera for — mirrors the
-/// TUI/CLI's fixed-duration nudge per keypress rather than inventing a
-/// hold-to-drive interaction the rest of the app doesn't have.
-const TAP_NUDGE: Duration = Duration::from_millis(150);
-
-/// How often the joystick sends a nudge while held past its deadzone.
-const JOYSTICK_NUDGE_INTERVAL: Duration = Duration::from_millis(150);
 
 /// Where the camera connection attempt currently stands.
 enum Connection {
@@ -100,8 +93,12 @@ struct App {
     status: Option<String>,
     pending_state_query: bool,
     last_command_at: Instant,
-    drag_offset: egui::Vec2,
-    last_nudge_sent_at: Instant,
+    /// What each continuous control was last told to do. A drive keeps running
+    /// on the camera by itself, so these say what it's already doing — and a
+    /// command only goes out when a control is asked for something different.
+    pan_tilt: Velocity,
+    zoom: Option<ZoomDirection>,
+    focus: Option<FocusDirection>,
 }
 
 impl Default for App {
@@ -116,8 +113,9 @@ impl Default for App {
             status: None,
             pending_state_query: false,
             last_command_at: Instant::now(),
-            drag_offset: egui::Vec2::ZERO,
-            last_nudge_sent_at: Instant::now() - JOYSTICK_NUDGE_INTERVAL,
+            pan_tilt: Velocity::STOP,
+            zoom: None,
+            focus: None,
         }
     }
 }
@@ -136,15 +134,30 @@ impl App {
         self.last_command_at = Instant::now();
     }
 
+    /// Whether any control is currently being driven.
+    fn driving(&self) -> bool {
+        !self.pan_tilt.is_stop() || self.zoom.is_some() || self.focus.is_some()
+    }
+
     /// Fires the debounced state query once the most recent command has had
-    /// time to settle, same timing as [`viscous::app::run`]/[`viscous::cli::run`].
+    /// time to settle, same timing and same suppression-while-driving rule as
+    /// [`viscous::session::run`].
+    ///
+    /// Skipped while a control is being driven: the camera's position is a
+    /// moving target that would be stale by the time it was drawn, and a state
+    /// query is four inquiry round trips on the same serial line — one in
+    /// flight is one more thing the stop command has to wait behind.
     fn send_query_state_if_due(&mut self) {
-        if self.pending_state_query && self.last_command_at.elapsed() >= QUIESCENCE_INTERVAL {
-            if let Some(intents) = &self.intents {
-                let _ = intents.send(Intent::QueryState);
-            }
-            self.pending_state_query = false;
+        if self.driving()
+            || !self.pending_state_query
+            || self.last_command_at.elapsed() < QUIESCENCE_INTERVAL
+        {
+            return;
         }
+        if let Some(intents) = &self.intents {
+            let _ = intents.send(Intent::QueryState);
+        }
+        self.pending_state_query = false;
     }
 
     fn start_connect(&mut self, ctx: &egui::Context) {
@@ -183,7 +196,7 @@ impl App {
 
     /// Applies one worker [`Outcome`]: everything but a successful state
     /// query becomes the status line; a successful state query updates the
-    /// camera-state panel instead — mirrors [`viscous::app::apply_outcome`].
+    /// camera-state panel instead — mirrors the TUI's own `Report` impl.
     fn apply_outcome(&mut self, outcome: Outcome) {
         match &outcome {
             Outcome::State(Ok(camera_state)) => {
@@ -228,29 +241,22 @@ impl App {
 
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
-                let (_, nudge) = joystick::pan_tilt_pad(ui, 240.0, &mut self.drag_offset);
-                if let Some((direction, degrees)) = nudge
-                    && self.last_nudge_sent_at.elapsed() >= JOYSTICK_NUDGE_INTERVAL
-                {
-                    self.send_intent(Intent::NudgePanTilt(direction, degrees));
-                    self.last_nudge_sent_at = Instant::now();
+                let pan_tilt = joystick::pan_tilt_pad(ui, 240.0);
+                if pan_tilt != self.pan_tilt {
+                    self.pan_tilt = pan_tilt;
+                    self.send_intent(Intent::DrivePanTilt(pan_tilt));
                 }
 
                 ui.add_space(16.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Zoom \u{2212}").clicked() {
-                        self.send_intent(Intent::NudgeZoom(ZoomDirection::Out, TAP_NUDGE));
-                    }
-                    if ui.button("Zoom +").clicked() {
-                        self.send_intent(Intent::NudgeZoom(ZoomDirection::In, TAP_NUDGE));
-                    }
-                    if ui.button("Focus \u{2212}").clicked() {
-                        self.send_intent(Intent::NudgeFocus(FocusDirection::Near, TAP_NUDGE));
-                    }
-                    if ui.button("Focus +").clicked() {
-                        self.send_intent(Intent::NudgeFocus(FocusDirection::Far, TAP_NUDGE));
-                    }
-                });
+                let (zoom, focus) = drive_buttons(ui);
+                if zoom != self.zoom {
+                    self.zoom = zoom;
+                    self.send_intent(Intent::DriveZoom(zoom));
+                }
+                if focus != self.focus {
+                    self.focus = focus;
+                    self.send_intent(Intent::DriveFocus(focus));
+                }
             });
 
             ui.separator();
@@ -274,6 +280,51 @@ impl App {
             ui.label(state);
         }
     }
+
+    /// Stops anything still being driven, waiting for the camera to confirm.
+    ///
+    /// A continuous drive outlives the process that started it, so a window
+    /// closed mid-move would otherwise leave the camera moving on its own.
+    fn stop_all_drives(&mut self) {
+        let (Some(intents), Some(results)) = (&self.intents, &self.results) else {
+            return;
+        };
+        if !self.pan_tilt.is_stop() {
+            worker::stop_and_confirm(intents, results, Intent::DrivePanTilt(Velocity::STOP));
+        }
+        if self.zoom.is_some() {
+            worker::stop_and_confirm(intents, results, Intent::DriveZoom(None));
+        }
+        if self.focus.is_some() {
+            worker::stop_and_confirm(intents, results, Intent::DriveFocus(None));
+        }
+    }
+}
+
+/// Draws the zoom and focus buttons, reporting which direction each is being
+/// held in.
+///
+/// Held rather than clicked: a continuous drive runs for exactly as long as
+/// the button is down, which is the same interaction as holding the TUI's
+/// zoom and focus keys.
+fn drive_buttons(ui: &mut egui::Ui) -> (Option<ZoomDirection>, Option<FocusDirection>) {
+    let mut zoom = None;
+    let mut focus = None;
+    ui.horizontal(|ui| {
+        if ui.button("Zoom \u{2212}").is_pointer_button_down_on() {
+            zoom = Some(ZoomDirection::Out);
+        }
+        if ui.button("Zoom +").is_pointer_button_down_on() {
+            zoom = Some(ZoomDirection::In);
+        }
+        if ui.button("Focus \u{2212}").is_pointer_button_down_on() {
+            focus = Some(FocusDirection::Near);
+        }
+        if ui.button("Focus +").is_pointer_button_down_on() {
+            focus = Some(FocusDirection::Far);
+        }
+    });
+    (zoom, focus)
 }
 
 impl eframe::App for App {
@@ -305,8 +356,12 @@ impl eframe::App for App {
         });
 
         // Keep polling for worker results / the debounced state query at
-        // the same cadence app.rs's own event loop uses.
+        // the same cadence the session loop's own event poll uses.
         ui.ctx().request_repaint_after(POLL_INTERVAL);
+    }
+
+    fn on_exit(&mut self) {
+        self.stop_all_drives();
     }
 }
 

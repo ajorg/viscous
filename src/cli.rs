@@ -2,29 +2,23 @@
 //! you want to parse from a script (e.g. driving `viscous` over an
 //! `expect`-controlled pseudoterminal).
 //!
-//! Reads the exact same single-keystroke input as the TUI — see
-//! [`keymap`](crate::keymap) — and drives the exact same poll/dispatch/drain
-//! loop as [`app::run`](crate::app::run) (fire off a command without
-//! waiting for it, so a burst of nudges doesn't back up behind the camera's
-//! round trip; debounce the follow-up state query the same way) — but
-//! prints each result as a line of text instead of updating a rendered
-//! frame. Like the TUI, this needs a real controlling terminal on stdin,
-//! since raw mode reads individual keystrokes without waiting for Enter;
-//! it's an alternative to the full-screen UI, not a way to drive the camera
-//! with no terminal at all.
+//! This is the same interactive session as the TUI — same keys, same
+//! hold-to-drive movement, same debounced state query (see
+//! [`session`](crate::session)) — printing each result as a line of text
+//! instead of updating a rendered frame. Like the TUI it needs a real
+//! controlling terminal on stdin, since raw mode reads individual keystrokes
+//! without waiting for Enter; it's an alternative to the full-screen UI, not a
+//! way to drive the camera with no terminal at all.
 
 use std::io::{self, Write};
-use std::sync::mpsc::{Receiver, Sender, TryRecvError};
-use std::time::Instant;
+use std::sync::mpsc::{Receiver, Sender};
 
-use crossterm::event::{self, Event};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 
 use crate::{
-    app::{POLL_INTERVAL, QUIESCENCE_INTERVAL},
-    keymap::{self, Action},
+    session::{self, Report},
     ui::KEY_LEGEND,
-    worker::{self, Intent, Outcome},
+    worker::{Intent, Outcome},
 };
 
 /// Writes one line of output ending in an explicit `\r\n`.
@@ -35,6 +29,26 @@ use crate::{
 /// each subsequent line staircasing further right than the last.
 fn write_line(stdout: &mut impl Write, text: &str) -> io::Result<()> {
     write!(stdout, "{text}\r\n")
+}
+
+/// The bare CLI's view of a session: every message is a line of transcript,
+/// and there's no frame to redraw between them.
+struct Transcript<'a, W: Write> {
+    stdout: &'a mut W,
+}
+
+impl<W: Write> Report for Transcript<'_, W> {
+    fn refresh(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn status(&mut self, text: &str) -> io::Result<()> {
+        write_line(self.stdout, text)
+    }
+
+    fn camera_state(&mut self, text: &str) -> io::Result<()> {
+        write_line(self.stdout, text)
+    }
 }
 
 /// Runs the bare command loop: prints `connection_summary` and the key
@@ -50,48 +64,9 @@ pub fn run(
     write_line(stdout, KEY_LEGEND)?;
 
     enable_raw_mode()?;
-    let result = run_loop(stdout, intents, results);
+    let result = session::run(intents, results, &mut Transcript { stdout });
     disable_raw_mode()?;
     result
-}
-
-fn run_loop(
-    stdout: &mut impl Write,
-    intents: &Sender<Intent>,
-    results: &Receiver<Outcome>,
-) -> io::Result<()> {
-    let mut pending_state_query = true;
-    let mut last_command_at = Instant::now() - QUIESCENCE_INTERVAL;
-
-    loop {
-        if event::poll(POLL_INTERVAL)?
-            && let Event::Key(key) = event::read()?
-        {
-            match keymap::map_key(key) {
-                Some(Action::Quit) => return Ok(()),
-                Some(Action::Camera(intent)) => {
-                    write_line(stdout, &worker::describe_busy(intent))?;
-                    let _ = intents.send(intent);
-                    pending_state_query = true;
-                    last_command_at = Instant::now();
-                }
-                None => {}
-            }
-        }
-
-        loop {
-            match results.try_recv() {
-                Ok(outcome) => write_line(stdout, &worker::describe_outcome(&outcome))?,
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => return Ok(()),
-            }
-        }
-
-        if pending_state_query && last_command_at.elapsed() >= QUIESCENCE_INTERVAL {
-            let _ = intents.send(Intent::QueryState);
-            pending_state_query = false;
-        }
-    }
 }
 
 #[cfg(test)]
@@ -103,5 +78,23 @@ mod tests {
         let mut stdout = Vec::new();
         write_line(&mut stdout, "hello").unwrap();
         assert_eq!(stdout, b"hello\r\n");
+    }
+
+    #[test]
+    fn every_kind_of_message_becomes_a_line_of_transcript() {
+        let mut stdout = Vec::new();
+        {
+            let mut transcript = Transcript {
+                stdout: &mut stdout,
+            };
+            transcript.refresh().unwrap();
+            transcript.status("pan/tilt right...").unwrap();
+            transcript.camera_state("power=on pan=0 tilt=0").unwrap();
+        }
+
+        assert_eq!(
+            String::from_utf8(stdout).unwrap(),
+            "pan/tilt right...\r\npower=on pan=0 tilt=0\r\n"
+        );
     }
 }

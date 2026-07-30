@@ -1,131 +1,133 @@
-//! The interactive event loop: polls terminal input, dispatches camera
-//! intents to the worker thread, and redraws.
+//! The TUI front end: renders the shared interactive session
+//! ([`crate::session`]) into a ratatui frame.
 
-use std::{
-    sync::mpsc::{Receiver, Sender, TryRecvError},
-    time::{Duration, Instant},
-};
+use std::io;
+use std::sync::mpsc::{Receiver, Sender};
 
-use crossterm::event::{self, Event};
-use grafton_visca::Error;
-use ratatui::DefaultTerminal;
+use ratatui::{DefaultTerminal, Terminal, backend::Backend};
 
 use crate::{
-    keymap::{self, Action},
+    session::{self, Report},
     ui::{self, AppState, Connection},
-    worker::{self, Intent, Outcome},
+    worker::{Intent, Outcome},
 };
 
-/// How long to wait for a key event before checking on worker results and
-/// the quiescence timer. Shared with [`crate::cli`], which drives the same
-/// poll/dispatch/drain loop against plain text instead of a rendered frame,
-/// and with the optional Flutter GUI's bridge crate, which drives the same
-/// debounce against gestures instead of keystrokes.
-pub const POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// The TUI's view of a session: results become the status line, a state
+/// snapshot updates the camera-state panel, and every pass of the loop
+/// redraws the frame.
+struct Tui<'a, B: Backend> {
+    terminal: &'a mut Terminal<B>,
+    state: AppState,
+}
 
-/// How long to wait after the most recent camera-changing command before
-/// requesting a fresh state snapshot. Debounces a burst of nudges (e.g.
-/// holding a key down) into a single query once movement actually stops,
-/// rather than polling on a fixed interval regardless of whether anything
-/// changed. Shared with [`crate::cli`]; see [`POLL_INTERVAL`].
-pub const QUIESCENCE_INTERVAL: Duration = Duration::from_millis(300);
+impl<B: Backend> Report for Tui<'_, B>
+where
+    // Every backend's error is an `Error`; these are what it takes to box one
+    // up as an `io::Error`, which is the currency the session loop deals in.
+    B::Error: Send + Sync + 'static,
+{
+    fn refresh(&mut self) -> io::Result<()> {
+        // Split the borrow: the draw closure reads the state that sits right
+        // next to the terminal being drawn to.
+        let Self { terminal, state } = self;
+        terminal
+            .draw(|frame| ui::render(frame, state))
+            .map_err(io::Error::other)?;
+        Ok(())
+    }
 
-/// Applies one worker [`Outcome`] to `state`: everything but a successful
-/// state query becomes the status line; a successful state query updates
-/// the camera-state panel instead.
-fn apply_outcome(state: &mut AppState, outcome: Outcome) {
-    let text = worker::describe_outcome(&outcome);
-    match outcome {
-        Outcome::State(Ok(_)) => state.camera_state = Some(text),
-        _ => state.status = Some(text),
+    fn status(&mut self, text: &str) -> io::Result<()> {
+        self.state.status = Some(text.to_string());
+        Ok(())
+    }
+
+    fn camera_state(&mut self, text: &str) -> io::Result<()> {
+        self.state.camera_state = Some(text.to_string());
+        Ok(())
     }
 }
 
-/// Runs the interactive event loop until the user quits or the worker
-/// thread goes away.
+/// Runs the interactive TUI until the user quits or the worker thread goes
+/// away.
 pub fn run(
     terminal: &mut DefaultTerminal,
     connection: Connection,
     intents: &Sender<Intent>,
     results: &Receiver<Outcome>,
-) -> Result<(), Error> {
-    let mut state = AppState {
-        connection,
-        ..AppState::default()
+) -> io::Result<()> {
+    let mut tui = Tui {
+        terminal,
+        state: AppState {
+            connection,
+            ..AppState::default()
+        },
     };
-    // Query once up front so the info panel doesn't sit on "(no state yet)"
-    // until the first command; `elapsed() >= QUIESCENCE_INTERVAL` is already
-    // true on the first loop iteration below.
-    let mut pending_state_query = true;
-    let mut last_command_at = Instant::now() - QUIESCENCE_INTERVAL;
-
-    loop {
-        terminal
-            .draw(|frame| ui::render(frame, &state))
-            .map_err(|e| Error::TransportError(e.to_string().into()))?;
-
-        let has_key =
-            event::poll(POLL_INTERVAL).map_err(|e| Error::TransportError(e.to_string().into()))?;
-        if has_key {
-            let event = event::read().map_err(|e| Error::TransportError(e.to_string().into()))?;
-            if let Event::Key(key) = event {
-                match keymap::map_key(key) {
-                    Some(Action::Quit) => return Ok(()),
-                    Some(Action::Camera(intent)) => {
-                        state.status = Some(worker::describe_busy(intent));
-                        let _ = intents.send(intent);
-                        pending_state_query = true;
-                        last_command_at = Instant::now();
-                    }
-                    None => {}
-                }
-            }
-        }
-
-        loop {
-            match results.try_recv() {
-                Ok(outcome) => apply_outcome(&mut state, outcome),
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => return Ok(()),
-            }
-        }
-
-        if pending_state_query && last_command_at.elapsed() >= QUIESCENCE_INTERVAL {
-            let _ = intents.send(Intent::QueryState);
-            pending_state_query = false;
-        }
-    }
+    session::run(intents, results, &mut tui)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::backend::TestBackend;
 
-    fn sample_camera_state() -> crate::state::CameraState {
-        crate::state::CameraState {
-            power_on: true,
-            pan_tilt: grafton_visca::camera::PanTiltPosition::new(0, 0),
-            zoom: grafton_visca::types::ZoomPosition::try_from(0u16).unwrap(),
-            focus: grafton_visca::types::FocusPosition::new(0),
-        }
+    fn test_terminal() -> Terminal<TestBackend> {
+        Terminal::new(TestBackend::new(80, 10)).expect("test backend should initialize")
+    }
+
+    fn rendered(backend: &TestBackend) -> String {
+        backend
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
     }
 
     #[test]
-    fn a_successful_state_query_updates_the_camera_state_panel_not_the_status_line() {
-        let mut state = AppState {
-            status: Some("stale".to_string()),
-            ..AppState::default()
+    fn a_result_becomes_the_status_line_and_leaves_the_state_panel_alone() {
+        let mut terminal = test_terminal();
+        let mut tui = Tui {
+            terminal: &mut terminal,
+            state: AppState::default(),
         };
-        apply_outcome(&mut state, Outcome::State(Ok(sample_camera_state())));
-        assert!(state.camera_state.unwrap().contains("power=on"));
-        assert_eq!(state.status.as_deref(), Some("stale"));
+
+        tui.status("recall preset 3...").unwrap();
+
+        assert_eq!(tui.state.status.as_deref(), Some("recall preset 3..."));
+        assert_eq!(tui.state.camera_state, None);
     }
 
     #[test]
-    fn anything_else_updates_the_status_line_not_the_camera_state_panel() {
-        let mut state = AppState::default();
-        apply_outcome(&mut state, Outcome::Done(Intent::RecallPreset(3), Ok(())));
-        assert!(state.status.unwrap().contains("preset 3"));
-        assert_eq!(state.camera_state, None);
+    fn a_state_snapshot_becomes_the_state_panel_and_leaves_the_status_alone() {
+        let mut terminal = test_terminal();
+        let mut tui = Tui {
+            terminal: &mut terminal,
+            state: AppState {
+                status: Some("stale".to_string()),
+                ..AppState::default()
+            },
+        };
+
+        tui.camera_state("power=on pan=0 tilt=0").unwrap();
+
+        assert_eq!(
+            tui.state.camera_state.as_deref(),
+            Some("power=on pan=0 tilt=0")
+        );
+        assert_eq!(tui.state.status.as_deref(), Some("stale"));
+    }
+
+    #[test]
+    fn refreshing_draws_the_current_state() {
+        let mut terminal = test_terminal();
+        let mut tui = Tui {
+            terminal: &mut terminal,
+            state: AppState::default(),
+        };
+
+        tui.camera_state("power=on pan=-120 tilt=45").unwrap();
+        tui.refresh().unwrap();
+
+        assert!(rendered(terminal.backend()).contains("pan=-120"));
     }
 }

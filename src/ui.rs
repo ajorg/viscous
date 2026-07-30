@@ -38,8 +38,8 @@ pub struct AppState {
     pub status: Option<String>,
 }
 
-pub const KEY_LEGEND: &str =
-    "arrows/shift+arrows: pan-tilt  []/-=: zoom  ,./<>: focus  1-6: recall preset  q/ctrl-d: quit";
+pub const KEY_LEGEND: &str = "hold to move \u{2014} arrows/shift+arrows: pan-tilt  []/-=: zoom  \
+     ,./<>: focus  1-6: recall preset  q/ctrl-d: quit";
 
 /// Renders `state` into `frame`.
 pub fn render(frame: &mut Frame, state: &AppState) {
@@ -123,7 +123,9 @@ mod tests {
     #[test]
     fn shows_key_legend_when_no_status_set() {
         let content = render_to_string(&AppState::default());
-        assert!(content.contains("recall preset"));
+        // Matched near the front of the legend: it's longer than the 80
+        // columns this renders into, so the tail gets clipped.
+        assert!(content.contains("pan-tilt"));
     }
 
     #[test]
@@ -134,7 +136,7 @@ mod tests {
         };
         let content = render_to_string(&state);
         assert!(content.contains("preset 3 saved"));
-        assert!(!content.contains("recall preset"));
+        assert!(!content.contains("pan-tilt"));
     }
 
     #[test]

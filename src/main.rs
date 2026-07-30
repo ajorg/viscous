@@ -81,7 +81,6 @@ fn main() -> ExitCode {
         let stdout = io::stdout();
         let mut stdout = stdout.lock();
         cli::run(&mut stdout, &connection_summary, &intent_tx, &result_rx)
-            .map_err(|error| grafton_visca::Error::TransportError(error.to_string().into()))
     } else {
         let connection = Connection::Connected {
             baud_rate,

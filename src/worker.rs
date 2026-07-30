@@ -1,33 +1,39 @@
 //! Runs camera commands on a dedicated thread so the UI thread never blocks
-//! on VISCA's ack/completion round trip (which, for real movement commands,
-//! can take as long as the physical move itself).
+//! on VISCA's ack/completion round trip (which, for a preset recall, can take
+//! as long as the physical move itself).
 
 use std::sync::mpsc::{Receiver, Sender};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use grafton_visca::{
     BlockingClient, Error,
     camera::profiles::GenericVisca,
+    command::PanTiltDirection,
     transport::{BlockingTransport, HasTransportConfig},
 };
 
 use crate::{
     focus::{self, FocusDirection},
-    pan_tilt::{self, NudgeDirection},
+    pan_tilt::{self, Velocity},
     preset,
     state::{self, CameraState},
     zoom::{self, ZoomDirection},
 };
 
+/// How long to wait for the camera to confirm a stop sent on the way out
+/// before giving up on it. Long enough for a command that's merely waiting
+/// its turn on the wire, short enough not to hold up quitting.
+const STOP_CONFIRM_TIMEOUT: Duration = Duration::from_millis(500);
+
 /// A camera action requested by the UI.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Intent {
-    /// Nudge pan/tilt in a direction by the given number of degrees.
-    NudgePanTilt(NudgeDirection, f64),
-    /// Nudge zoom in a direction for the given duration.
-    NudgeZoom(ZoomDirection, Duration),
-    /// Nudge focus in a direction for the given duration.
-    NudgeFocus(FocusDirection, Duration),
+    /// Set the continuous pan/tilt drive, or stop it.
+    DrivePanTilt(Velocity),
+    /// Start driving zoom in a direction, or stop it with `None`.
+    DriveZoom(Option<ZoomDirection>),
+    /// Start driving focus in a direction, or stop it with `None`.
+    DriveFocus(Option<FocusDirection>),
     /// Recall the given 1-based preset number.
     RecallPreset(u8),
     /// Save the current position to the given 1-based preset number.
@@ -47,14 +53,66 @@ pub enum Outcome {
     State(Result<CameraState, Error>),
 }
 
+/// One of the camera's continuous controls.
+///
+/// Two intents for the same control sitting in the queue together make the
+/// earlier one meaningless: a drive command isn't a step to be replayed, it's
+/// a statement of what the camera should be doing *now*, and only the last
+/// one still says that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Control {
+    PanTilt,
+    Zoom,
+    Focus,
+}
+
+/// Which continuous control an intent drives, if any.
+fn control(intent: Intent) -> Option<Control> {
+    match intent {
+        Intent::DrivePanTilt(_) => Some(Control::PanTilt),
+        Intent::DriveZoom(_) => Some(Control::Zoom),
+        Intent::DriveFocus(_) => Some(Control::Focus),
+        Intent::RecallPreset(_) | Intent::SavePreset(_) | Intent::QueryState => None,
+    }
+}
+
+/// Drops every queued drive command that a later one for the same control
+/// has already superseded, leaving everything else in order.
+///
+/// Without this, a control held down while the camera is slow to answer
+/// builds a backlog of velocities the user has already moved on from, and
+/// releasing it stops nothing until that backlog has played out.
+fn coalesced(batch: &[Intent]) -> Vec<Intent> {
+    let mut superseded = Vec::new();
+    let mut kept: Vec<Intent> = batch
+        .iter()
+        .rev()
+        .copied()
+        .filter(|intent| match control(*intent) {
+            None => true,
+            Some(control) if superseded.contains(&control) => false,
+            Some(control) => {
+                superseded.push(control);
+                true
+            }
+        })
+        .collect();
+    kept.reverse();
+    kept
+}
+
 /// A short human description of an intent, for status/log messages.
 pub fn describe(intent: Intent) -> String {
     match intent {
-        Intent::NudgePanTilt(direction, _) => format!("pan/tilt {}", direction_label(direction)),
-        Intent::NudgeZoom(ZoomDirection::In, _) => "zoom in".to_string(),
-        Intent::NudgeZoom(ZoomDirection::Out, _) => "zoom out".to_string(),
-        Intent::NudgeFocus(FocusDirection::Near, _) => "focus near".to_string(),
-        Intent::NudgeFocus(FocusDirection::Far, _) => "focus far".to_string(),
+        Intent::DrivePanTilt(velocity) => {
+            format!("pan/tilt {}", direction_label(velocity.direction))
+        }
+        Intent::DriveZoom(None) => "zoom stop".to_string(),
+        Intent::DriveZoom(Some(ZoomDirection::In)) => "zoom in".to_string(),
+        Intent::DriveZoom(Some(ZoomDirection::Out)) => "zoom out".to_string(),
+        Intent::DriveFocus(None) => "focus stop".to_string(),
+        Intent::DriveFocus(Some(FocusDirection::Near)) => "focus near".to_string(),
+        Intent::DriveFocus(Some(FocusDirection::Far)) => "focus far".to_string(),
         Intent::RecallPreset(number) => format!("recall preset {number}"),
         Intent::SavePreset(number) => format!("save preset {number}"),
         Intent::QueryState => "state query".to_string(),
@@ -81,16 +139,17 @@ pub fn describe_busy(intent: Intent) -> String {
     format!("{}...", describe(intent))
 }
 
-fn direction_label(direction: NudgeDirection) -> &'static str {
+fn direction_label(direction: PanTiltDirection) -> &'static str {
     match direction {
-        NudgeDirection::Up => "up",
-        NudgeDirection::Down => "down",
-        NudgeDirection::Left => "left",
-        NudgeDirection::Right => "right",
-        NudgeDirection::UpLeft => "up-left",
-        NudgeDirection::UpRight => "up-right",
-        NudgeDirection::DownLeft => "down-left",
-        NudgeDirection::DownRight => "down-right",
+        PanTiltDirection::Up => "up",
+        PanTiltDirection::Down => "down",
+        PanTiltDirection::Left => "left",
+        PanTiltDirection::Right => "right",
+        PanTiltDirection::UpLeft => "up-left",
+        PanTiltDirection::UpRight => "up-right",
+        PanTiltDirection::DownLeft => "down-left",
+        PanTiltDirection::DownRight => "down-right",
+        PanTiltDirection::Stop => "stop",
     }
 }
 
@@ -99,14 +158,10 @@ where
     T: BlockingTransport + HasTransportConfig + 'static,
 {
     match intent {
-        Intent::NudgePanTilt(direction, degrees) => {
-            Outcome::Done(intent, pan_tilt::nudge_pan_tilt(camera, direction, degrees))
-        }
-        Intent::NudgeZoom(direction, duration) => {
-            Outcome::Done(intent, zoom::nudge_zoom(camera, direction, duration))
-        }
-        Intent::NudgeFocus(direction, duration) => {
-            Outcome::Done(intent, focus::nudge_focus(camera, direction, duration))
+        Intent::DrivePanTilt(velocity) => Outcome::Done(intent, pan_tilt::drive(camera, velocity)),
+        Intent::DriveZoom(direction) => Outcome::Done(intent, zoom::drive_zoom(camera, direction)),
+        Intent::DriveFocus(direction) => {
+            Outcome::Done(intent, focus::drive_focus(camera, direction))
         }
         Intent::RecallPreset(number) => {
             Outcome::Done(intent, preset::recall_preset(camera, number))
@@ -130,9 +185,36 @@ pub fn run<T>(
     T: BlockingTransport + HasTransportConfig + 'static,
 {
     for intent in intents {
-        let outcome = dispatch(camera, intent);
-        if results.send(outcome).is_err() {
-            break;
+        // Anything that piled up while the previous command was on the wire
+        // is waiting here, so take the whole backlog at once rather than one
+        // per round trip: that's what makes it possible to notice a drive
+        // command has already been superseded before bothering to send it.
+        let mut batch = vec![intent];
+        batch.extend(intents.try_iter());
+
+        for intent in coalesced(&batch) {
+            if results.send(dispatch(camera, intent)).is_err() {
+                return;
+            }
+        }
+    }
+}
+
+/// Sends `stop` and waits briefly for the camera to answer it.
+///
+/// Worth waiting for on the way out: a continuous drive keeps running on the
+/// camera until something stops it, so a stop still sitting in the queue when
+/// the process exits would leave the camera panning on its own.
+pub fn stop_and_confirm(intents: &Sender<Intent>, results: &Receiver<Outcome>, stop: Intent) {
+    if intents.send(stop).is_err() {
+        return;
+    }
+    let deadline = Instant::now() + STOP_CONFIRM_TIMEOUT;
+    // Outcomes for commands sent earlier can still be ahead of this one.
+    while let Ok(outcome) = results.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+    {
+        if matches!(outcome, Outcome::Done(intent, _) if intent == stop) {
+            return;
         }
     }
 }
@@ -143,23 +225,35 @@ mod tests {
     use grafton_visca::testing::testkit::{ScriptedBlockingTransport, helpers};
     use std::sync::mpsc::channel;
 
+    fn scripted_camera(
+        replies: Vec<grafton_visca::testing::testkit::Step>,
+    ) -> BlockingClient<GenericVisca, ScriptedBlockingTransport> {
+        grafton_visca::CameraBuilder::new()
+            .build_blocking::<GenericVisca, _>(ScriptedBlockingTransport::new(replies))
+            .expect("camera should build from a scripted transport")
+    }
+
+    fn drive_right() -> Intent {
+        Intent::DrivePanTilt(pan_tilt::velocity_from_axes(1.0, 0.0))
+    }
+
+    fn drive_left() -> Intent {
+        Intent::DrivePanTilt(pan_tilt::velocity_from_axes(-1.0, 0.0))
+    }
+
     #[test]
     fn run_dispatches_each_intent_and_reports_its_result() {
-        let transport = ScriptedBlockingTransport::new(vec![
+        let camera = scripted_camera(vec![
             helpers::standard_command_response(1), // preset recall
-            helpers::standard_command_response(1), // zoom start
-            helpers::standard_command_response(1), // zoom stop
+            helpers::standard_command_response(1), // zoom drive
         ]);
-        let camera = grafton_visca::CameraBuilder::new()
-            .build_blocking::<GenericVisca, _>(transport)
-            .expect("camera should build from a scripted transport");
 
         let (intent_tx, intent_rx) = channel();
         let (result_tx, result_rx) = channel();
 
         intent_tx.send(Intent::RecallPreset(1)).unwrap();
         intent_tx
-            .send(Intent::NudgeZoom(ZoomDirection::In, Duration::ZERO))
+            .send(Intent::DriveZoom(Some(ZoomDirection::In)))
             .unwrap();
         drop(intent_tx);
 
@@ -171,20 +265,17 @@ mod tests {
         );
         assert!(
             matches!(result_rx.recv().unwrap(), Outcome::Done(_, Ok(()))),
-            "zoom nudge should succeed"
+            "zoom drive should succeed"
         );
         assert!(result_rx.try_recv().is_err(), "no further results expected");
     }
 
     #[test]
     fn run_reports_command_errors_without_stopping() {
-        let transport = ScriptedBlockingTransport::new(vec![
+        let camera = scripted_camera(vec![
             helpers::errors::syntax_error(1),
             helpers::standard_command_response(1),
         ]);
-        let camera = grafton_visca::CameraBuilder::new()
-            .build_blocking::<GenericVisca, _>(transport)
-            .expect("camera should build from a scripted transport");
 
         let (intent_tx, intent_rx) = channel();
         let (result_tx, result_rx) = channel();
@@ -206,14 +297,39 @@ mod tests {
     }
 
     #[test]
+    fn run_sends_only_the_last_of_a_queued_run_of_drive_commands() {
+        // A single scripted reply, so a second drive command reaching the
+        // camera would fail rather than silently pass.
+        let camera = scripted_camera(vec![helpers::standard_command_response(1)]);
+
+        let (intent_tx, intent_rx) = channel();
+        let (result_tx, result_rx) = channel();
+
+        intent_tx.send(drive_right()).unwrap();
+        intent_tx.send(drive_left()).unwrap();
+        intent_tx
+            .send(Intent::DrivePanTilt(Velocity::STOP))
+            .unwrap();
+        drop(intent_tx);
+
+        run(&camera, &intent_rx, &result_tx);
+
+        assert!(
+            matches!(
+                result_rx.recv().unwrap(),
+                Outcome::Done(Intent::DrivePanTilt(velocity), Ok(())) if velocity.is_stop()
+            ),
+            "only the stop should have been sent"
+        );
+        assert!(result_rx.try_recv().is_err(), "no further results expected");
+    }
+
+    #[test]
     fn query_state_intent_reports_state() {
-        let transport = ScriptedBlockingTransport::new(vec![
+        let camera = scripted_camera(vec![
             helpers::power_inquiry_response(true),
             helpers::errors::syntax_error(1), // next inquiry: fine to fail, we just want Outcome::State
         ]);
-        let camera = grafton_visca::CameraBuilder::new()
-            .build_blocking::<GenericVisca, _>(transport)
-            .expect("camera should build from a scripted transport");
 
         let (intent_tx, intent_rx) = channel();
         let (result_tx, result_rx) = channel();
@@ -227,11 +343,101 @@ mod tests {
     }
 
     #[test]
+    fn coalescing_keeps_only_the_last_drive_for_each_control() {
+        let batch = [
+            drive_right(),
+            Intent::DriveZoom(Some(ZoomDirection::In)),
+            drive_left(),
+            Intent::DriveZoom(None),
+        ];
+        assert_eq!(
+            coalesced(&batch),
+            vec![drive_left(), Intent::DriveZoom(None)]
+        );
+    }
+
+    #[test]
+    fn coalescing_leaves_one_off_commands_alone_and_in_order() {
+        let batch = [
+            Intent::RecallPreset(1),
+            Intent::SavePreset(2),
+            Intent::QueryState,
+        ];
+        assert_eq!(coalesced(&batch), batch.to_vec());
+    }
+
+    #[test]
+    fn coalescing_keeps_a_drive_that_nothing_supersedes_in_place() {
+        let batch = [drive_right(), Intent::RecallPreset(1)];
+        assert_eq!(coalesced(&batch), batch.to_vec());
+    }
+
+    #[test]
+    fn stop_and_confirm_sends_the_stop_and_returns_once_it_is_answered() {
+        let (intent_tx, intent_rx) = channel();
+        let (result_tx, result_rx) = channel();
+        let stop = Intent::DrivePanTilt(Velocity::STOP);
+
+        // An unrelated outcome ahead of the stop's own, as happens when an
+        // earlier command is still being answered.
+        result_tx
+            .send(Outcome::Done(Intent::RecallPreset(1), Ok(())))
+            .unwrap();
+        result_tx.send(Outcome::Done(stop, Ok(()))).unwrap();
+
+        stop_and_confirm(&intent_tx, &result_rx, stop);
+
+        assert_eq!(intent_rx.try_recv().unwrap(), stop);
+    }
+
+    #[test]
+    fn stop_and_confirm_gives_up_when_the_worker_is_gone() {
+        let (intent_tx, intent_rx) = channel::<Intent>();
+        let (_result_tx, result_rx) = channel::<Outcome>();
+        drop(intent_rx);
+
+        // Nowhere to send it and nothing to wait for: returns rather than
+        // sitting out the timeout.
+        stop_and_confirm(&intent_tx, &result_rx, Intent::DriveZoom(None));
+    }
+
+    fn sample_camera_state() -> CameraState {
+        CameraState {
+            power_on: true,
+            pan_tilt: grafton_visca::camera::PanTiltPosition::new(0, 0),
+            zoom: grafton_visca::types::ZoomPosition::try_from(0u16).unwrap(),
+            focus: grafton_visca::types::FocusPosition::new(0),
+        }
+    }
+
+    #[test]
     fn describe_names_the_pan_tilt_direction() {
         assert_eq!(
-            describe(Intent::NudgePanTilt(NudgeDirection::UpRight, 2.0)),
+            describe(Intent::DrivePanTilt(pan_tilt::velocity_from_axes(1.0, 1.0))),
             "pan/tilt up-right"
         );
+    }
+
+    #[test]
+    fn describe_calls_a_pan_tilt_stop_a_stop() {
+        assert_eq!(
+            describe(Intent::DrivePanTilt(Velocity::STOP)),
+            "pan/tilt stop"
+        );
+    }
+
+    #[test]
+    fn describe_distinguishes_starting_a_drive_from_stopping_it() {
+        assert_eq!(
+            describe(Intent::DriveZoom(Some(ZoomDirection::In))),
+            "zoom in"
+        );
+        assert_eq!(describe(Intent::DriveZoom(None)), "zoom stop");
+        assert_eq!(
+            describe(Intent::DriveFocus(Some(FocusDirection::Near))),
+            "focus near"
+        );
+        assert_eq!(describe(Intent::DriveFocus(None)), "focus stop");
     }
 
     #[test]
@@ -245,15 +451,6 @@ mod tests {
         assert_eq!(describe_busy(Intent::RecallPreset(2)), "recall preset 2...");
     }
 
-    fn sample_camera_state() -> CameraState {
-        CameraState {
-            power_on: true,
-            pan_tilt: grafton_visca::camera::PanTiltPosition::new(0, 0),
-            zoom: grafton_visca::types::ZoomPosition::try_from(0u16).unwrap(),
-            focus: grafton_visca::types::FocusPosition::new(0),
-        }
-    }
-
     #[test]
     fn describe_outcome_confirms_a_successful_command() {
         assert_eq!(
@@ -265,7 +462,7 @@ mod tests {
     #[test]
     fn describe_outcome_reports_a_failed_command() {
         let text = describe_outcome(&Outcome::Done(
-            Intent::NudgeZoom(ZoomDirection::In, Duration::ZERO),
+            Intent::DriveZoom(Some(ZoomDirection::In)),
             Err(Error::Timeout),
         ));
         assert!(text.contains("error"));
