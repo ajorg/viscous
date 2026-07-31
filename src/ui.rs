@@ -12,17 +12,19 @@ use ratatui::{
 /// Where the camera connection attempt currently stands.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub enum Connection {
-    /// Still probing candidate baud rates.
+    /// Still trying to reach a camera.
     #[default]
     Connecting,
     /// Connected, with the version-inquiry summary to show.
     Connected {
-        /// The baud rate that worked.
-        baud_rate: u32,
+        /// How the connection was made, already phrased for display — the
+        /// transports differ in what's worth saying (a baud rate, an address),
+        /// so each one words its own.
+        link: String,
         /// A human-readable version summary.
         version: String,
     },
-    /// No candidate baud rate produced a response.
+    /// Nothing answered.
     Failed(String),
 }
 
@@ -52,9 +54,7 @@ pub fn render(frame: &mut Frame, state: &AppState) {
 
     let header_text = match &state.connection {
         Connection::Connecting => "Connecting...".to_string(),
-        Connection::Connected { baud_rate, version } => {
-            format!("Connected at {baud_rate} baud \u{2014} {version}")
-        }
+        Connection::Connected { link, version } => format!("{link} \u{2014} {version}"),
         Connection::Failed(reason) => format!("Connection failed: {reason}"),
     };
     frame.render_widget(Paragraph::new(header_text), header);
@@ -97,16 +97,16 @@ mod tests {
     }
 
     #[test]
-    fn shows_baud_rate_and_version_once_connected() {
+    fn shows_the_link_and_version_once_connected() {
         let state = AppState {
             connection: Connection::Connected {
-                baud_rate: 9600,
+                link: "Connected at 9600 baud".to_string(),
                 version: "vendor=0x0001".to_string(),
             },
             ..AppState::default()
         };
         let content = render_to_string(&state);
-        assert!(content.contains("9600"));
+        assert!(content.contains("Connected at 9600 baud"));
         assert!(content.contains("vendor=0x0001"));
     }
 

@@ -3,59 +3,42 @@ use std::process::ExitCode;
 use std::sync::mpsc::channel;
 use std::thread;
 
-use grafton_visca::camera::{Connect, profiles::GenericVisca};
 use viscous::{
     app, cli,
-    connection::{
-        DEFAULT_CAMERA_BAUD_RATES, ProbeOutcome, discover_baud_rate, format_version, query_version,
-    },
+    connection::{self, Connected, Target, format_version},
     ui::Connection,
     worker,
 };
 
-/// Parses `viscous [--cli] <serial-port>`, returning whether bare CLI mode
-/// was explicitly requested and the port path.
+/// Parses `viscous [--cli] <target>`, returning whether bare CLI mode was
+/// explicitly requested and what to connect to.
 fn parse_args(args: impl Iterator<Item = String>) -> Option<(bool, String)> {
     let mut cli_requested = false;
-    let mut port = None;
+    let mut target = None;
     for arg in args {
         if arg == "--cli" {
             cli_requested = true;
-        } else if port.is_none() {
-            port = Some(arg);
+        } else if target.is_none() {
+            target = Some(arg);
         }
     }
-    Some((cli_requested, port?))
+    Some((cli_requested, target?))
 }
 
 fn main() -> ExitCode {
-    let Some((cli_requested, port)) = parse_args(std::env::args().skip(1)) else {
-        eprintln!("usage: viscous [--cli] <serial-port>");
+    let Some((cli_requested, target)) = parse_args(std::env::args().skip(1)) else {
+        eprintln!("usage: viscous [--cli] <serial-port|tcp://host[:port]>");
         return ExitCode::FAILURE;
     };
 
-    let outcome = discover_baud_rate(DEFAULT_CAMERA_BAUD_RATES, |baud_rate| {
-        let camera = Connect::open_serial_blocking::<GenericVisca>(&port, baud_rate)?;
-        query_version(&camera)
-    });
-
-    let (baud_rate, version) = match outcome {
-        ProbeOutcome::Connected { baud_rate, version } => (baud_rate, version),
-        ProbeOutcome::NoResponse => {
-            eprintln!(
-                "No response from camera on {port} at any of the candidate baud rates: {DEFAULT_CAMERA_BAUD_RATES:?}"
-            );
-            return ExitCode::FAILURE;
-        }
-    };
-
-    // Discovery already proved a camera answers at `baud_rate`; reconnect
-    // once more for a client the worker thread can hold onto, since the
-    // discovery closure's client only lived for the duration of that probe.
-    let camera = match Connect::open_serial_blocking::<GenericVisca>(&port, baud_rate) {
-        Ok(camera) => camera,
+    let Connected {
+        camera,
+        link,
+        version,
+    } = match connection::connect(&Target::from(target.as_str())) {
+        Ok(connected) => connected,
         Err(error) => {
-            eprintln!("Connected during discovery but the follow-up connection failed: {error}");
+            eprintln!("{error}");
             return ExitCode::FAILURE;
         }
     };
@@ -72,10 +55,7 @@ fn main() -> ExitCode {
         worker::run(&camera, &intent_rx, &result_tx);
     });
 
-    let connection_summary = format!(
-        "Connected at {baud_rate} baud \u{2014} {}",
-        format_version(&version)
-    );
+    let connection_summary = format!("{link} \u{2014} {}", format_version(&version));
 
     let app_result = if cli_requested {
         let stdout = io::stdout();
@@ -83,7 +63,7 @@ fn main() -> ExitCode {
         cli::run(&mut stdout, &connection_summary, &intent_tx, &result_rx)
     } else {
         let connection = Connection::Connected {
-            baud_rate,
+            link,
             version: format_version(&version),
         };
         let mut terminal = ratatui::init();

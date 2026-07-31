@@ -16,11 +16,8 @@ use std::thread;
 use std::time::Instant;
 
 use eframe::egui;
-use grafton_visca::camera::{Connect, profiles::GenericVisca};
 use viscous::{
-    connection::{
-        DEFAULT_CAMERA_BAUD_RATES, ProbeOutcome, discover_baud_rate, format_version, query_version,
-    },
+    connection::{self, Target, format_version},
     focus::FocusDirection,
     pan_tilt::Velocity,
     session::{POLL_INTERVAL, QUIESCENCE_INTERVAL},
@@ -33,51 +30,33 @@ use viscous::{
 enum Connection {
     Disconnected,
     Connecting,
-    Connected { baud_rate: u32, summary: String },
+    Connected { link: String, summary: String },
     Failed(String),
 }
 
-/// What a successful [`connect`] produces: the version summary plus the
-/// channels the rest of the app uses to talk to the worker thread.
-struct Connected {
-    baud_rate: u32,
+/// What a successful [`connect`] produces: how to describe the connection,
+/// plus the channels the rest of the app uses to talk to the worker thread.
+struct Worker {
+    link: String,
     summary: String,
     intents: Sender<Intent>,
     results: Receiver<Outcome>,
 }
 
-/// Discovers and connects to a camera on `port`, replaying the same
-/// probe-then-reconnect sequence `main.rs` uses (discovery's own connection
-/// only lives for the duration of the probe, so a second connection is
-/// opened for the worker thread to hold onto), then starts its worker
-/// thread.
-fn connect(port: &str) -> Result<Connected, String> {
-    let outcome = discover_baud_rate(DEFAULT_CAMERA_BAUD_RATES, |baud_rate| {
-        let camera = Connect::open_serial_blocking::<GenericVisca>(port, baud_rate)?;
-        query_version(&camera)
-    });
-
-    let (baud_rate, version) = match outcome {
-        ProbeOutcome::Connected { baud_rate, version } => (baud_rate, version),
-        ProbeOutcome::NoResponse => {
-            return Err(format!(
-                "No response from camera on {port} at any of the candidate baud rates: {DEFAULT_CAMERA_BAUD_RATES:?}"
-            ));
-        }
-    };
-
-    let camera =
-        Connect::open_serial_blocking::<GenericVisca>(port, baud_rate).map_err(|error| {
-            format!("Connected during discovery but the follow-up connection failed: {error}")
-        })?;
+/// Connects to whatever `target` names — a serial port or a `tcp://` endpoint,
+/// same string either front end takes — and starts the worker thread that owns
+/// the camera from then on.
+fn connect(target: &str) -> Result<Worker, String> {
+    let connected = connection::connect(&Target::from(target))?;
 
     let (worker_tx, worker_rx) = mpsc::channel::<Intent>();
     let (result_tx, result_rx) = mpsc::channel::<Outcome>();
+    let camera = connected.camera;
     thread::spawn(move || worker::run(&camera, &worker_rx, &result_tx));
 
-    Ok(Connected {
-        baud_rate,
-        summary: format_version(&version),
+    Ok(Worker {
+        link: connected.link,
+        summary: format_version(&connected.version),
         intents: worker_tx,
         results: result_rx,
     })
@@ -86,7 +65,7 @@ fn connect(port: &str) -> Result<Connected, String> {
 struct App {
     port_input: String,
     connection: Connection,
-    connect_rx: Option<Receiver<Result<Connected, String>>>,
+    connect_rx: Option<Receiver<Result<Worker, String>>>,
     intents: Option<Sender<Intent>>,
     results: Option<Receiver<Outcome>>,
     camera_state: Option<String>,
@@ -177,13 +156,13 @@ impl App {
         let Ok(result) = rx.try_recv() else { return };
         self.connect_rx = None;
         match result {
-            Ok(connected) => {
+            Ok(worker) => {
                 self.connection = Connection::Connected {
-                    baud_rate: connected.baud_rate,
-                    summary: connected.summary,
+                    link: worker.link,
+                    summary: worker.summary,
                 };
-                self.intents = Some(connected.intents);
-                self.results = Some(connected.results);
+                self.intents = Some(worker.intents);
+                self.results = Some(worker.results);
                 // Query once up front so the info panel doesn't sit empty
                 // until the first command; `elapsed() >= QUIESCENCE_INTERVAL`
                 // is already true here.
@@ -217,9 +196,10 @@ impl App {
     fn draw_connect_form(&mut self, ui: &mut egui::Ui) {
         ui.add_space(48.0);
         ui.horizontal(|ui| {
-            ui.label("Serial port:");
+            ui.label("Camera:");
             ui.text_edit_singleline(&mut self.port_input);
         });
+        ui.small("a serial port (/dev/ttyUSB0, COM3), or tcp://host:port for VISCA over IP");
         ui.add_space(8.0);
         let connecting = matches!(self.connection, Connection::Connecting);
         if ui
@@ -339,8 +319,8 @@ impl eframe::App for App {
             let header = match &self.connection {
                 Connection::Disconnected | Connection::Failed(_) => None,
                 Connection::Connecting => Some("Connecting...".to_string()),
-                Connection::Connected { baud_rate, summary } => {
-                    Some(format!("Connected at {baud_rate} baud \u{2014} {summary}"))
+                Connection::Connected { link, summary } => {
+                    Some(format!("{link} \u{2014} {summary}"))
                 }
             };
             if let Some(text) = header {

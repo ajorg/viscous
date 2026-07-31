@@ -2,7 +2,7 @@
 name = "viscous"
 version = "0.1.0"
 edition = "2024"
-description = "A keyboard-driven TUI for controlling a VISCA PTZ camera over serial"
+description = "A keyboard-driven TUI for controlling a VISCA PTZ camera over serial or TCP"
 license = "0BSD"
 
 [dependencies]

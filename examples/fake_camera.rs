@@ -34,9 +34,18 @@
 //! pair from [com0com](https://com0com.sourceforge.net/) — pass an existing
 //! port name instead: `cargo run --example fake_camera -- COM10`, then point
 //! `viscous`/a GUI at the pair's other end (`COM11`).
+//!
+//! Passing `tcp://[host:]port` instead listens for VISCA over IP, which needs
+//! no virtual serial hardware on either side and reaches across machines: run
+//! `cargo run --example fake_camera -- tcp://5678` in WSL (or on any other
+//! host) and point a Windows build at `tcp://localhost:5678`. A generic-VISCA
+//! camera sends the same raw bytes over IP as over RS-232 — right down to the
+//! `0x81` address, since VISCA over IP is fixed at device 1 — so everything
+//! below the transport is shared.
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
@@ -509,25 +518,125 @@ fn send(master: &mut impl Write, label: &str, bytes: &[u8]) -> bool {
 }
 
 /// Anything the simulator can read VISCA bytes from and write replies to —
-/// either a self-provisioned pty (Unix) or a named port opened directly
-/// (any platform, including a Windows com0com pair).
+/// a self-provisioned pty (Unix), a named port opened directly (any platform,
+/// including a Windows com0com pair), or a TCP client.
 trait Transport: Read + Write {}
 impl<T: Read + Write + ?Sized> Transport for T {}
 
-/// Opens the transport to simulate the camera on: a named port if one was
-/// given on the command line (works everywhere, including a com0com pair on
-/// Windows), otherwise a self-provisioned pty pair (Unix only — there's no
-/// equivalent auto-provisioning trick on Windows).
-fn open_transport(port_name: Option<&str>) -> io::Result<Box<dyn Transport>> {
-    if let Some(port_name) = port_name {
-        let port = serialport::new(port_name, 9600)
-            .timeout(Duration::from_millis(500))
-            .open()
-            .map_err(io::Error::other)?;
-        println!("Fake camera listening on {port_name}");
-        return Ok(Box::new(port));
+/// The prefix that asks for a TCP listener instead of a serial port.
+const TCP_SCHEME: &str = "tcp://";
+
+/// The port a real generic-VISCA camera listens on for VISCA over IP, and so
+/// the one to default to here — a client that leaves the port off its own
+/// address lands on the same number.
+const DEFAULT_TCP_PORT: u16 = 5678;
+
+/// A TCP listener that serves one client at a time, waiting for the next as
+/// soon as the current one goes away.
+///
+/// One at a time because a real camera is one camera: two clients driving it
+/// at once is the client's problem to avoid, not something to simulate away.
+/// But the connection itself has to be disposable — `viscous` reconnects
+/// during startup, and a GUI can disconnect and reconnect at any point — so
+/// the listener outlives any single client.
+struct TcpPort {
+    listener: TcpListener,
+    client: Option<TcpStream>,
+}
+
+impl TcpPort {
+    /// The client currently being served, waiting for one to connect if there
+    /// isn't one.
+    fn client(&mut self) -> io::Result<&mut TcpStream> {
+        if self.client.is_none() {
+            let (client, peer) = self.listener.accept()?;
+            println!("Client connected from {peer}");
+            self.client = Some(client);
+        }
+        Ok(self.client.as_mut().expect("a client just connected"))
+    }
+}
+
+impl Read for TcpPort {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let read = self.client()?.read(buffer);
+        // End of stream or an error both mean this client is finished with;
+        // dropping it here is what lets the next read wait for a new one
+        // instead of spinning on a dead socket.
+        if !matches!(read, Ok(1..)) {
+            println!("Client disconnected");
+            self.client = None;
+        }
+        read
+    }
+}
+
+impl Write for TcpPort {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        // Deliberately not `client()`: a reply with nobody left to hear it
+        // should fail, not wait for the next client and then answer a question
+        // that client never asked.
+        match &mut self.client {
+            Some(client) => client.write(buffer),
+            None => Err(io::Error::other("no client connected")),
+        }
     }
 
+    fn flush(&mut self) -> io::Result<()> {
+        match &mut self.client {
+            Some(client) => client.flush(),
+            None => Ok(()),
+        }
+    }
+}
+
+/// Where a `tcp://...` argument says to listen.
+///
+/// A bare port — or nothing after the scheme at all — binds every interface
+/// rather than loopback: the whole reason to run this over TCP instead of a
+/// pty is to be reachable from somewhere else (a Windows build talking to a
+/// camera in WSL), and a loopback-only bind defeats that silently.
+fn bind_address(argument: &str) -> String {
+    match argument {
+        "" => format!("0.0.0.0:{DEFAULT_TCP_PORT}"),
+        port if !port.contains(':') => format!("0.0.0.0:{port}"),
+        address => address.to_string(),
+    }
+}
+
+fn open_tcp(argument: &str) -> io::Result<Box<dyn Transport>> {
+    let listener = TcpListener::bind(bind_address(argument))?;
+    let bound = listener.local_addr()?;
+
+    println!("Fake camera listening on tcp://{bound}");
+    println!(
+        "In another terminal, run: cargo run -- tcp://127.0.0.1:{}",
+        bound.port()
+    );
+    println!(
+        "From a Windows build against this camera running in WSL, connect to \
+         tcp://localhost:{} — WSL forwards it.",
+        bound.port()
+    );
+
+    Ok(Box::new(TcpPort {
+        listener,
+        client: None,
+    }))
+}
+
+fn open_serial(port_name: &str) -> io::Result<Box<dyn Transport>> {
+    let port = serialport::new(port_name, 9600)
+        .timeout(Duration::from_millis(500))
+        .open()
+        .map_err(io::Error::other)?;
+    println!("Fake camera listening on {port_name}");
+    Ok(Box::new(port))
+}
+
+/// Provisions a pty pair and simulates the camera on the master end. Unix
+/// only — there's no equivalent auto-provisioning trick on Windows.
+fn open_pty() -> io::Result<Box<dyn Transport>> {
     #[cfg(unix)]
     {
         let master = posix_openpt(OFlag::O_RDWR).expect("posix_openpt should succeed");
@@ -544,17 +653,30 @@ fn open_transport(port_name: Option<&str>) -> io::Result<Box<dyn Transport>> {
     #[cfg(not(unix))]
     {
         Err(io::Error::other(
-            "no port given, and this platform can't provision one automatically (that's a \
-             Unix-only pty trick) — install com0com (https://com0com.sourceforge.net/), create \
-             a port pair (e.g. COM10 <-> COM11), then run: cargo run --example fake_camera -- \
-             COM10 (and point viscous/the GUI at COM11)",
+            "no target given, and this platform can't provision a serial port automatically \
+             (that's a Unix-only pty trick) — either run: cargo run --example fake_camera -- \
+             tcp://5678 (and point viscous/the GUI at tcp://localhost:5678), or install com0com \
+             (https://com0com.sourceforge.net/), create a port pair (e.g. COM10 <-> COM11), then \
+             run: cargo run --example fake_camera -- COM10 (and point viscous/the GUI at COM11)",
         ))
     }
 }
 
+/// Opens the transport to simulate the camera on, from the command line
+/// argument naming it.
+fn open_transport(target: Option<&str>) -> io::Result<Box<dyn Transport>> {
+    match target {
+        Some(target) => match target.strip_prefix(TCP_SCHEME) {
+            Some(address) => open_tcp(address),
+            None => open_serial(target),
+        },
+        None => open_pty(),
+    }
+}
+
 fn main() -> io::Result<()> {
-    let port_name = std::env::args().nth(1);
-    let mut transport = open_transport(port_name.as_deref())?;
+    let target = std::env::args().nth(1);
+    let mut transport = open_transport(target.as_deref())?;
 
     let mut camera = CameraSim::new();
     let mut message = Vec::new();
@@ -562,12 +684,13 @@ fn main() -> io::Result<()> {
 
     loop {
         // A pty master reads as EIO once every slave-side file descriptor is
-        // closed (rather than blocking until a new one opens), and a named
-        // port's read simply times out while nothing's connected. viscous
-        // itself disconnects and reconnects during startup (a short
-        // discovery probe, then a fresh connection for the real session),
-        // so treat any read failure as "no client right now" and wait for
-        // the next one instead of exiting.
+        // closed (rather than blocking until a new one opens), a named port's
+        // read simply times out while nothing's connected, and a TCP read
+        // ends at the moment the client hangs up. viscous itself disconnects
+        // and reconnects during serial startup (a short discovery probe, then
+        // a fresh connection for the real session), so treat any read failure
+        // as "no client right now" and wait for the next one instead of
+        // exiting.
         if transport.read_exact(&mut byte).is_err() {
             message.clear();
             std::thread::sleep(Duration::from_millis(50));
