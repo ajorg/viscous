@@ -16,6 +16,7 @@ use std::thread;
 use std::time::Instant;
 
 use eframe::egui;
+use egui::{TextWrapMode, Ui, Vec2, vec2};
 use viscous::{
     connection::{self, Target, format_version},
     focus::FocusDirection,
@@ -70,6 +71,9 @@ struct App {
     results: Option<Receiver<Outcome>>,
     camera_state: Option<String>,
     status: Option<String>,
+    /// The window size most recently asked for, so the request only goes out
+    /// when the size the contents need actually changes.
+    requested_size: Option<Vec2>,
     pending_state_query: bool,
     last_command_at: Instant,
     /// What each continuous control was last told to do. A drive keeps running
@@ -90,6 +94,7 @@ impl Default for App {
             results: None,
             camera_state: None,
             status: None,
+            requested_size: None,
             pending_state_query: false,
             last_command_at: Instant::now(),
             pan_tilt: Velocity::STOP,
@@ -193,8 +198,70 @@ impl App {
         }
     }
 
-    fn draw_connect_form(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(48.0);
+    /// Draws one frame and sizes the window around what it drew.
+    fn draw(&mut self, ui: &mut Ui) {
+        self.poll_connect();
+        self.drain_results();
+        self.send_query_state_if_due();
+
+        let frame = egui::Frame::central_panel(ui.style());
+        let margin = frame.total_margin();
+        // The panel fills the window whatever it holds, so it can't say how big
+        // the window should be; a child inside it stops at its contents, and
+        // that extent is the layout's own idea of the room it needs.
+        let content = egui::CentralPanel::default()
+            .frame(frame)
+            .show(ui, |ui| ui.scope(|ui| self.draw_contents(ui)).response.rect)
+            .inner;
+
+        let size = window_size_for(content, vec2(margin.right, margin.bottom));
+        self.fit_window_to(ui.ctx(), size);
+    }
+
+    fn draw_contents(&mut self, ui: &mut Ui) {
+        // Text sizes itself to what it says, like every other widget here:
+        // a line that wrapped would be fitting itself to a window that is in
+        // turn fitted to it.
+        ui.style_mut().wrap_mode = Some(TextWrapMode::Extend);
+
+        ui.heading("Viscous");
+
+        let header = match &self.connection {
+            Connection::Disconnected | Connection::Failed(_) => None,
+            Connection::Connecting => Some("Connecting...".to_string()),
+            Connection::Connected { link, summary } => Some(format!("{link} \u{2014} {summary}")),
+        };
+        if let Some(text) = header {
+            ui.label(text);
+        }
+
+        ui.add_space(8.0);
+        if matches!(self.connection, Connection::Connected { .. }) {
+            self.draw_controls(ui);
+        } else {
+            self.draw_connect_form(ui);
+        }
+    }
+
+    /// Asks for a window of exactly `size`, and shows it once there's a size
+    /// worth showing it at.
+    ///
+    /// Only asks when that size changes: what comes back is never quite what
+    /// was asked for — whole pixels, a platform minimum, the user's own drag —
+    /// and repeating the request every frame would turn that into an argument.
+    fn fit_window_to(&mut self, ctx: &egui::Context, size: Vec2) {
+        if self.requested_size == Some(size) {
+            return;
+        }
+        let first_fit = self.requested_size.is_none();
+        self.requested_size = Some(size);
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+        if first_fit {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        }
+    }
+
+    fn draw_connect_form(&mut self, ui: &mut Ui) {
         ui.horizontal(|ui| {
             ui.label("Camera:");
             ui.text_edit_singleline(&mut self.port_input);
@@ -215,31 +282,40 @@ impl App {
         }
     }
 
-    fn draw_controls(&mut self, ui: &mut egui::Ui) {
+    fn draw_controls(&mut self, ui: &mut Ui) {
         ui.label(self.status.as_deref().unwrap_or("Ready"));
         ui.add_space(16.0);
 
         ui.horizontal(|ui| {
-            ui.vertical(|ui| {
-                let pan_tilt = joystick::pan_tilt_pad(ui, 240.0);
-                if pan_tilt != self.pan_tilt {
-                    self.pan_tilt = pan_tilt;
-                    self.send_intent(Intent::DrivePanTilt(pan_tilt));
-                }
+            let drives_height = ui
+                .vertical(|ui| {
+                    let pan_tilt = joystick::pan_tilt_pad(ui, 240.0);
+                    if pan_tilt != self.pan_tilt {
+                        self.pan_tilt = pan_tilt;
+                        self.send_intent(Intent::DrivePanTilt(pan_tilt));
+                    }
 
-                ui.add_space(16.0);
-                let (zoom, focus) = drive_buttons(ui);
-                if zoom != self.zoom {
-                    self.zoom = zoom;
-                    self.send_intent(Intent::DriveZoom(zoom));
-                }
-                if focus != self.focus {
-                    self.focus = focus;
-                    self.send_intent(Intent::DriveFocus(focus));
-                }
+                    ui.add_space(16.0);
+                    let (zoom, focus) = drive_buttons(ui);
+                    if zoom != self.zoom {
+                        self.zoom = zoom;
+                        self.send_intent(Intent::DriveZoom(zoom));
+                    }
+                    if focus != self.focus {
+                        self.focus = focus;
+                        self.send_intent(Intent::DriveFocus(focus));
+                    }
+                })
+                .response
+                .rect
+                .height();
+
+            // Left to itself a separator fills whatever height it's offered,
+            // which here is the whole window; hold it to what it separates.
+            ui.scope(|ui| {
+                ui.set_max_height(drives_height);
+                ui.separator();
             });
-
-            ui.separator();
 
             ui.vertical(|ui| {
                 for number in 1..=6u8 {
@@ -307,33 +383,16 @@ fn drive_buttons(ui: &mut egui::Ui) -> (Option<ZoomDirection>, Option<FocusDirec
     (zoom, focus)
 }
 
+/// The window size that exactly holds `content`, which was measured inside the
+/// panel's margins: its far corner already counts the leading margin, leaving
+/// only the trailing one to add.
+fn window_size_for(content: egui::Rect, trailing_margin: Vec2) -> Vec2 {
+    (content.max.to_vec2() + trailing_margin).ceil()
+}
+
 impl eframe::App for App {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.poll_connect();
-        self.drain_results();
-        self.send_query_state_if_due();
-
-        egui::CentralPanel::default().show(ui, |ui| {
-            ui.heading("Viscous");
-
-            let header = match &self.connection {
-                Connection::Disconnected | Connection::Failed(_) => None,
-                Connection::Connecting => Some("Connecting...".to_string()),
-                Connection::Connected { link, summary } => {
-                    Some(format!("{link} \u{2014} {summary}"))
-                }
-            };
-            if let Some(text) = header {
-                ui.label(text);
-            }
-
-            ui.add_space(8.0);
-            if matches!(self.connection, Connection::Connected { .. }) {
-                self.draw_controls(ui);
-            } else {
-                self.draw_connect_form(ui);
-            }
-        });
+    fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+        self.draw(ui);
 
         // Keep polling for worker results / the debounced state query at
         // the same cadence the session loop's own event poll uses.
@@ -346,9 +405,123 @@ impl eframe::App for App {
 }
 
 fn main() -> eframe::Result {
+    // Born hidden, with no size of its own: the first frame measures the
+    // layout, resizes the window to fit it and only then shows it, so nothing
+    // here has to guess at a size the contents already know.
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default().with_visible(false),
+        ..Default::default()
+    };
     eframe::run_native(
         "Viscous",
-        eframe::NativeOptions::default(),
+        options,
         Box::new(|_cc| Ok(Box::new(App::default()))),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egui::{Pos2, Rect, ViewportCommand};
+
+    /// Lays out one frame of the app on a screen of the given size, with no
+    /// window and no GPU, and reports what it asked the platform for.
+    fn frame_on_screen(app: &mut App, ctx: &egui::Context, screen: Vec2) -> Vec<ViewportCommand> {
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, screen)),
+            ..Default::default()
+        };
+        ctx.run_ui(input, |ui| app.draw(ui))
+            .viewport_output
+            .into_values()
+            .flat_map(|viewport| viewport.commands)
+            .collect()
+    }
+
+    fn requested_size(commands: &[ViewportCommand]) -> Option<Vec2> {
+        commands.iter().find_map(|command| match command {
+            ViewportCommand::InnerSize(size) => Some(*size),
+            _ => None,
+        })
+    }
+
+    fn fit_on_screen(screen: Vec2) -> Vec2 {
+        let commands = frame_on_screen(&mut App::default(), &egui::Context::default(), screen);
+        requested_size(&commands).expect("the first frame should size the window")
+    }
+
+    #[test]
+    fn window_size_for_adds_the_margin_left_on_the_far_side() {
+        let content = Rect::from_min_size(egui::pos2(8.0, 8.0), vec2(100.0, 50.0));
+
+        assert_eq!(window_size_for(content, vec2(8.0, 8.0)), vec2(116.0, 66.0));
+    }
+
+    #[test]
+    fn the_window_is_asked_to_fit_the_contents_not_the_screen() {
+        let small = fit_on_screen(vec2(800.0, 600.0));
+        let large = fit_on_screen(vec2(1600.0, 1200.0));
+
+        assert_eq!(small, large, "the screen should not decide the layout");
+        assert!(
+            small.x < 800.0 && small.y < 600.0,
+            "the connect form should ask for less than the screen it was given: {small:?}"
+        );
+    }
+
+    #[test]
+    fn the_window_grows_to_fit_the_controls_once_connected() {
+        let ctx = egui::Context::default();
+        let screen = vec2(1600.0, 1200.0);
+        let mut app = App::default();
+
+        let form = requested_size(&frame_on_screen(&mut app, &ctx, screen))
+            .expect("the first frame should size the window");
+        app.connection = Connection::Connected {
+            link: "Connected at 9600 baud".to_string(),
+            summary: "vendor=Sony (0x0020)".to_string(),
+        };
+        let controls = requested_size(&frame_on_screen(&mut app, &ctx, screen))
+            .expect("swapping the form for the controls should resize the window");
+
+        assert!(
+            controls.x > form.x && controls.y > form.y,
+            "the controls need more room than the form: {controls:?} vs {form:?}"
+        );
+        assert!(
+            controls.x < 1600.0 && controls.y < 1200.0,
+            "the controls should still ask for less than the screen: {controls:?}"
+        );
+    }
+
+    #[test]
+    fn the_window_is_left_alone_while_the_contents_stay_put() {
+        let ctx = egui::Context::default();
+        let screen = vec2(800.0, 600.0);
+        let mut app = App::default();
+
+        frame_on_screen(&mut app, &ctx, screen);
+        let commands = frame_on_screen(&mut app, &ctx, screen);
+
+        assert_eq!(requested_size(&commands), None);
+    }
+
+    #[test]
+    fn the_window_is_shown_once_it_has_been_fitted() {
+        let ctx = egui::Context::default();
+        let screen = vec2(800.0, 600.0);
+        let mut app = App::default();
+
+        let first = frame_on_screen(&mut app, &ctx, screen);
+        let second = frame_on_screen(&mut app, &ctx, screen);
+
+        assert!(
+            first.contains(&ViewportCommand::Visible(true)),
+            "the hidden window should be shown after its first fit: {first:?}"
+        );
+        assert!(
+            !second.contains(&ViewportCommand::Visible(true)),
+            "showing it once is enough: {second:?}"
+        );
+    }
 }
