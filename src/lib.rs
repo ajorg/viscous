@@ -11,6 +11,7 @@ pub mod power;
 pub mod preset;
 pub mod session;
 pub mod state;
+pub mod title;
 pub mod ui;
 pub mod worker;
 pub mod zoom;

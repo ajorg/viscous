@@ -17,6 +17,7 @@ use crate::{
     pan_tilt::{self, Velocity},
     power, preset,
     state::{self, CameraState},
+    title::{self, Title},
     zoom::{self, ZoomDirection},
 };
 
@@ -46,6 +47,10 @@ pub enum Intent {
     ResetPanTilt,
     /// Power the camera on, or put it into standby.
     SetPower(bool),
+    /// Give the camera a title to hold, without showing it.
+    SetTitle(Title),
+    /// Show the title the camera is holding, or hide it.
+    ShowTitle(bool),
     /// Query the camera's current pan/tilt/zoom/focus/power state.
     QueryState,
 }
@@ -86,6 +91,8 @@ fn control(intent: Intent) -> Option<Control> {
         | Intent::Home
         | Intent::ResetPanTilt
         | Intent::SetPower(_)
+        | Intent::SetTitle(_)
+        | Intent::ShowTitle(_)
         | Intent::QueryState => None,
     }
 }
@@ -135,6 +142,9 @@ pub fn describe(intent: Intent) -> String {
         Intent::ResetPanTilt => "pan/tilt reset".to_string(),
         Intent::SetPower(true) => "power on".to_string(),
         Intent::SetPower(false) => "power off".to_string(),
+        Intent::SetTitle(title) => format!("set title \"{title}\""),
+        Intent::ShowTitle(true) => "show title".to_string(),
+        Intent::ShowTitle(false) => "hide title".to_string(),
         Intent::QueryState => "state query".to_string(),
     }
 }
@@ -191,6 +201,8 @@ where
         Intent::Home => Outcome::Done(intent, pan_tilt::home(camera)),
         Intent::ResetPanTilt => Outcome::Done(intent, pan_tilt::reset(camera)),
         Intent::SetPower(on) => Outcome::Done(intent, power::set_power(camera, on)),
+        Intent::SetTitle(text) => Outcome::Done(intent, title::set_title(camera, text)),
+        Intent::ShowTitle(on) => Outcome::Done(intent, title::show_title(camera, on)),
         Intent::QueryState => Outcome::State(state::query_state(camera)),
     }
 }

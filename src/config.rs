@@ -14,6 +14,9 @@ pub struct Config {
     /// Preset number -> label.
     #[serde(default)]
     pub presets: BTreeMap<u8, String>,
+    /// Title slot number -> the text to burn into the video output.
+    #[serde(default)]
+    pub titles: BTreeMap<u8, String>,
 }
 
 /// An error loading or saving the config file.

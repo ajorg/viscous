@@ -27,12 +27,17 @@ use viscous::{
     pan_tilt::{self, Velocity},
     session::{POLL_INTERVAL, QUIESCENCE_INTERVAL},
     state::{self, CameraState},
+    title::{self, Title},
     worker::{self, Intent, Outcome},
     zoom::ZoomDirection,
 };
 
 /// How many preset slots to offer — the same six the TUI's number keys reach.
 const PRESETS: u8 = 6;
+
+/// How many titles to keep on hand. The camera holds one at a time; these are
+/// the ones an operator switches between during a session.
+const TITLES: u8 = 3;
 
 /// What the controls are asking the camera to be doing right now — one
 /// snapshot per frame, whichever control it came from.
@@ -117,8 +122,12 @@ struct App {
     /// What each preset is of, in the operator's own words, keyed by the same
     /// 1-based number as the buttons.
     preset_labels: BTreeMap<u8, String>,
-    /// Where those descriptions are kept between runs, if this platform has
-    /// somewhere to keep them.
+    /// The titles kept on hand to burn into the video output, and which of
+    /// them the camera was last told to show.
+    titles: BTreeMap<u8, String>,
+    shown_title: Option<u8>,
+    /// Where the descriptions and titles are kept between runs, if this
+    /// platform has somewhere to keep them.
     config_path: Option<PathBuf>,
     /// The window size most recently asked for, so the request only goes out
     /// when the size the contents need actually changes.
@@ -144,6 +153,8 @@ impl Default for App {
             camera_state: None,
             status: None,
             preset_labels: BTreeMap::new(),
+            titles: BTreeMap::new(),
+            shown_title: None,
             config_path: None,
             requested_size: None,
             pending_state_query: false,
@@ -168,7 +179,10 @@ impl App {
             ..Self::default()
         };
         match app.config_path.as_deref().map(config::load) {
-            Some(Ok(config)) => app.preset_labels = config.presets,
+            Some(Ok(config)) => {
+                app.preset_labels = config.presets;
+                app.titles = config.titles;
+            }
             Some(Err(error)) => app.status = Some(error.to_string()),
             None => {}
         }
@@ -407,7 +421,11 @@ impl App {
                 ui.separator();
             });
 
-            ui.vertical(|ui| self.draw_presets(ui));
+            ui.vertical(|ui| {
+                self.draw_presets(ui);
+                ui.add_space(12.0);
+                self.draw_titles(ui);
+            });
         });
 
         // The pointer wins where both are asking at once: a hand on the mouse
@@ -474,7 +492,7 @@ impl App {
 
                 let description = self.preset_labels.entry(number).or_default();
                 if ui.text_edit_singleline(description).lost_focus() {
-                    self.save_preset_labels();
+                    self.save_config();
                 }
 
                 if ui
@@ -488,22 +506,74 @@ impl App {
         }
     }
 
-    /// Writes the preset descriptions back to the config file.
+    /// The titles that can be burned into the camera's video output: one
+    /// shown at a time, since that's all the camera can hold.
     ///
-    /// Slots the operator has left blank are dropped rather than stored empty:
-    /// the file is meant to be readable and editable by hand, and six empty
-    /// strings say nothing.
-    fn save_preset_labels(&mut self) {
+    /// This is for whoever is watching downstream rather than for the
+    /// operator — a name under a speaker, which hymn is being sung — so what
+    /// goes out is what the camera can actually draw: twenty characters,
+    /// uppercase, from its own character set.
+    fn draw_titles(&mut self, ui: &mut Ui) {
+        ui.label("Titles");
+        for number in 1..=TITLES {
+            ui.horizontal(|ui| {
+                let mut shown = self.shown_title == Some(number);
+                if ui
+                    .checkbox(&mut shown, "Show")
+                    .on_hover_text("Burn this title into the video output")
+                    .changed()
+                {
+                    self.show_title(shown.then_some(number));
+                }
+
+                let text = self.titles.entry(number).or_default();
+                if ui.text_edit_singleline(text).lost_focus() {
+                    self.save_config();
+                    // Editing the one on screen changes what is on screen.
+                    if self.shown_title == Some(number) {
+                        self.show_title(Some(number));
+                    }
+                }
+            });
+        }
+        ui.small(format!(
+            "Up to {} uppercase characters, drawn over the picture",
+            title::LENGTH
+        ));
+    }
+
+    /// Shows the given title on the camera, or hides whatever is showing.
+    fn show_title(&mut self, number: Option<u8>) {
+        self.shown_title = number;
+        match number.and_then(|number| self.titles.get(&number)) {
+            Some(text) => {
+                let text = Title::new(text);
+                self.send_intent(Intent::SetTitle(text));
+                self.send_intent(Intent::ShowTitle(true));
+            }
+            None => self.send_intent(Intent::ShowTitle(false)),
+        }
+    }
+
+    /// Writes the preset descriptions and titles back to the config file.
+    ///
+    /// Slots left blank are dropped rather than stored empty: the file is
+    /// meant to be readable and editable by hand, and six empty strings say
+    /// nothing.
+    fn save_config(&mut self) {
         let Some(path) = self.config_path.clone() else {
             return;
         };
-        let config = config::Config {
-            presets: self
-                .preset_labels
+        let written = |slots: &BTreeMap<u8, String>| {
+            slots
                 .iter()
-                .filter(|(_, description)| !description.trim().is_empty())
-                .map(|(number, description)| (*number, description.clone()))
-                .collect(),
+                .filter(|(_, text)| !text.trim().is_empty())
+                .map(|(number, text)| (*number, text.clone()))
+                .collect()
+        };
+        let config = config::Config {
+            presets: written(&self.preset_labels),
+            titles: written(&self.titles),
         };
         if let Err(error) = config::save(&config, &path) {
             self.status = Some(error.to_string());
@@ -696,7 +766,7 @@ impl eframe::App for App {
         self.stop_all_drives();
         // A description still being typed when the window closes never lost
         // focus, so it would otherwise go unsaved.
-        self.save_preset_labels();
+        self.save_config();
     }
 }
 
@@ -930,6 +1000,89 @@ mod tests {
         );
     }
 
+    /// The Show checkbox for title `number`, found by position for the same
+    /// reason the description fields are: the rows are drawn in order.
+    fn show_checkbox<'a>(harness: &'a Harness<'_, App>, number: u8) -> egui_kittest::Node<'a> {
+        harness
+            .get_all_by_label("Show")
+            .nth(usize::from(number) - 1)
+            .expect("every title should have a Show checkbox")
+    }
+
+    #[test]
+    fn showing_a_title_sends_it_to_the_camera_and_turns_it_on() {
+        let (mut app, sent) = connected_app(None);
+        app.titles.insert(2, "Hymn 123".to_string());
+        let mut harness = ui_harness(app);
+
+        show_checkbox(&harness, 2).click();
+        harness.run();
+
+        assert_eq!(
+            sent.try_iter().collect::<Vec<_>>(),
+            vec![
+                Intent::SetTitle(Title::new("Hymn 123")),
+                Intent::ShowTitle(true)
+            ]
+        );
+    }
+
+    #[test]
+    fn only_one_title_can_be_on_screen_because_the_camera_holds_one() {
+        let (mut app, sent) = connected_app(None);
+        app.titles.insert(1, "Podium".to_string());
+        app.titles.insert(2, "Choir".to_string());
+        let mut harness = ui_harness(app);
+
+        show_checkbox(&harness, 1).click();
+        harness.run();
+        show_checkbox(&harness, 2).click();
+        harness.run();
+
+        assert_eq!(harness.state().shown_title, Some(2));
+        assert_eq!(
+            sent.try_iter().last(),
+            Some(Intent::ShowTitle(true)),
+            "switching titles should leave the new one showing"
+        );
+    }
+
+    #[test]
+    fn unchecking_the_shown_title_hides_it() {
+        let (mut app, sent) = connected_app(None);
+        app.titles.insert(1, "Podium".to_string());
+        let mut harness = ui_harness(app);
+
+        show_checkbox(&harness, 1).click();
+        harness.run();
+        let _ = sent.try_iter().count();
+        show_checkbox(&harness, 1).click();
+        harness.run();
+
+        assert_eq!(harness.state().shown_title, None);
+        assert_eq!(
+            sent.try_iter().collect::<Vec<_>>(),
+            vec![Intent::ShowTitle(false)]
+        );
+    }
+
+    #[test]
+    fn a_title_is_kept_between_runs_like_a_preset_description() {
+        let path = test_config_path("titles");
+        let (mut app, _sent) = connected_app(None);
+        app.config_path = Some(path.clone());
+        app.titles.insert(3, "Sister Jones".to_string());
+
+        app.save_config();
+        let reopened = App::with_config(Some(path.clone()));
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(
+            reopened.titles.get(&3).map(String::as_str),
+            Some("Sister Jones")
+        );
+    }
+
     #[test]
     fn a_numbered_preset_button_goes_to_that_preset() {
         let (app, sent) = connected_app(None);
@@ -986,7 +1139,7 @@ mod tests {
         app.preset_labels.insert(1, "Podium".to_string());
         app.preset_labels.insert(2, "   ".to_string());
 
-        app.save_preset_labels();
+        app.save_config();
         let written = std::fs::read_to_string(&path).expect("the config file should be written");
         let _ = std::fs::remove_file(&path);
 

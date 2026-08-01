@@ -56,6 +56,11 @@ use nix::pty::{grantpt, posix_openpt, ptsname_r, unlockpt};
 const TERMINATOR: u8 = 0xFF;
 const OUR_ADDRESS: u8 = 0x81;
 
+/// How many characters the camera's title holds, and the code it pads them
+/// with — the camera's own character set, shared with the app that sends it.
+const TITLE_LENGTH: usize = viscous::title::LENGTH;
+const SPACE: u8 = 0x1B;
+
 /// Simulated pan/tilt speed at full VISCA speed, in raw position units per
 /// second. Chosen so a brief tap of a control moves visibly but a large preset
 /// recall takes a few visible seconds — enough to exercise "in progress"
@@ -92,6 +97,10 @@ struct Preset {
 struct CameraSim {
     power_on: bool,
     auto_focus: bool,
+    /// The title the camera is holding, in its own character codes, and
+    /// whether it's currently burned into the video output.
+    title: [u8; TITLE_LENGTH],
+    title_shown: bool,
     zoom: u16,
     focus: u16,
     pan: i16,
@@ -150,6 +159,8 @@ impl CameraSim {
         Self {
             power_on: true,
             auto_focus: false,
+            title: [SPACE; TITLE_LENGTH],
+            title_shown: false,
             zoom: 0x0000,
             focus: 0x1000,
             pan: 0,
@@ -264,6 +275,11 @@ impl CameraSim {
                 let mode = if self.auto_focus { 0x02 } else { 0x03 };
                 Some(inquiry_reply(&[mode]))
             }
+            // Title display inquiry.
+            [0x04, 0x74] => {
+                let shown = if self.title_shown { 0x02 } else { 0x03 };
+                Some(inquiry_reply(&[shown]))
+            }
             // Zoom position inquiry.
             [0x04, 0x47] => Some(inquiry_reply(&nibbles_u16(self.zoom))),
             // Focus position inquiry.
@@ -325,6 +341,24 @@ impl CameraSim {
             // Power on / off (standby).
             [0x04, 0x00, on @ (0x02 | 0x03)] => {
                 self.power_on = *on == 0x02;
+                Duration::ZERO
+            }
+            // Title set: 73 pp <10 bytes>. Part 00 is where the title goes,
+            // 01 and 02 are its characters, ten at a time.
+            [0x04, 0x73, part, characters @ ..] if characters.len() == 10 => {
+                let offset = usize::from(part.saturating_sub(1)) * 10;
+                if (0x01..=0x02).contains(part) {
+                    self.title[offset..offset + 10].copy_from_slice(characters);
+                }
+                Duration::ZERO
+            }
+            // Title display: clear, on, off.
+            [0x04, 0x74, action] => {
+                match action {
+                    0x00 => self.title = [SPACE; TITLE_LENGTH],
+                    0x02 => self.title_shown = true,
+                    _ => self.title_shown = false,
+                }
                 Duration::ZERO
             }
             // Auto / manual focus.
@@ -495,6 +529,20 @@ fn describe_message(message: &[u8]) -> String {
         (Some(0x01), [0x06, 0x05]) => "pan/tilt reset".to_string(),
         (Some(0x01), [0x04, 0x00, 0x02]) => "power on".to_string(),
         (Some(0x01), [0x04, 0x00, 0x03]) => "power off".to_string(),
+        (Some(0x01), [0x04, 0x73, part @ (0x01 | 0x02), characters @ ..])
+            if characters.len() == 10 =>
+        {
+            let first = (part - 1) * 10 + 1;
+            format!(
+                "title characters {first}-{} \"{}\"",
+                first + 9,
+                viscous::title::decode(characters)
+            )
+        }
+        (Some(0x01), [0x04, 0x73, 0x00, ..]) => "title appearance".to_string(),
+        (Some(0x01), [0x04, 0x74, 0x00]) => "title clear".to_string(),
+        (Some(0x01), [0x04, 0x74, 0x02]) => "title display on".to_string(),
+        (Some(0x01), [0x04, 0x74, 0x03]) => "title display off".to_string(),
         (Some(0x01), [0x04, 0x38, 0x02]) => "auto focus".to_string(),
         (Some(0x01), [0x04, 0x38, 0x03]) => "manual focus".to_string(),
         (Some(0x01), [0x04, 0x07, 0x00]) => "zoom stop".to_string(),
@@ -524,6 +572,7 @@ fn describe_message(message: &[u8]) -> String {
         (Some(0x09), [0x00, 0x02]) => "version inquiry".to_string(),
         (Some(0x09), [0x04, 0x00]) => "power inquiry".to_string(),
         (Some(0x09), [0x04, 0x38]) => "focus mode inquiry".to_string(),
+        (Some(0x09), [0x04, 0x74]) => "title display inquiry".to_string(),
         (Some(0x09), [0x04, 0x47]) => "zoom position inquiry".to_string(),
         (Some(0x09), [0x04, 0x48]) => "focus position inquiry".to_string(),
         (Some(0x09), [0x06, 0x12]) => "pan/tilt position inquiry".to_string(),
