@@ -11,6 +11,8 @@
 
 mod joystick;
 
+use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::Instant;
@@ -18,6 +20,7 @@ use std::time::Instant;
 use eframe::egui;
 use egui::{TextWrapMode, Ui, Vec2, vec2};
 use viscous::{
+    config,
     connection::{self, Target, format_version},
     focus::FocusDirection,
     pan_tilt::Velocity,
@@ -26,6 +29,9 @@ use viscous::{
     worker::{self, Intent, Outcome},
     zoom::ZoomDirection,
 };
+
+/// How many preset slots to offer — the same six the TUI's number keys reach.
+const PRESETS: u8 = 6;
 
 /// Where the camera connection attempt currently stands.
 enum Connection {
@@ -74,6 +80,12 @@ struct App {
     /// from it, not just the readout at the bottom.
     camera_state: Option<CameraState>,
     status: Option<String>,
+    /// What each preset is of, in the operator's own words, keyed by the same
+    /// 1-based number as the buttons.
+    preset_labels: BTreeMap<u8, String>,
+    /// Where those descriptions are kept between runs, if this platform has
+    /// somewhere to keep them.
+    config_path: Option<PathBuf>,
     /// The window size most recently asked for, so the request only goes out
     /// when the size the contents need actually changes.
     requested_size: Option<Vec2>,
@@ -97,6 +109,8 @@ impl Default for App {
             results: None,
             camera_state: None,
             status: None,
+            preset_labels: BTreeMap::new(),
+            config_path: None,
             requested_size: None,
             pending_state_query: false,
             last_command_at: Instant::now(),
@@ -108,6 +122,25 @@ impl Default for App {
 }
 
 impl App {
+    /// An app that keeps its preset descriptions in `path`, starting from
+    /// whatever is already there.
+    ///
+    /// A config file that won't load says so in the status line rather than
+    /// being silently replaced: the descriptions are typed by hand and worth
+    /// more than the blank slate that would overwrite them.
+    fn with_config(path: Option<PathBuf>) -> Self {
+        let mut app = Self {
+            config_path: path,
+            ..Self::default()
+        };
+        match app.config_path.as_deref().map(config::load) {
+            Some(Ok(config)) => app.preset_labels = config.presets,
+            Some(Err(error)) => app.status = Some(error.to_string()),
+            None => {}
+        }
+        app
+    }
+
     /// Sends a user-initiated intent: shows a busy message immediately (the
     /// real completion, which can take seconds, arrives later via
     /// [`Self::drain_results`]) and arms the debounced follow-up state
@@ -342,23 +375,67 @@ impl App {
                 ui.separator();
             });
 
-            ui.vertical(|ui| {
-                for number in 1..=6u8 {
-                    ui.horizontal(|ui| {
-                        if ui.button(format!("Preset {number}")).clicked() {
-                            self.send_intent(Intent::RecallPreset(number));
-                        }
-                        if ui.button("Save").clicked() {
-                            self.send_intent(Intent::SavePreset(number));
-                        }
-                    });
-                }
-            });
+            ui.vertical(|ui| self.draw_presets(ui));
         });
 
         if let Some(state) = &self.camera_state {
             ui.add_space(16.0);
             ui.label(state::format_state(state));
+        }
+    }
+
+    /// The preset slots: go to one, describe it, or store where the camera is
+    /// pointing now.
+    ///
+    /// The description is the operator's, not the camera's — VISCA presets are
+    /// bare numbers — so it lives in this program's config file and comes back
+    /// on the next run.
+    fn draw_presets(&mut self, ui: &mut Ui) {
+        for number in 1..=PRESETS {
+            ui.horizontal(|ui| {
+                if ui
+                    .button(number.to_string())
+                    .on_hover_text(format!("Go to preset {number}"))
+                    .clicked()
+                {
+                    self.send_intent(Intent::RecallPreset(number));
+                }
+
+                let description = self.preset_labels.entry(number).or_default();
+                if ui.text_edit_singleline(description).lost_focus() {
+                    self.save_preset_labels();
+                }
+
+                if ui
+                    .button("Save")
+                    .on_hover_text(format!("Store this position as preset {number}"))
+                    .clicked()
+                {
+                    self.send_intent(Intent::SavePreset(number));
+                }
+            });
+        }
+    }
+
+    /// Writes the preset descriptions back to the config file.
+    ///
+    /// Slots the operator has left blank are dropped rather than stored empty:
+    /// the file is meant to be readable and editable by hand, and six empty
+    /// strings say nothing.
+    fn save_preset_labels(&mut self) {
+        let Some(path) = self.config_path.clone() else {
+            return;
+        };
+        let config = config::Config {
+            presets: self
+                .preset_labels
+                .iter()
+                .filter(|(_, description)| !description.trim().is_empty())
+                .map(|(number, description)| (*number, description.clone()))
+                .collect(),
+        };
+        if let Err(error) = config::save(&config, &path) {
+            self.status = Some(error.to_string());
         }
     }
 
@@ -469,6 +546,9 @@ impl eframe::App for App {
 
     fn on_exit(&mut self) {
         self.stop_all_drives();
+        // A description still being typed when the window closes never lost
+        // focus, so it would otherwise go unsaved.
+        self.save_preset_labels();
     }
 }
 
@@ -483,7 +563,7 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "Viscous",
         options,
-        Box::new(|_cc| Ok(Box::new(App::default()))),
+        Box::new(|_cc| Ok(Box::new(App::with_config(config::default_path().ok())))),
     )
 }
 
@@ -559,6 +639,102 @@ mod tests {
     fn fit_on_screen(screen: Vec2) -> Vec2 {
         let commands = frame_on_screen(&mut App::default(), &egui::Context::default(), screen);
         requested_size(&commands).expect("the first frame should size the window")
+    }
+
+    /// The description field belonging to preset `number`: the rows are drawn
+    /// in order, so the nth text field is the nth preset's.
+    fn description_field<'a>(harness: &'a Harness<'_, App>, number: u8) -> egui_kittest::Node<'a> {
+        harness
+            .get_all_by_role(egui::accesskit::Role::TextInput)
+            .nth(usize::from(number) - 1)
+            .expect("every preset should have a description field")
+    }
+
+    fn test_config_path(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("viscous-gui-test-{name}.toml"));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    #[test]
+    fn a_numbered_preset_button_goes_to_that_preset() {
+        let (app, sent) = connected_app(None);
+
+        assert_eq!(click(app, &sent, "3"), vec![Intent::RecallPreset(3)]);
+    }
+
+    #[test]
+    fn each_preset_row_stores_its_own_slot() {
+        let (app, sent) = connected_app(None);
+        let mut harness = ui_harness(app);
+
+        harness
+            .get_all_by_label("Save")
+            .nth(2)
+            .expect("there should be a Save button for every preset")
+            .click();
+        harness.run();
+
+        assert_eq!(
+            sent.try_iter().collect::<Vec<_>>(),
+            vec![Intent::SavePreset(3)]
+        );
+    }
+
+    #[test]
+    fn a_typed_preset_description_is_there_again_next_run() {
+        let path = test_config_path("preset-description");
+        let (mut app, _sent) = connected_app(None);
+        app.config_path = Some(path.clone());
+        let mut harness = ui_harness(app);
+
+        description_field(&harness, 2).click();
+        harness.run();
+        description_field(&harness, 2).type_text("Chorister");
+        harness.run();
+        // Clicking away is what commits the edit, the same as tabbing out of it.
+        harness.get_by_label("Home").click();
+        harness.run();
+
+        let reopened = App::with_config(Some(path.clone()));
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            reopened.preset_labels.get(&2).map(String::as_str),
+            Some("Chorister")
+        );
+    }
+
+    #[test]
+    fn preset_slots_left_blank_are_not_written_out() {
+        let path = test_config_path("blank-presets");
+        let (mut app, _sent) = connected_app(None);
+        app.config_path = Some(path.clone());
+        app.preset_labels.insert(1, "Podium".to_string());
+        app.preset_labels.insert(2, "   ".to_string());
+
+        app.save_preset_labels();
+        let written = std::fs::read_to_string(&path).expect("the config file should be written");
+        let _ = std::fs::remove_file(&path);
+
+        assert!(written.contains("Podium"));
+        assert!(
+            !written.contains("2 ="),
+            "a blank description should be left out: {written}"
+        );
+    }
+
+    #[test]
+    fn a_config_file_that_will_not_load_is_reported_rather_than_overwritten() {
+        let path = test_config_path("malformed");
+        std::fs::write(&path, "not valid toml [[[").expect("write should succeed");
+
+        let app = App::with_config(Some(path.clone()));
+        let still_there = std::fs::read_to_string(&path).expect("the file should still be there");
+        let _ = std::fs::remove_file(&path);
+
+        assert!(app.status.is_some(), "the failure should be visible");
+        assert!(app.preset_labels.is_empty());
+        assert_eq!(still_there, "not valid toml [[[");
     }
 
     #[test]
