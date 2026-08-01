@@ -20,8 +20,8 @@ use crate::{
 /// How far a movement key deflects its axis, as a fraction of full speed. A
 /// keyboard can only really express a couple of speeds, so the plain key is
 /// slow enough to frame a shot with, and shift is everything the camera has.
-const KEY_DEFLECTION: f32 = 0.35;
-const FAST_KEY_DEFLECTION: f32 = 1.0;
+pub const KEY_DEFLECTION: f32 = 0.35;
+pub const FAST_KEY_DEFLECTION: f32 = 1.0;
 
 /// A camera drive that runs for as long as its key is held down.
 #[derive(Debug, Clone, Copy, PartialEq)]

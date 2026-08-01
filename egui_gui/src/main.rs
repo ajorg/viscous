@@ -18,12 +18,13 @@ use std::thread;
 use std::time::Instant;
 
 use eframe::egui;
-use egui::{TextWrapMode, Ui, Vec2, vec2};
+use egui::{Key, TextWrapMode, Ui, Vec2, vec2};
 use viscous::{
     config,
     connection::{self, Target, format_version},
     focus::FocusDirection,
-    pan_tilt::Velocity,
+    keymap::{FAST_KEY_DEFLECTION, KEY_DEFLECTION},
+    pan_tilt::{self, Velocity},
     session::{POLL_INTERVAL, QUIESCENCE_INTERVAL},
     state::{self, CameraState},
     worker::{self, Intent, Outcome},
@@ -32,6 +33,39 @@ use viscous::{
 
 /// How many preset slots to offer — the same six the TUI's number keys reach.
 const PRESETS: u8 = 6;
+
+/// What the controls are asking the camera to be doing right now — one
+/// snapshot per frame, whichever control it came from.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Drives {
+    pan_tilt: Velocity,
+    zoom: Option<ZoomDirection>,
+    focus: Option<FocusDirection>,
+}
+
+impl Drives {
+    /// Nothing being asked for: every control at rest.
+    const STOPPED: Self = Self {
+        pan_tilt: Velocity::STOP,
+        zoom: None,
+        focus: None,
+    };
+
+    /// This set of drives, filled in from `other` wherever it asks for
+    /// nothing — so two controls can be live at once (a drag while a zoom key
+    /// is held) without either cancelling the other.
+    fn or(self, other: Self) -> Self {
+        Self {
+            pan_tilt: if self.pan_tilt.is_stop() {
+                other.pan_tilt
+            } else {
+                self.pan_tilt
+            },
+            zoom: self.zoom.or(other.zoom),
+            focus: self.focus.or(other.focus),
+        }
+    }
+}
 
 /// Where the camera connection attempt currently stands.
 enum Connection {
@@ -341,28 +375,26 @@ impl App {
         ui.label(self.status.as_deref().unwrap_or("Ready"));
         ui.add_space(16.0);
 
+        let mut pointed = Drives::STOPPED;
         ui.horizontal(|ui| {
             let drives_height = ui
                 .vertical(|ui| {
-                    let pan_tilt = joystick::pan_tilt_pad(ui, 240.0);
-                    if pan_tilt != self.pan_tilt {
-                        self.pan_tilt = pan_tilt;
-                        self.send_intent(Intent::DrivePanTilt(pan_tilt));
-                    }
+                    pointed.pan_tilt = joystick::pan_tilt_pad(ui, 240.0);
 
                     ui.add_space(16.0);
-                    let (zoom, focus) = drive_buttons(ui);
-                    if zoom != self.zoom {
-                        self.zoom = zoom;
-                        self.send_intent(Intent::DriveZoom(zoom));
-                    }
-                    if focus != self.focus {
-                        self.focus = focus;
-                        self.send_intent(Intent::DriveFocus(focus));
-                    }
+                    (pointed.zoom, pointed.focus) = drive_buttons(ui);
 
                     ui.add_space(8.0);
                     self.draw_camera_buttons(ui);
+
+                    // The keys aren't discoverable from the buttons, the way
+                    // the pad and the drives are, so they're spelled out —
+                    // as the camera's older Windows control panel did.
+                    ui.add_space(8.0);
+                    ui.small("Drag the pad to pan and tilt \u{2014} further out is faster");
+                    ui.small("Arrows pan and tilt, with shift for full speed");
+                    ui.small("Zoom with [ ] or PgUp/PgDn, focus with , and .");
+                    ui.small("Keys 1-6 go to presets");
                 })
                 .response
                 .rect
@@ -378,10 +410,49 @@ impl App {
             ui.vertical(|ui| self.draw_presets(ui));
         });
 
+        // The pointer wins where both are asking at once: a hand on the mouse
+        // is aiming at a particular shot, and a key that was never released
+        // (a window that lost focus mid-drive, say) shouldn't override it.
+        self.apply_drives(pointed.or(self.keyboard_drives(ui)));
+        if let Some(preset) = keyboard_preset(ui) {
+            self.send_intent(Intent::RecallPreset(preset));
+        }
+
         if let Some(state) = &self.camera_state {
             ui.add_space(16.0);
             ui.label(state::format_state(state));
         }
+    }
+
+    /// Sends whatever changed since the last frame, and nothing that didn't.
+    ///
+    /// A drive keeps running on the camera by itself, so what's already been
+    /// asked for is what the camera is already doing: a command only goes out
+    /// when a control starts asking for something else.
+    fn apply_drives(&mut self, drives: Drives) {
+        if drives.pan_tilt != self.pan_tilt {
+            self.pan_tilt = drives.pan_tilt;
+            self.send_intent(Intent::DrivePanTilt(drives.pan_tilt));
+        }
+        if drives.zoom != self.zoom {
+            self.zoom = drives.zoom;
+            self.send_intent(Intent::DriveZoom(drives.zoom));
+        }
+        if drives.focus != self.focus {
+            self.focus = drives.focus;
+            self.send_intent(Intent::DriveFocus(drives.focus));
+        }
+    }
+
+    /// What the keys currently held down are asking for.
+    ///
+    /// Nothing, while a description field has the keyboard: a "1" typed there
+    /// is a digit, not a preset, and an arrow key is a cursor.
+    fn keyboard_drives(&self, ui: &Ui) -> Drives {
+        if typing(ui) {
+            return Drives::STOPPED;
+        }
+        ui.input(|input| held_drives(|key| input.key_down(key), input.modifiers.shift))
     }
 
     /// The preset slots: go to one, describe it, or store where the camera is
@@ -508,6 +579,83 @@ fn drive_buttons(ui: &mut egui::Ui) -> (Option<ZoomDirection>, Option<FocusDirec
         }
     });
     (zoom, focus)
+}
+
+/// Whether the keyboard currently belongs to a widget — a preset description
+/// being typed into — rather than to the camera.
+fn typing(ui: &Ui) -> bool {
+    ui.memory(|memory| memory.focused().is_some())
+}
+
+/// The drives the held keys are asking for, given a way to ask whether a key
+/// is down.
+///
+/// The bindings are the TUI's, so the same fingers work in either front end:
+/// arrows pan and tilt, `[`/`]` or `-`/`=` zoom, `,`/`.` focus, and shift
+/// means full speed rather than the slower speed a shot is framed at. Page
+/// up/down zoom as well, which is what the camera's older Windows control
+/// panel used.
+fn held_drives(down: impl Fn(Key) -> bool, shift: bool) -> Drives {
+    let deflection = if shift {
+        FAST_KEY_DEFLECTION
+    } else {
+        KEY_DEFLECTION
+    };
+    let axis = |negative: Key, positive: Key| match (down(negative), down(positive)) {
+        (true, false) => -deflection,
+        (false, true) => deflection,
+        _ => 0.0,
+    };
+
+    Drives {
+        pan_tilt: pan_tilt::velocity_from_axes(
+            axis(Key::ArrowLeft, Key::ArrowRight),
+            axis(Key::ArrowDown, Key::ArrowUp),
+        ),
+        zoom: direction(
+            down(Key::OpenBracket) || down(Key::Minus) || down(Key::PageDown),
+            down(Key::CloseBracket) || down(Key::Equals) || down(Key::PageUp),
+            ZoomDirection::Out,
+            ZoomDirection::In,
+        ),
+        focus: direction(
+            down(Key::Comma),
+            down(Key::Period),
+            FocusDirection::Near,
+            FocusDirection::Far,
+        ),
+    }
+}
+
+/// Which of two opposed keys is asking for its direction, or neither when
+/// both are — a control can only go one way at a time.
+fn direction<T>(negative: bool, positive: bool, out: T, in_: T) -> Option<T> {
+    match (negative, positive) {
+        (true, false) => Some(out),
+        (false, true) => Some(in_),
+        _ => None,
+    }
+}
+
+/// The preset a number key was just pressed for, if any.
+fn keyboard_preset(ui: &Ui) -> Option<u8> {
+    if typing(ui) {
+        return None;
+    }
+    const DIGITS: [Key; PRESETS as usize] = [
+        Key::Num1,
+        Key::Num2,
+        Key::Num3,
+        Key::Num4,
+        Key::Num5,
+        Key::Num6,
+    ];
+    ui.input(|input| {
+        DIGITS
+            .iter()
+            .position(|key| input.key_pressed(*key))
+            .map(|index| index as u8 + 1)
+    })
 }
 
 /// Draws a small lamp for the camera's power state: lit when it's awake, dark
@@ -654,6 +802,132 @@ mod tests {
         let path = std::env::temp_dir().join(format!("viscous-gui-test-{name}.toml"));
         let _ = std::fs::remove_file(&path);
         path
+    }
+
+    /// The drives asked for while exactly `held` is down.
+    fn held(keys: &[Key]) -> Drives {
+        held_drives(|key| keys.contains(&key), false)
+    }
+
+    #[test]
+    fn the_arrow_keys_drive_pan_and_tilt() {
+        assert_eq!(
+            held(&[Key::ArrowUp]).pan_tilt,
+            pan_tilt::velocity_from_axes(0.0, KEY_DEFLECTION)
+        );
+        assert_eq!(
+            held(&[Key::ArrowLeft, Key::ArrowDown]).pan_tilt,
+            pan_tilt::velocity_from_axes(-KEY_DEFLECTION, -KEY_DEFLECTION)
+        );
+    }
+
+    #[test]
+    fn shift_drives_at_the_speed_the_camera_is_capable_of() {
+        let fast = held_drives(|key| key == Key::ArrowRight, true);
+
+        assert_eq!(
+            fast.pan_tilt,
+            pan_tilt::velocity_from_axes(FAST_KEY_DEFLECTION, 0.0)
+        );
+        assert!(fast.pan_tilt.pan_speed > held(&[Key::ArrowRight]).pan_tilt.pan_speed);
+    }
+
+    #[test]
+    fn opposed_keys_cancel_rather_than_pick_one() {
+        let both = held(&[Key::ArrowLeft, Key::ArrowRight, Key::Comma, Key::Period]);
+
+        assert_eq!(both, Drives::STOPPED);
+    }
+
+    #[test]
+    fn the_zoom_and_focus_keys_drive_those() {
+        assert_eq!(held(&[Key::CloseBracket]).zoom, Some(ZoomDirection::In));
+        assert_eq!(held(&[Key::Minus]).zoom, Some(ZoomDirection::Out));
+        assert_eq!(held(&[Key::PageUp]).zoom, Some(ZoomDirection::In));
+        assert_eq!(held(&[Key::PageDown]).zoom, Some(ZoomDirection::Out));
+        assert_eq!(held(&[Key::Comma]).focus, Some(FocusDirection::Near));
+        assert_eq!(held(&[Key::Period]).focus, Some(FocusDirection::Far));
+    }
+
+    #[test]
+    fn a_drag_and_a_held_key_drive_different_controls_at_once() {
+        let dragging = Drives {
+            pan_tilt: pan_tilt::velocity_from_axes(1.0, 0.0),
+            ..Drives::STOPPED
+        };
+        let zooming = held(&[Key::PageUp]);
+
+        let both = dragging.or(zooming);
+
+        assert_eq!(both.pan_tilt, dragging.pan_tilt);
+        assert_eq!(both.zoom, Some(ZoomDirection::In));
+    }
+
+    #[test]
+    fn the_pointer_wins_the_control_it_shares_with_the_keyboard() {
+        let dragging = Drives {
+            pan_tilt: pan_tilt::velocity_from_axes(1.0, 0.0),
+            ..Drives::STOPPED
+        };
+
+        assert_eq!(
+            dragging.or(held(&[Key::ArrowLeft])).pan_tilt,
+            dragging.pan_tilt
+        );
+    }
+
+    #[test]
+    fn a_held_arrow_key_drives_the_camera_and_releasing_it_stops() {
+        let (app, sent) = connected_app(None);
+        let mut harness = ui_harness(app);
+
+        harness.key_down(Key::ArrowRight);
+        harness.run();
+        let driving = sent.try_iter().collect::<Vec<_>>();
+
+        harness.key_up(Key::ArrowRight);
+        harness.run();
+        let released = sent.try_iter().collect::<Vec<_>>();
+
+        assert_eq!(
+            driving,
+            vec![Intent::DrivePanTilt(pan_tilt::velocity_from_axes(
+                KEY_DEFLECTION,
+                0.0
+            ))]
+        );
+        assert_eq!(released, vec![Intent::DrivePanTilt(Velocity::STOP)]);
+    }
+
+    #[test]
+    fn a_number_key_goes_to_that_preset() {
+        let (app, sent) = connected_app(None);
+        let mut harness = ui_harness(app);
+
+        harness.key_press(Key::Num4);
+        harness.run();
+
+        assert_eq!(
+            sent.try_iter().collect::<Vec<_>>(),
+            vec![Intent::RecallPreset(4)]
+        );
+    }
+
+    #[test]
+    fn keys_meant_for_a_description_do_not_reach_the_camera() {
+        let (app, sent) = connected_app(None);
+        let mut harness = ui_harness(app);
+
+        description_field(&harness, 1).click();
+        harness.run();
+        harness.key_press(Key::Num4);
+        harness.key_down(Key::ArrowRight);
+        harness.run();
+
+        assert!(
+            sent.try_iter().next().is_none(),
+            "a field being typed into owns the keyboard"
+        );
     }
 
     #[test]
