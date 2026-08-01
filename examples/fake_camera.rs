@@ -91,6 +91,7 @@ struct Preset {
 
 struct CameraSim {
     power_on: bool,
+    auto_focus: bool,
     zoom: u16,
     focus: u16,
     pan: i16,
@@ -148,6 +149,7 @@ impl CameraSim {
     fn new() -> Self {
         Self {
             power_on: true,
+            auto_focus: false,
             zoom: 0x0000,
             focus: 0x1000,
             pan: 0,
@@ -257,6 +259,11 @@ impl CameraSim {
                 let status = if self.power_on { 0x02 } else { 0x03 };
                 Some(inquiry_reply(&[status]))
             }
+            // Focus mode inquiry.
+            [0x04, 0x38] => {
+                let mode = if self.auto_focus { 0x02 } else { 0x03 };
+                Some(inquiry_reply(&[mode]))
+            }
             // Zoom position inquiry.
             [0x04, 0x47] => Some(inquiry_reply(&nibbles_u16(self.zoom))),
             // Focus position inquiry.
@@ -305,6 +312,30 @@ impl CameraSim {
                 self.pan = 0;
                 self.tilt = 0;
                 delay
+            }
+            // Pan/tilt reset: recalibrates, which on a real camera means a
+            // full sweep to find the limits before returning to home.
+            [0x06, 0x05] => {
+                let sweep = pan_tilt_travel_time(PAN_LIMITS.1 as i32, TILT_LIMITS.1 as i32);
+                let home = pan_tilt_travel_time(-i32::from(self.pan), -i32::from(self.tilt));
+                self.pan = 0;
+                self.tilt = 0;
+                sweep + home
+            }
+            // Power on / off (standby).
+            [0x04, 0x00, on @ (0x02 | 0x03)] => {
+                self.power_on = *on == 0x02;
+                Duration::ZERO
+            }
+            // Auto / manual focus.
+            [0x04, 0x38, auto @ (0x02 | 0x03)] => {
+                self.auto_focus = *auto == 0x02;
+                // Handing focus back to the camera ends any manual drive, the
+                // same way the camera's own focusing would override it.
+                if self.auto_focus {
+                    self.focus_rate = 0.0;
+                }
+                Duration::ZERO
             }
             // Zoom stop.
             [0x04, 0x07, 0x00] => {
@@ -461,6 +492,11 @@ fn describe_message(message: &[u8]) -> String {
         }
         (Some(0x01), [0x06, 0x03, ..]) => "pan/tilt relative move".to_string(),
         (Some(0x01), [0x06, 0x04]) => "pan/tilt home".to_string(),
+        (Some(0x01), [0x06, 0x05]) => "pan/tilt reset".to_string(),
+        (Some(0x01), [0x04, 0x00, 0x02]) => "power on".to_string(),
+        (Some(0x01), [0x04, 0x00, 0x03]) => "power off".to_string(),
+        (Some(0x01), [0x04, 0x38, 0x02]) => "auto focus".to_string(),
+        (Some(0x01), [0x04, 0x38, 0x03]) => "manual focus".to_string(),
         (Some(0x01), [0x04, 0x07, 0x00]) => "zoom stop".to_string(),
         (Some(0x01), [0x04, 0x07, b]) if *b == 0x02 || (0x20..=0x2F).contains(b) => {
             "zoom tele (in)".to_string()
@@ -487,6 +523,7 @@ fn describe_message(message: &[u8]) -> String {
         (Some(0x01), _) => "command (unrecognized)".to_string(),
         (Some(0x09), [0x00, 0x02]) => "version inquiry".to_string(),
         (Some(0x09), [0x04, 0x00]) => "power inquiry".to_string(),
+        (Some(0x09), [0x04, 0x38]) => "focus mode inquiry".to_string(),
         (Some(0x09), [0x04, 0x47]) => "zoom position inquiry".to_string(),
         (Some(0x09), [0x04, 0x48]) => "focus position inquiry".to_string(),
         (Some(0x09), [0x06, 0x12]) => "pan/tilt position inquiry".to_string(),

@@ -35,6 +35,22 @@ where
     }
 }
 
+/// Switches focus between the camera's automatic and manual modes.
+///
+/// Manual is less a preference than a precondition: a camera focusing
+/// automatically overrides the near/far drive the moment it sees the scene
+/// again, so [`drive_focus`] only holds while focus is manual.
+pub fn set_auto_focus<T>(camera: &BlockingClient<GenericVisca, T>, auto: bool) -> Result<(), Error>
+where
+    T: BlockingTransport + HasTransportConfig + 'static,
+{
+    if auto {
+        camera.focus_auto()
+    } else {
+        camera.focus_manual()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -59,5 +75,11 @@ mod tests {
     fn drive_focus_stops_the_drive_when_given_no_direction() {
         drive_focus(&scripted_camera(), None)
             .expect("scripted camera should ack and complete the stop");
+    }
+
+    #[test]
+    fn set_auto_focus_switches_the_camera_both_ways() {
+        set_auto_focus(&scripted_camera(), true).expect("scripted camera should ack auto focus");
+        set_auto_focus(&scripted_camera(), false).expect("scripted camera should ack manual focus");
     }
 }

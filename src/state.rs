@@ -4,6 +4,7 @@
 use grafton_visca::{
     BlockingClient, Error,
     camera::{PanTiltPosition, profiles::GenericVisca},
+    command::FocusMode,
     transport::{BlockingTransport, HasTransportConfig},
     types::{FocusPosition, ZoomPosition},
 };
@@ -19,6 +20,9 @@ pub struct CameraState {
     pub zoom: ZoomPosition,
     /// Current focus position.
     pub focus: FocusPosition,
+    /// Whether the camera is focusing automatically, in which case a manual
+    /// focus drive won't hold.
+    pub auto_focus: bool,
 }
 
 /// Queries a connected camera for its current state.
@@ -31,6 +35,7 @@ where
         pan_tilt: camera.pan_tilt_position()?,
         zoom: camera.zoom_position()?,
         focus: camera.focus_position()?,
+        auto_focus: camera.focus_mode()? == FocusMode::Auto,
     })
 }
 
@@ -41,12 +46,13 @@ pub fn format_state(state: &CameraState) -> String {
     // pairing that with our own "zoom="/"focus=" label would double it up;
     // use the raw value instead.
     format!(
-        "power={} pan={} tilt={} zoom=0x{:04X} focus=0x{:04X}",
+        "power={} pan={} tilt={} zoom=0x{:04X} focus=0x{:04X} ({})",
         if state.power_on { "on" } else { "off" },
         state.pan_tilt.pan,
         state.pan_tilt.tilt,
         state.zoom.value(),
         state.focus.value(),
+        if state.auto_focus { "auto" } else { "manual" },
     )
 }
 
@@ -60,6 +66,7 @@ mod tests {
             pan_tilt: PanTiltPosition::new(-120, 45),
             zoom: ZoomPosition::try_from(0x1000u16).unwrap(),
             focus: FocusPosition::new(0x2000),
+            auto_focus: false,
         }
     }
 
@@ -71,6 +78,17 @@ mod tests {
         assert!(text.contains("tilt=45"));
         assert!(text.contains("zoom=0x1000"));
         assert!(text.contains("focus=0x2000"));
+        assert!(text.contains("manual"));
+    }
+
+    #[test]
+    fn format_state_says_which_way_focus_is_being_driven() {
+        let auto = CameraState {
+            auto_focus: true,
+            ..sample_state()
+        };
+
+        assert!(format_state(&auto).contains("auto"));
     }
 
     #[test]

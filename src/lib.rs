@@ -7,6 +7,7 @@ pub mod connection;
 pub mod focus;
 pub mod keymap;
 pub mod pan_tilt;
+pub mod power;
 pub mod preset;
 pub mod session;
 pub mod state;

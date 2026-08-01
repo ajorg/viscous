@@ -128,10 +128,41 @@ where
     )
 }
 
+/// Sends the camera to its home position.
+pub fn home<T>(camera: &BlockingClient<GenericVisca, T>) -> Result<(), Error>
+where
+    T: BlockingTransport + HasTransportConfig + 'static,
+{
+    camera.pan_tilt_home()
+}
+
+/// Recalibrates the pan/tilt mechanism, ending at the home position.
+///
+/// Worth having next to [`home`], which it otherwise looks like: a camera
+/// that has been turned by hand, or has lost steps against an obstruction,
+/// answers position inquiries with numbers that no longer match where it is
+/// actually pointing — and every saved preset is expressed in those numbers.
+/// The reset re-finds the mechanical limits and re-zeroes them, at the cost
+/// of a full sweep to get there.
+pub fn reset<T>(camera: &BlockingClient<GenericVisca, T>) -> Result<(), Error>
+where
+    T: BlockingTransport + HasTransportConfig + 'static,
+{
+    camera.pan_tilt_reset()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use grafton_visca::testing::testkit::{ScriptedBlockingTransport, helpers};
+
+    #[test]
+    fn home_and_reset_each_reach_the_camera() {
+        let acks = || scripted_camera(vec![helpers::standard_command_response(1)]);
+
+        home(&acks()).expect("scripted camera should ack home");
+        reset(&acks()).expect("scripted camera should ack reset");
+    }
 
     #[test]
     fn a_centered_control_stops() {

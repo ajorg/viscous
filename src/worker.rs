@@ -15,7 +15,7 @@ use grafton_visca::{
 use crate::{
     focus::{self, FocusDirection},
     pan_tilt::{self, Velocity},
-    preset,
+    power, preset,
     state::{self, CameraState},
     zoom::{self, ZoomDirection},
 };
@@ -34,10 +34,18 @@ pub enum Intent {
     DriveZoom(Option<ZoomDirection>),
     /// Start driving focus in a direction, or stop it with `None`.
     DriveFocus(Option<FocusDirection>),
+    /// Focus automatically, or leave focus to the manual drive.
+    SetAutoFocus(bool),
     /// Recall the given 1-based preset number.
     RecallPreset(u8),
     /// Save the current position to the given 1-based preset number.
     SavePreset(u8),
+    /// Return to the home position.
+    Home,
+    /// Recalibrate the pan/tilt mechanism.
+    ResetPanTilt,
+    /// Power the camera on, or put it into standby.
+    SetPower(bool),
     /// Query the camera's current pan/tilt/zoom/focus/power state.
     QueryState,
 }
@@ -72,7 +80,13 @@ fn control(intent: Intent) -> Option<Control> {
         Intent::DrivePanTilt(_) => Some(Control::PanTilt),
         Intent::DriveZoom(_) => Some(Control::Zoom),
         Intent::DriveFocus(_) => Some(Control::Focus),
-        Intent::RecallPreset(_) | Intent::SavePreset(_) | Intent::QueryState => None,
+        Intent::SetAutoFocus(_)
+        | Intent::RecallPreset(_)
+        | Intent::SavePreset(_)
+        | Intent::Home
+        | Intent::ResetPanTilt
+        | Intent::SetPower(_)
+        | Intent::QueryState => None,
     }
 }
 
@@ -113,8 +127,14 @@ pub fn describe(intent: Intent) -> String {
         Intent::DriveFocus(None) => "focus stop".to_string(),
         Intent::DriveFocus(Some(FocusDirection::Near)) => "focus near".to_string(),
         Intent::DriveFocus(Some(FocusDirection::Far)) => "focus far".to_string(),
+        Intent::SetAutoFocus(true) => "auto focus".to_string(),
+        Intent::SetAutoFocus(false) => "manual focus".to_string(),
         Intent::RecallPreset(number) => format!("recall preset {number}"),
         Intent::SavePreset(number) => format!("save preset {number}"),
+        Intent::Home => "home".to_string(),
+        Intent::ResetPanTilt => "pan/tilt reset".to_string(),
+        Intent::SetPower(true) => "power on".to_string(),
+        Intent::SetPower(false) => "power off".to_string(),
         Intent::QueryState => "state query".to_string(),
     }
 }
@@ -167,6 +187,10 @@ where
             Outcome::Done(intent, preset::recall_preset(camera, number))
         }
         Intent::SavePreset(number) => Outcome::Done(intent, preset::save_preset(camera, number)),
+        Intent::SetAutoFocus(auto) => Outcome::Done(intent, focus::set_auto_focus(camera, auto)),
+        Intent::Home => Outcome::Done(intent, pan_tilt::home(camera)),
+        Intent::ResetPanTilt => Outcome::Done(intent, pan_tilt::reset(camera)),
+        Intent::SetPower(on) => Outcome::Done(intent, power::set_power(camera, on)),
         Intent::QueryState => Outcome::State(state::query_state(camera)),
     }
 }
@@ -357,6 +381,39 @@ mod tests {
     }
 
     #[test]
+    fn run_dispatches_the_one_off_camera_commands() {
+        let intents = [
+            Intent::Home,
+            Intent::ResetPanTilt,
+            Intent::SetPower(false),
+            Intent::SetAutoFocus(true),
+        ];
+        let camera = scripted_camera(
+            intents
+                .iter()
+                .map(|_| helpers::standard_command_response(1))
+                .collect(),
+        );
+
+        let (intent_tx, intent_rx) = channel();
+        let (result_tx, result_rx) = channel();
+        for intent in intents {
+            intent_tx.send(intent).unwrap();
+        }
+        drop(intent_tx);
+
+        run(&camera, &intent_rx, &result_tx);
+
+        for intent in intents {
+            assert!(
+                matches!(result_rx.recv().unwrap(), Outcome::Done(done, Ok(())) if done == intent),
+                "{} should reach the camera",
+                describe(intent)
+            );
+        }
+    }
+
+    #[test]
     fn coalescing_leaves_one_off_commands_alone_and_in_order() {
         let batch = [
             Intent::RecallPreset(1),
@@ -407,6 +464,7 @@ mod tests {
             pan_tilt: grafton_visca::camera::PanTiltPosition::new(0, 0),
             zoom: grafton_visca::types::ZoomPosition::try_from(0u16).unwrap(),
             focus: grafton_visca::types::FocusPosition::new(0),
+            auto_focus: false,
         }
     }
 
@@ -438,6 +496,20 @@ mod tests {
             "focus near"
         );
         assert_eq!(describe(Intent::DriveFocus(None)), "focus stop");
+    }
+
+    #[test]
+    fn describe_says_which_way_a_two_state_setting_was_switched() {
+        assert_eq!(describe(Intent::SetPower(true)), "power on");
+        assert_eq!(describe(Intent::SetPower(false)), "power off");
+        assert_eq!(describe(Intent::SetAutoFocus(true)), "auto focus");
+        assert_eq!(describe(Intent::SetAutoFocus(false)), "manual focus");
+    }
+
+    #[test]
+    fn describe_tells_home_apart_from_the_reset_that_ends_there() {
+        assert_eq!(describe(Intent::Home), "home");
+        assert_eq!(describe(Intent::ResetPanTilt), "pan/tilt reset");
     }
 
     #[test]

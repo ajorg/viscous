@@ -22,7 +22,7 @@ use viscous::{
     focus::FocusDirection,
     pan_tilt::Velocity,
     session::{POLL_INTERVAL, QUIESCENCE_INTERVAL},
-    state,
+    state::{self, CameraState},
     worker::{self, Intent, Outcome},
     zoom::ZoomDirection,
 };
@@ -69,7 +69,10 @@ struct App {
     connect_rx: Option<Receiver<Result<Worker, String>>>,
     intents: Option<Sender<Intent>>,
     results: Option<Receiver<Outcome>>,
-    camera_state: Option<String>,
+    /// The camera's last reported state, kept as the camera reported it
+    /// rather than as text: the power lamp and the focus-mode toggle answer
+    /// from it, not just the readout at the bottom.
+    camera_state: Option<CameraState>,
     status: Option<String>,
     /// The window size most recently asked for, so the request only goes out
     /// when the size the contents need actually changes.
@@ -183,9 +186,7 @@ impl App {
     /// camera-state panel instead — mirrors the TUI's own `Report` impl.
     fn apply_outcome(&mut self, outcome: Outcome) {
         match &outcome {
-            Outcome::State(Ok(camera_state)) => {
-                self.camera_state = Some(state::format_state(camera_state))
-            }
+            Outcome::State(Ok(camera_state)) => self.camera_state = Some(*camera_state),
             _ => self.status = Some(worker::describe_outcome(&outcome)),
         }
     }
@@ -226,13 +227,15 @@ impl App {
 
         ui.heading("Viscous");
 
-        let header = match &self.connection {
-            Connection::Disconnected | Connection::Failed(_) => None,
-            Connection::Connecting => Some("Connecting...".to_string()),
-            Connection::Connected { link, summary } => Some(format!("{link} \u{2014} {summary}")),
-        };
-        if let Some(text) = header {
-            ui.label(text);
+        match &self.connection {
+            Connection::Disconnected | Connection::Failed(_) => {}
+            Connection::Connecting => {
+                ui.label("Connecting...");
+            }
+            Connection::Connected { link, summary } => {
+                let camera = format!("{link} \u{2014} {summary}");
+                self.draw_camera_row(ui, &camera);
+            }
         }
 
         ui.add_space(8.0);
@@ -241,6 +244,25 @@ impl App {
         } else {
             self.draw_connect_form(ui);
         }
+    }
+
+    /// What the camera is, whether it's awake, and the switch for that.
+    fn draw_camera_row(&mut self, ui: &mut Ui, camera: &str) {
+        ui.horizontal(|ui| {
+            ui.label(camera);
+            let powered = self.camera_state.map(|state| state.power_on);
+            power_lamp(ui, powered);
+            // Nothing is known about power until the first state reply lands,
+            // and the useful thing to offer meanwhile is the one that wakes a
+            // camera that turns out to be asleep.
+            let on = powered.unwrap_or(false);
+            if ui
+                .button(if on { "Power off" } else { "Power on" })
+                .clicked()
+            {
+                self.send_intent(Intent::SetPower(!on));
+            }
+        });
     }
 
     /// Asks for a window of exactly `size`, and shows it once there's a size
@@ -305,6 +327,9 @@ impl App {
                         self.focus = focus;
                         self.send_intent(Intent::DriveFocus(focus));
                     }
+
+                    ui.add_space(8.0);
+                    self.draw_camera_buttons(ui);
                 })
                 .response
                 .rect
@@ -333,8 +358,33 @@ impl App {
 
         if let Some(state) = &self.camera_state {
             ui.add_space(16.0);
-            ui.label(state);
+            ui.label(state::format_state(state));
         }
+    }
+
+    /// The commands that are given once rather than held: where to point, and
+    /// who is focusing.
+    fn draw_camera_buttons(&mut self, ui: &mut Ui) {
+        ui.horizontal(|ui| {
+            if ui.button("Home").clicked() {
+                self.send_intent(Intent::Home);
+            }
+            if ui
+                .button("Reset")
+                .on_hover_text("Recalibrate pan/tilt, then return home")
+                .clicked()
+            {
+                self.send_intent(Intent::ResetPanTilt);
+            }
+
+            // A camera focusing for itself overrides the focus buttons the
+            // moment it sees the scene again, so which it's doing belongs
+            // where those buttons are.
+            let mut auto = self.camera_state.is_some_and(|state| state.auto_focus);
+            if ui.toggle_value(&mut auto, "Auto focus").changed() {
+                self.send_intent(Intent::SetAutoFocus(auto));
+            }
+        });
     }
 
     /// Stops anything still being driven, waiting for the camera to confirm.
@@ -383,6 +433,24 @@ fn drive_buttons(ui: &mut egui::Ui) -> (Option<ZoomDirection>, Option<FocusDirec
     (zoom, focus)
 }
 
+/// Draws a small lamp for the camera's power state: lit when it's awake, dark
+/// when it's in standby, and neither until the camera has said which.
+///
+/// Sized from the text beside it rather than in pixels of its own, so it stays
+/// a lamp next to a line of text at any scale.
+fn power_lamp(ui: &mut Ui, powered: Option<bool>) {
+    let diameter = ui.text_style_height(&egui::TextStyle::Body) / 2.0;
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(diameter), egui::Sense::hover());
+    let (color, tooltip) = match powered {
+        Some(true) => (egui::Color32::from_rgb(60, 180, 75), "Camera is on"),
+        Some(false) => (egui::Color32::from_rgb(120, 40, 40), "Camera is in standby"),
+        None => (ui.visuals().weak_text_color(), "Waiting for the camera"),
+    };
+    ui.painter()
+        .circle_filled(rect.center(), diameter / 2.0, color);
+    response.on_hover_text(tooltip);
+}
+
 /// The window size that exactly holds `content`, which was measured inside the
 /// panel's margins: its far corner already counts the leading margin, leaving
 /// only the trailing one to add.
@@ -423,6 +491,49 @@ fn main() -> eframe::Result {
 mod tests {
     use super::*;
     use egui::{Pos2, Rect, ViewportCommand};
+    use egui_kittest::{Harness, kittest::Queryable};
+    use grafton_visca::{camera::PanTiltPosition, types::FocusPosition, types::ZoomPosition};
+
+    /// An app already connected to a camera, plus the receiving end of the
+    /// channel its controls send intents down — what a click actually
+    /// produces, rather than what it draws.
+    fn connected_app(camera_state: Option<CameraState>) -> (App, Receiver<Intent>) {
+        let (intents, sent) = mpsc::channel();
+        let app = App {
+            connection: Connection::Connected {
+                link: "Connected at 9600 baud".to_string(),
+                summary: "vendor=Sony (0x0020)".to_string(),
+            },
+            intents: Some(intents),
+            camera_state,
+            ..App::default()
+        };
+        (app, sent)
+    }
+
+    fn camera_state(power_on: bool, auto_focus: bool) -> CameraState {
+        CameraState {
+            power_on,
+            pan_tilt: PanTiltPosition::new(0, 0),
+            zoom: ZoomPosition::try_from(0u16).unwrap(),
+            focus: FocusPosition::new(0),
+            auto_focus,
+        }
+    }
+
+    /// Drives the app the way a user does: real frames, real hit testing,
+    /// widgets found by the label they're drawn with.
+    fn ui_harness(app: App) -> Harness<'static, App> {
+        Harness::new_ui_state(|ui, app| app.draw(ui), app)
+    }
+
+    /// Clicks the button with `label` and returns the intents that produced.
+    fn click(app: App, sent: &Receiver<Intent>, label: &str) -> Vec<Intent> {
+        let mut harness = ui_harness(app);
+        harness.get_by_label(label).click();
+        harness.run();
+        sent.try_iter().collect()
+    }
 
     /// Lays out one frame of the app on a screen of the given size, with no
     /// window and no GPU, and reports what it asked the platform for.
@@ -448,6 +559,56 @@ mod tests {
     fn fit_on_screen(screen: Vec2) -> Vec2 {
         let commands = frame_on_screen(&mut App::default(), &egui::Context::default(), screen);
         requested_size(&commands).expect("the first frame should size the window")
+    }
+
+    #[test]
+    fn home_and_reset_are_sent_as_the_one_off_commands_they_are() {
+        let (app, sent) = connected_app(None);
+        assert_eq!(click(app, &sent, "Home"), vec![Intent::Home]);
+
+        let (app, sent) = connected_app(None);
+        assert_eq!(click(app, &sent, "Reset"), vec![Intent::ResetPanTilt]);
+    }
+
+    #[test]
+    fn the_power_button_offers_whichever_state_the_camera_is_not_in() {
+        let (app, sent) = connected_app(Some(camera_state(true, false)));
+        assert_eq!(
+            click(app, &sent, "Power off"),
+            vec![Intent::SetPower(false)],
+            "a camera that is on should be offered standby"
+        );
+
+        let (app, sent) = connected_app(Some(camera_state(false, false)));
+        assert_eq!(
+            click(app, &sent, "Power on"),
+            vec![Intent::SetPower(true)],
+            "a camera in standby should be offered waking up"
+        );
+    }
+
+    #[test]
+    fn the_power_button_offers_to_wake_a_camera_that_has_not_answered_yet() {
+        let (app, sent) = connected_app(None);
+
+        assert_eq!(click(app, &sent, "Power on"), vec![Intent::SetPower(true)]);
+    }
+
+    #[test]
+    fn the_focus_mode_toggle_switches_the_camera_out_of_what_it_reports() {
+        let (app, sent) = connected_app(Some(camera_state(true, false)));
+        assert_eq!(
+            click(app, &sent, "Auto focus"),
+            vec![Intent::SetAutoFocus(true)],
+            "a manually focusing camera should be offered auto focus"
+        );
+
+        let (app, sent) = connected_app(Some(camera_state(true, true)));
+        assert_eq!(
+            click(app, &sent, "Auto focus"),
+            vec![Intent::SetAutoFocus(false)],
+            "an auto focusing camera should be offered manual focus back"
+        );
     }
 
     #[test]
