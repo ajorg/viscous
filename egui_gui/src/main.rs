@@ -21,7 +21,7 @@ use eframe::egui;
 use egui::{Key, TextWrapMode, Ui, Vec2, vec2};
 use viscous::{
     config,
-    connection::{self, Target, format_version},
+    connection::{self, Target, format_camera, format_version},
     focus::FocusDirection,
     keymap::{FAST_KEY_DEFLECTION, KEY_DEFLECTION},
     pan_tilt::{self, Velocity},
@@ -108,7 +108,13 @@ impl Status {
 enum Connection {
     Disconnected,
     Connecting,
-    Connected { link: String, summary: String },
+    Connected {
+        link: String,
+        summary: String,
+        /// The rest of the version reply, kept for the header's hover text —
+        /// worth having to hand, not worth the width of the window.
+        details: String,
+    },
     Failed(String),
 }
 
@@ -117,6 +123,7 @@ enum Connection {
 struct Worker {
     link: String,
     summary: String,
+    details: String,
     intents: Sender<Intent>,
     results: Receiver<Outcome>,
 }
@@ -134,7 +141,8 @@ fn connect(target: &str) -> Result<Worker, String> {
 
     Ok(Worker {
         link: connected.link,
-        summary: format_version(&connected.version),
+        summary: format_camera(&connected.version),
+        details: format_version(&connected.version),
         intents: worker_tx,
         results: result_rx,
     })
@@ -310,6 +318,7 @@ impl App {
                 self.connection = Connection::Connected {
                     link: worker.link,
                     summary: worker.summary,
+                    details: worker.details,
                 };
                 self.intents = Some(worker.intents);
                 self.results = Some(worker.results);
@@ -385,9 +394,14 @@ impl App {
             Connection::Connecting => {
                 ui.label("Connecting...");
             }
-            Connection::Connected { link, summary } => {
+            Connection::Connected {
+                link,
+                summary,
+                details,
+            } => {
                 let camera = format!("{link} \u{2014} {summary}");
-                self.draw_camera_row(ui, &camera);
+                let details = details.clone();
+                self.draw_camera_row(ui, &camera, &details);
             }
         }
 
@@ -400,11 +414,15 @@ impl App {
     }
 
     /// What the camera is, whether it's awake, and the switch for that.
-    fn draw_camera_row(&mut self, ui: &mut Ui, camera: &str) {
+    fn draw_camera_row(&mut self, ui: &mut Ui, camera: &str, details: &str) {
         ui.horizontal(|ui| {
-            ui.label(camera);
+            ui.label(camera).on_hover_text(details);
             let powered = self.camera_state.map(|state| state.power_on);
             power_lamp(ui, powered);
+            // A dark lamp is only a colour; a camera in standby ignores every
+            // control on this window, which is worth saying in words — as the
+            // camera's older Windows control panel did beside its own lamp.
+            ui.label(power_words(powered));
             // Nothing is known about power until the first state reply lands,
             // and the useful thing to offer meanwhile is the one that wakes a
             // camera that turns out to be asleep.
@@ -887,6 +905,15 @@ fn space(ui: &mut Ui, gaps: f32) {
     ui.add_space(gap * gaps);
 }
 
+/// What the power lamp beside this means, in words.
+fn power_words(powered: Option<bool>) -> &'static str {
+    match powered {
+        Some(true) => "Camera is on",
+        Some(false) => "Camera is in standby",
+        None => "Waiting for the camera",
+    }
+}
+
 /// Draws a small lamp for the camera's power state: lit when it's awake, dark
 /// when it's in standby, and neither until the camera has said which.
 ///
@@ -958,8 +985,9 @@ mod tests {
         let (intents, sent) = mpsc::channel();
         let app = App {
             connection: Connection::Connected {
-                link: "Connected at 9600 baud".to_string(),
-                summary: "vendor=Sony (0x0020)".to_string(),
+                link: "COM3 at 9600 baud".to_string(),
+                summary: "Sony".to_string(),
+                details: "vendor=Sony (0x0020) model=0x040F".to_string(),
             },
             intents: Some(intents),
             camera_state,
@@ -974,8 +1002,9 @@ mod tests {
         let (intents, _) = mpsc::channel();
         let (_, results) = mpsc::channel();
         Worker {
-            link: "Connected at 9600 baud".to_string(),
-            summary: "vendor=Sony (0x0020)".to_string(),
+            link: "COM3 at 9600 baud".to_string(),
+            summary: "Sony".to_string(),
+            details: "vendor=Sony (0x0020) model=0x040F".to_string(),
             intents,
             results,
         }
@@ -1452,6 +1481,13 @@ mod tests {
     }
 
     #[test]
+    fn the_camera_row_says_in_words_what_the_lamp_says_in_colour() {
+        assert_eq!(power_words(Some(true)), "Camera is on");
+        assert_eq!(power_words(Some(false)), "Camera is in standby");
+        assert_eq!(power_words(None), "Waiting for the camera");
+    }
+
+    #[test]
     fn the_power_button_offers_whichever_state_the_camera_is_not_in() {
         let (app, sent) = connected_app(Some(camera_state(true, false)));
         assert_eq!(
@@ -1562,8 +1598,9 @@ mod tests {
         let form = requested_size(&frame_on_screen(&mut app, &ctx, screen))
             .expect("the first frame should size the window");
         app.connection = Connection::Connected {
-            link: "Connected at 9600 baud".to_string(),
-            summary: "vendor=Sony (0x0020)".to_string(),
+            link: "COM3 at 9600 baud".to_string(),
+            summary: "Sony".to_string(),
+            details: "vendor=Sony (0x0020) model=0x040F".to_string(),
         };
         let controls = requested_size(&frame_on_screen(&mut app, &ctx, screen))
             .expect("swapping the form for the controls should resize the window");

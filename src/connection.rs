@@ -86,7 +86,7 @@ fn connect_serial(port: &str) -> Result<Connected, String> {
 
     Ok(Connected {
         camera,
-        link: format!("Connected at {baud_rate} baud"),
+        link: format!("{port} at {baud_rate} baud"),
         version,
     })
 }
@@ -104,7 +104,7 @@ fn connect_tcp(address: &str) -> Result<Connected, String> {
 
     Ok(Connected {
         camera,
-        link: format!("Connected to {address} over TCP"),
+        link: format!("{address} over TCP"),
         version,
     })
 }
@@ -173,7 +173,21 @@ fn vendor_name(vendor: u16) -> Option<&'static str> {
         .find_map(|&(id, name)| (id == vendor).then_some(name))
 }
 
-/// Formats a camera's version-inquiry reply for display.
+/// Names the camera that answered, in as many words as a header line can
+/// spare: who made it, and nothing else.
+///
+/// The rest of the version reply — model, ROM, socket count — identifies a
+/// firmware build rather than a camera, which is worth having to hand but not
+/// worth the width of a window.
+pub fn format_camera(info: &VersionInfo) -> String {
+    match vendor_name(info.vendor) {
+        Some(name) => name.to_string(),
+        None => format!("vendor 0x{:04X}", info.vendor),
+    }
+}
+
+/// Formats a camera's version-inquiry reply in full, for a transcript or a
+/// tooltip with room for it.
 pub fn format_version(info: &VersionInfo) -> String {
     let vendor = match vendor_name(info.vendor) {
         Some(name) => format!("{name} (0x{:04X})", info.vendor),
@@ -204,6 +218,14 @@ mod tests {
             format_version(&sample_version()),
             "vendor=0x0001 model=0x0002 rom=0x00000304 max_socket=2"
         );
+    }
+
+    #[test]
+    fn a_camera_is_named_by_who_made_it() {
+        let mut info = sample_version();
+        info.vendor = 0x0020;
+        assert_eq!(format_camera(&info), "Sony");
+        assert_eq!(format_camera(&sample_version()), "vendor 0x0001");
     }
 
     #[test]
@@ -320,7 +342,7 @@ mod tests {
             connect(&Target::Tcp(address.clone())).expect("the loopback camera should answer");
 
         assert_eq!(connected.version, sample_version());
-        assert_eq!(connected.link, format!("Connected to {address} over TCP"));
+        assert_eq!(connected.link, format!("{address} over TCP"));
         served.join().expect("the loopback camera should not panic");
     }
 

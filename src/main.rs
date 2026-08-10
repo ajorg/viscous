@@ -5,7 +5,7 @@ use std::thread;
 
 use viscous::{
     app, cli,
-    connection::{self, Connected, Target, format_version},
+    connection::{self, Connected, Target, format_camera, format_version},
     ui::Connection,
     worker,
 };
@@ -55,6 +55,8 @@ fn main() -> ExitCode {
         worker::run(&camera, &intent_rx, &result_tx);
     });
 
+    // The transcript has room for the whole version reply; the TUI's one-line
+    // header does not, and says who made the camera instead.
     let connection_summary = format!("{link} \u{2014} {}", format_version(&version));
 
     let app_result = if cli_requested {
@@ -64,7 +66,7 @@ fn main() -> ExitCode {
     } else {
         let connection = Connection::Connected {
             link,
-            version: format_version(&version),
+            version: format_camera(&version),
         };
         let mut terminal = ratatui::init();
         let result = app::run(&mut terminal, connection, &intent_tx, &result_rx);
