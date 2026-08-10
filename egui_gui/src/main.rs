@@ -32,6 +32,14 @@ use viscous::{
     zoom::ZoomDirection,
 };
 
+/// What to offer in the camera field before anything has connected: the shape
+/// of a serial port name on this platform, so the first run has something to
+/// edit rather than something to compose.
+#[cfg(windows)]
+const FIRST_GUESS: &str = "COM3";
+#[cfg(not(windows))]
+const FIRST_GUESS: &str = "/dev/ttyUSB0";
+
 /// How many preset slots to offer — the same six the TUI's number keys reach.
 const PRESETS: u8 = 6;
 
@@ -150,6 +158,9 @@ struct App {
     /// them the camera was last told to show.
     titles: BTreeMap<u8, String>,
     shown_title: Option<u8>,
+    /// The camera that last connected, remembered so the next run opens on it
+    /// instead of on whatever this platform's ports are usually called.
+    camera: Option<String>,
     /// Where the descriptions and titles are kept between runs, if this
     /// platform has somewhere to keep them.
     config_path: Option<PathBuf>,
@@ -169,7 +180,7 @@ struct App {
 impl Default for App {
     fn default() -> Self {
         Self {
-            port_input: "/dev/ttyUSB0".to_string(),
+            port_input: FIRST_GUESS.to_string(),
             connection: Connection::Disconnected,
             connect_rx: None,
             intents: None,
@@ -179,6 +190,7 @@ impl Default for App {
             preset_labels: BTreeMap::new(),
             titles: BTreeMap::new(),
             shown_title: None,
+            camera: None,
             config_path: None,
             requested_size: None,
             pending_state_query: false,
@@ -206,6 +218,10 @@ impl App {
             Some(Ok(config)) => {
                 app.preset_labels = config.presets;
                 app.titles = config.titles;
+                if let Some(camera) = config.camera {
+                    app.port_input = camera.clone();
+                    app.camera = Some(camera);
+                }
             }
             Some(Err(error)) => app.status = Some(Status::failed(error.to_string())),
             None => {}
@@ -279,9 +295,18 @@ impl App {
     fn poll_connect(&mut self) {
         let Some(rx) = &self.connect_rx else { return };
         let Ok(result) = rx.try_recv() else { return };
+        self.poll_connect_result(result);
+    }
+
+    /// Takes up whatever the connection attempt came back with.
+    fn poll_connect_result(&mut self, result: Result<Worker, String>) {
         self.connect_rx = None;
         match result {
             Ok(worker) => {
+                // Only a camera that answered is worth coming back to; a
+                // typo that failed would just be in the way next time.
+                self.camera = Some(self.port_input.trim().to_string());
+                self.save_config();
                 self.connection = Connection::Connected {
                     link: worker.link,
                     summary: worker.summary,
@@ -658,6 +683,7 @@ impl App {
                 .collect()
         };
         let config = config::Config {
+            camera: self.camera.clone(),
             presets: written(&self.preset_labels),
             titles: written(&self.titles),
         };
@@ -942,6 +968,19 @@ mod tests {
         (app, sent)
     }
 
+    /// A worker with nothing on the other end of its channels — enough to
+    /// stand in for a camera that answered.
+    fn test_worker() -> Worker {
+        let (intents, _) = mpsc::channel();
+        let (_, results) = mpsc::channel();
+        Worker {
+            link: "Connected at 9600 baud".to_string(),
+            summary: "vendor=Sony (0x0020)".to_string(),
+            intents,
+            results,
+        }
+    }
+
     fn camera_state(power_on: bool, auto_focus: bool) -> CameraState {
         CameraState {
             power_on,
@@ -1148,6 +1187,29 @@ mod tests {
     }
 
     #[test]
+    fn escape_hands_the_keyboard_back_to_the_camera() {
+        let (app, sent) = connected_app(None);
+        let mut harness = ui_harness(app);
+
+        description_field(&harness, 1).click();
+        harness.run();
+        harness.key_press(Key::Escape);
+        harness.run();
+        let _ = sent.try_iter().count();
+        harness.key_down(Key::ArrowRight);
+        harness.run();
+
+        assert_eq!(
+            sent.try_iter().collect::<Vec<_>>(),
+            vec![Intent::DrivePanTilt(pan_tilt::velocity_from_axes(
+                KEY_DEFLECTION,
+                0.0
+            ))],
+            "a description field should let go of the keyboard on escape"
+        );
+    }
+
+    #[test]
     fn a_number_key_goes_to_that_preset() {
         let (app, sent) = connected_app(None);
         let mut harness = ui_harness(app);
@@ -1317,6 +1379,34 @@ mod tests {
             reopened.preset_labels.get(&2).map(String::as_str),
             Some("Chorister")
         );
+    }
+
+    #[test]
+    fn the_camera_that_connected_is_there_again_next_run() {
+        let path = test_config_path("camera");
+        let (mut app, _sent) = connected_app(None);
+        app.config_path = Some(path.clone());
+        app.port_input = " tcp://camera.local:5678 ".to_string();
+
+        app.poll_connect_result(Ok(test_worker()));
+        let reopened = App::with_config(Some(path.clone()));
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(reopened.port_input, "tcp://camera.local:5678");
+    }
+
+    #[test]
+    fn a_camera_that_never_answered_is_not_remembered() {
+        let path = test_config_path("failed-camera");
+        let (mut app, _sent) = connected_app(None);
+        app.config_path = Some(path.clone());
+        app.port_input = "COM99".to_string();
+
+        app.poll_connect_result(Err("no response".to_string()));
+        let reopened = App::with_config(Some(path.clone()));
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(reopened.port_input, FIRST_GUESS);
     }
 
     #[test]

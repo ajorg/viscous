@@ -8,9 +8,15 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-/// Preset labels, keyed by the same 1-based preset number used elsewhere.
+/// What a front end remembers between runs: the operator's own words for
+/// each preset and title, and which camera to reach for.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Config {
+    /// The camera last connected to — a serial port name or a `tcp://`
+    /// endpoint, in the same spelling either front end takes. Absent until
+    /// something has actually connected.
+    #[serde(default)]
+    pub camera: Option<String>,
     /// Preset number -> label.
     #[serde(default)]
     pub presets: BTreeMap<u8, String>,
@@ -106,6 +112,21 @@ mod tests {
         let _ = fs::remove_file(&path);
 
         assert_eq!(loaded, config);
+    }
+
+    #[test]
+    fn a_config_written_before_cameras_were_remembered_still_loads() {
+        let path = test_path("no-camera");
+        fs::write(&path, "[presets]\n1 = \"wide shot\"\n").expect("write should succeed");
+
+        let config = load(&path).expect("an older config should still load");
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(config.camera, None);
+        assert_eq!(
+            config.presets.get(&1).map(String::as_str),
+            Some("wide shot")
+        );
     }
 
     #[test]
