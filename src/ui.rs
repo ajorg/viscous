@@ -40,8 +40,15 @@ pub struct AppState {
     pub status: Option<String>,
 }
 
-pub const KEY_LEGEND: &str = "hold to move \u{2014} arrows/shift+arrows: pan-tilt  []/-=: zoom  \
-     ,./<>: focus  1-6: recall preset  q/ctrl-d: quit";
+/// The one line of help, sized to be read rather than to list everything: it
+/// shares the footer with the status line and has to fit a narrow terminal
+/// whole, so it names one way to reach each control and leaves the synonyms
+/// (`-=` for zoom, `<>` for focus, ctrl-D for quit) to be discovered.
+pub const KEY_LEGEND: &str = "hold to move: arrows  []zoom  ,.focus  shift=fast  \
+     1-6 preset  q quit";
+
+/// The narrowest terminal [`KEY_LEGEND`] is expected to fit in.
+pub const MIN_COLUMNS: usize = 80;
 
 /// Renders `state` into `frame`.
 pub fn render(frame: &mut Frame, state: &AppState) {
@@ -123,9 +130,17 @@ mod tests {
     #[test]
     fn shows_key_legend_when_no_status_set() {
         let content = render_to_string(&AppState::default());
-        // Matched near the front of the legend: it's longer than the 80
-        // columns this renders into, so the tail gets clipped.
-        assert!(content.contains("pan-tilt"));
+        assert!(content.contains(KEY_LEGEND));
+    }
+
+    #[test]
+    fn the_key_legend_fits_a_narrow_terminal_whole() {
+        let width = KEY_LEGEND.chars().count();
+        assert!(
+            width <= MIN_COLUMNS,
+            "the legend shares the footer with the status line and gets clipped \
+             rather than wrapped: {width} columns"
+        );
     }
 
     #[test]
@@ -136,7 +151,7 @@ mod tests {
         };
         let content = render_to_string(&state);
         assert!(content.contains("preset 3 saved"));
-        assert!(!content.contains("pan-tilt"));
+        assert!(!content.contains("hold to move"));
     }
 
     #[test]
