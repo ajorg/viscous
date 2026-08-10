@@ -780,10 +780,10 @@ fn drive_buttons(
     // each other however wide the words in front of them turn out to be.
     egui::Grid::new("drives").show(ui, |ui| {
         ui.label("Zoom");
-        if held(ui, true, "Out", "Widen the shot, for as long as it is held") {
+        if held(ui, true, "Out", "Hold to widen the shot") {
             zoom = Some(ZoomDirection::Out);
         }
-        if held(ui, true, "In", "Tighten the shot, for as long as it is held") {
+        if held(ui, true, "In", "Hold to tighten the shot") {
             zoom = Some(ZoomDirection::In);
         }
         ui.end_row();
@@ -792,10 +792,10 @@ fn drive_buttons(
         // for itself ignores them; the toggle that revives them is alongside.
         let manual = !auto_focusing;
         ui.label("Focus");
-        if held(ui, manual, "Near", "Focus closer, for as long as it is held") {
+        if held(ui, manual, "Near", "Hold to focus closer") {
             focus = Some(FocusDirection::Near);
         }
-        if held(ui, manual, "Far", "Focus further off, for as long as it is held") {
+        if held(ui, manual, "Far", "Hold to focus further off") {
             focus = Some(FocusDirection::Far);
         }
         ui.end_row();
