@@ -9,12 +9,15 @@ use std::f32::consts::PI;
 use egui::{Sense, Stroke, TextStyle, Ui, Vec2, vec2};
 use viscous::pan_tilt::{self, Velocity};
 
-/// How big the pad is, as a multiple of the height of a line of body text.
+/// The smallest the pad is drawn, as a multiple of the height of a line of
+/// body text.
 ///
 /// The pad has no size of its own to be right about: what matters is that it
-/// stays a comfortable hand's worth of travel next to the controls around it,
-/// so it's measured in the same text the rest of the window is laid out in and
-/// follows the user's interface scaling along with everything else.
+/// stays at least a comfortable hand's worth of travel next to the controls
+/// around it, so its floor is measured in the same text the rest of the window
+/// is laid out in and follows the user's interface scaling along with
+/// everything else. Given a larger window it takes the room, since a bigger
+/// pad is a finer aim.
 const PAD_TEXT_HEIGHTS: f32 = 16.0;
 
 /// The puck and the dot marking the centre, as fractions of the pad's radius,
@@ -44,9 +47,9 @@ fn clamp_to_radius(offset: Vec2, radius: f32) -> Vec2 {
     }
 }
 
-/// How big a pad the given `ui` calls for: a fixed number of lines of its own
-/// body text, so it scales with the interface rather than with the display.
-pub fn pad_size(ui: &Ui) -> f32 {
+/// The smallest pad the given `ui` should draw: a fixed number of lines of its
+/// own body text, so it scales with the interface rather than with the display.
+pub fn least_pad_size(ui: &Ui) -> f32 {
     ui.text_style_height(&TextStyle::Body) * PAD_TEXT_HEIGHTS
 }
 
@@ -56,8 +59,7 @@ pub fn pad_size(ui: &Ui) -> f32 {
 /// The puck's position is derived from the live pointer state rather than
 /// remembered between frames: "let go" is exactly "no pointer button held on
 /// this widget", which is also precisely when the camera should stop.
-pub fn pan_tilt_pad(ui: &mut Ui) -> Velocity {
-    let size = pad_size(ui);
+pub fn pan_tilt_pad(ui: &mut Ui, size: f32) -> Velocity {
     let radius = size / 2.0;
     let (rect, response) = ui.allocate_exact_size(vec2(size, size), Sense::click_and_drag());
     let center = rect.center();
@@ -119,14 +121,14 @@ mod tests {
 
     const RADIUS: f32 = 120.0;
 
-    /// The pad size a window whose body text is `height` tall would draw.
+    /// The smallest pad a window whose body text is `height` tall would draw.
     fn pad_size_with_body_height(height: f32) -> f32 {
         let measured = Cell::new(0.0);
         Harness::new_ui(|ui| {
             ui.style_mut()
                 .text_styles
                 .insert(TextStyle::Body, FontId::proportional(height));
-            measured.set(pad_size(ui));
+            measured.set(least_pad_size(ui));
         })
         .run();
         measured.get()

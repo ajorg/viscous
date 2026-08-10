@@ -175,6 +175,23 @@ struct App {
     /// The window size most recently asked for, so the request only goes out
     /// when the size the contents need actually changes.
     requested_size: Option<Vec2>,
+    /// The frame on which the window was sized around the controls, if that
+    /// has happened yet.
+    ///
+    /// Up to and including that frame the pad asks for its natural size, so
+    /// the window is fitted to what the layout needs rather than to whatever
+    /// size it happened to open at; from the next frame on the window is the
+    /// user's and the pad takes whatever room it is given. Counted in frames
+    /// rather than kept as a flag because egui can lay a frame out more than
+    /// once, and the two halves of that must not land in the same frame.
+    fitted_at: Option<u64>,
+    /// How much room the window offered the contents, and how much of it
+    /// everything other than the pad took, when it was last drawn. The pad is
+    /// given what's left over — measuring what the rest came to is steadier
+    /// than counting it up from the style.
+    room: Vec2,
+    around_pad: Vec2,
+    pad_size: f32,
     pending_state_query: bool,
     last_command_at: Instant,
     /// What each continuous control was last told to do. A drive keeps running
@@ -201,6 +218,10 @@ impl Default for App {
             camera: None,
             config_path: None,
             requested_size: None,
+            fitted_at: None,
+            room: Vec2::ZERO,
+            around_pad: Vec2::ZERO,
+            pad_size: 0.0,
             pending_state_query: false,
             last_command_at: Instant::now(),
             pan_tilt: Velocity::STOP,
@@ -374,9 +395,13 @@ impl App {
         // that extent is the layout's own idea of the room it needs.
         let content = egui::CentralPanel::default()
             .frame(frame)
-            .show(ui, |ui| ui.scope(|ui| self.draw_contents(ui)).response.rect)
+            .show(ui, |ui| {
+                self.room = ui.available_size();
+                ui.scope(|ui| self.draw_contents(ui)).response.rect
+            })
             .inner;
 
+        self.around_pad = content.size() - Vec2::splat(self.pad_size);
         let size = window_size_for(content, vec2(margin.right, margin.bottom));
         self.fit_window_to(ui.ctx(), size);
     }
@@ -442,8 +467,13 @@ impl App {
     /// Only asks when that size changes: what comes back is never quite what
     /// was asked for — whole pixels, a platform minimum, the user's own drag —
     /// and repeating the request every frame would turn that into an argument.
+    ///
+    /// Once the controls have been fitted the window is left alone entirely,
+    /// and made unshrinkable below that fit: from then on its size is the
+    /// user's to choose, and the room they give it goes to the pad and the
+    /// description fields.
     fn fit_window_to(&mut self, ctx: &egui::Context, size: Vec2) {
-        if self.requested_size == Some(size) {
+        if self.fitted_at.is_some() || self.requested_size == Some(size) {
             return;
         }
         let first_fit = self.requested_size.is_none();
@@ -451,6 +481,10 @@ impl App {
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
         if first_fit {
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        }
+        if matches!(self.connection, Connection::Connected { .. }) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(size));
+            self.fitted_at = Some(ctx.cumulative_frame_nr());
         }
     }
 
@@ -483,7 +517,8 @@ impl App {
         ui.horizontal(|ui| {
             let drives_height = ui
                 .vertical(|ui| {
-                    pointed.pan_tilt = joystick::pan_tilt_pad(ui);
+                    self.pad_size = self.pad_size_in(ui);
+                    pointed.pan_tilt = joystick::pan_tilt_pad(ui, self.pad_size);
 
                     space(ui, 2.0);
                     (pointed.zoom, pointed.focus) = drive_buttons(ui, self.auto_focusing());
@@ -543,6 +578,24 @@ impl App {
                 ui.label("Ready");
             }
         }
+    }
+
+    /// How big to draw the pad: its natural size while the window is still
+    /// being fitted around the layout, and afterwards whatever room the window
+    /// has beyond what everything else in it needs.
+    ///
+    /// Square, so it takes the smaller of the two leftovers — which also
+    /// leaves the width it doesn't need to the descriptions beside it.
+    fn pad_size_in(&self, ui: &Ui) -> f32 {
+        let least = joystick::least_pad_size(ui);
+        let fitted = self
+            .fitted_at
+            .is_some_and(|frame| ui.ctx().cumulative_frame_nr() > frame);
+        if !fitted {
+            return least;
+        }
+        let spare = self.room - self.around_pad;
+        spare.min_elem().max(least)
     }
 
     /// Sends whatever changed since the last frame, and nothing that didn't.
@@ -1670,6 +1723,36 @@ mod tests {
         assert!(
             controls.x < 1600.0 && controls.y < 1200.0,
             "the controls should still ask for less than the screen: {controls:?}"
+        );
+    }
+
+    #[test]
+    fn once_fitted_the_window_is_the_users_and_the_pad_takes_the_room() {
+        let ctx = egui::Context::default();
+        let screen = vec2(1600.0, 1200.0);
+        let (mut app, _sent) = connected_app(None);
+
+        let fit = frame_on_screen(&mut app, &ctx, screen);
+        let natural = app.pad_size;
+        let after = frame_on_screen(&mut app, &ctx, screen);
+        frame_on_screen(&mut app, &ctx, screen);
+
+        assert!(
+            requested_size(&fit).is_some()
+                && fit
+                    .iter()
+                    .any(|command| matches!(command, ViewportCommand::MinInnerSize(_))),
+            "the fit should size the window and stop it shrinking below that: {fit:?}"
+        );
+        assert_eq!(
+            requested_size(&after),
+            None,
+            "the window is the user's to size from then on"
+        );
+        assert!(
+            app.pad_size > natural,
+            "the pad should take the room the window has spare ({natural} then {})",
+            app.pad_size
         );
     }
 
