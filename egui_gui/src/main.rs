@@ -490,15 +490,6 @@ impl App {
 
                     space(ui, 1.0);
                     self.draw_camera_buttons(ui);
-
-                    // The keys aren't discoverable from the buttons, the way
-                    // the pad and the drives are, so they're spelled out —
-                    // as the camera's older Windows control panel did.
-                    space(ui, 1.0);
-                    ui.small("Drag the pad to pan and tilt \u{2014} further out is faster");
-                    ui.small("Arrows pan and tilt, with shift for full speed");
-                    ui.small("Zoom with [ ] or PgUp/PgDn, focus with , and .");
-                    ui.small("Keys 1-6 go to presets, f switches auto focus");
                 })
                 .response
                 .rect
@@ -511,11 +502,7 @@ impl App {
                 ui.separator();
             });
 
-            ui.vertical(|ui| {
-                self.draw_presets(ui);
-                space(ui, 1.5);
-                self.draw_titles(ui);
-            });
+            ui.vertical(|ui| self.draw_shots(ui));
         });
 
         // The pointer wins where both are asking at once: a hand on the mouse
@@ -531,8 +518,11 @@ impl App {
             self.send_intent(Intent::SetAutoFocus(!self.auto_focusing()));
         }
 
+        space(ui, 1.0);
+        draw_key_help(ui);
+
         if let Some(state) = &self.camera_state {
-            space(ui, 2.0);
+            space(ui, 1.0);
             // Power and focus mode are already shown by the lamp and the
             // toggle, so what's left is only the numbers, kept quiet: they're
             // there to be checked, not read.
@@ -600,8 +590,26 @@ impl App {
     /// The description is the operator's, not the camera's — VISCA presets are
     /// bare numbers — so it lives in this program's config file and comes back
     /// on the next run.
-    fn draw_presets(&mut self, ui: &mut Ui) {
+    /// The two lists of the operator's own words: what each preset is a shot
+    /// of, and what to write over the picture.
+    ///
+    /// Laid out as two blocks of plain rows rather than one grid: a grid cell
+    /// offers a description field what's left of the row, and this column's
+    /// width is in turn decided by what it asks for — so the two would talk
+    /// each other down to nothing.
+    fn draw_shots(&mut self, ui: &mut Ui) {
         ui.label("Presets");
+        self.draw_presets(ui);
+        space(ui, 1.5);
+        ui.label("Titles");
+        self.draw_titles(ui);
+        ui.small(format!(
+            "Up to {} uppercase characters, drawn over the picture",
+            title::LENGTH
+        ));
+    }
+
+    fn draw_presets(&mut self, ui: &mut Ui) {
         for number in 1..=PRESETS {
             ui.horizontal(|ui| {
                 let description = self.preset_labels.get(&number).map(String::as_str);
@@ -643,7 +651,6 @@ impl App {
     /// goes out is what the camera can actually draw: twenty characters,
     /// uppercase, from its own character set.
     fn draw_titles(&mut self, ui: &mut Ui) {
-        ui.label("Titles");
         for number in 1..=TITLES {
             ui.horizontal(|ui| {
                 let mut shown = self.shown_title == Some(number);
@@ -665,10 +672,6 @@ impl App {
                 }
             });
         }
-        ui.small(format!(
-            "Up to {} uppercase characters, drawn over the picture",
-            title::LENGTH
-        ));
     }
 
     /// Shows the given title on the camera, or hides whatever is showing.
@@ -893,6 +896,16 @@ fn keyboard_preset(ui: &Ui) -> Option<u8> {
             .position(|key| input.key_pressed(*key))
             .map(|index| index as u8 + 1)
     })
+}
+
+/// The keys, spelled out: they aren't discoverable from the buttons the way
+/// the pad and the drives are, and the camera's older Windows control panel
+/// listed its own the same way.
+fn draw_key_help(ui: &mut Ui) {
+    ui.small("Drag the pad to pan and tilt \u{2014} further out is faster");
+    ui.small("Arrows pan and tilt, with shift for full speed");
+    ui.small("Zoom with [ ] or PgUp/PgDn, focus with , and .");
+    ui.small("Keys 1-6 go to presets, f switches auto focus");
 }
 
 /// Opens a gap of `gaps` of the style's own spacing between widgets.
