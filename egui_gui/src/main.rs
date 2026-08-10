@@ -230,6 +230,14 @@ impl App {
         self.last_command_at = Instant::now();
     }
 
+    /// Whether the camera is focusing for itself, in which case the focus
+    /// controls have nothing to drive: the camera overrides them the moment it
+    /// sees the scene again. Unknown counts as not, so the controls stay live
+    /// until the camera has actually said otherwise.
+    fn auto_focusing(&self) -> bool {
+        self.camera_state.is_some_and(|state| state.auto_focus)
+    }
+
     /// Whether any control is currently being driven.
     fn driving(&self) -> bool {
         !self.pan_tilt.is_stop() || self.zoom.is_some() || self.focus.is_some()
@@ -435,7 +443,7 @@ impl App {
                     pointed.pan_tilt = joystick::pan_tilt_pad(ui);
 
                     space(ui, 2.0);
-                    (pointed.zoom, pointed.focus) = drive_buttons(ui);
+                    (pointed.zoom, pointed.focus) = drive_buttons(ui, self.auto_focusing());
 
                     space(ui, 1.0);
                     self.draw_camera_buttons(ui);
@@ -447,7 +455,7 @@ impl App {
                     ui.small("Drag the pad to pan and tilt \u{2014} further out is faster");
                     ui.small("Arrows pan and tilt, with shift for full speed");
                     ui.small("Zoom with [ ] or PgUp/PgDn, focus with , and .");
-                    ui.small("Keys 1-6 go to presets");
+                    ui.small("Keys 1-6 go to presets, f switches auto focus");
                 })
                 .response
                 .rect
@@ -473,6 +481,11 @@ impl App {
         self.apply_drives(pointed.or(self.keyboard_drives(ui)));
         if let Some(preset) = keyboard_preset(ui) {
             self.send_intent(Intent::RecallPreset(preset));
+        }
+        // The same key the TUI uses, so the fingers that learned it there
+        // reach the toggle drawn just above.
+        if !typing(ui) && ui.input(|input| input.key_pressed(Key::F)) {
+            self.send_intent(Intent::SetAutoFocus(!self.auto_focusing()));
         }
 
         if let Some(state) = &self.camera_state {
@@ -527,7 +540,15 @@ impl App {
         if typing(ui) {
             return Drives::STOPPED;
         }
-        ui.input(|input| held_drives(|key| input.key_down(key), input.modifiers.shift))
+        let mut drives =
+            ui.input(|input| held_drives(|key| input.key_down(key), input.modifiers.shift));
+        // The focus buttons are drawn disabled while the camera focuses for
+        // itself; the focus keys have to agree with them, or one of the two
+        // would be lying about what the camera will do.
+        if self.auto_focusing() {
+            drives.focus = None;
+        }
+        drives
     }
 
     /// The preset slots: go to one, describe it, or store where the camera is
@@ -663,8 +684,12 @@ impl App {
             // A camera focusing for itself overrides the focus buttons the
             // moment it sees the scene again, so which it's doing belongs
             // where those buttons are.
-            let mut auto = self.camera_state.is_some_and(|state| state.auto_focus);
-            if ui.toggle_value(&mut auto, "Auto focus").changed() {
+            let mut auto = self.auto_focusing();
+            if ui
+                .toggle_value(&mut auto, "Auto focus")
+                .on_hover_text("Let the camera focus itself, instead of the focus buttons")
+                .changed()
+            {
                 self.send_intent(Intent::SetAutoFocus(auto));
             }
         });
@@ -698,26 +723,32 @@ impl App {
 /// zoom and focus keys. They read "Out"/"In" and "Near"/"Far" rather than
 /// "−"/"+", because neither control has a more or a less of it — zoom has a
 /// wide end and a tight one, and focus has a near and a far.
-fn drive_buttons(ui: &mut egui::Ui) -> (Option<ZoomDirection>, Option<FocusDirection>) {
+fn drive_buttons(
+    ui: &mut egui::Ui,
+    auto_focusing: bool,
+) -> (Option<ZoomDirection>, Option<FocusDirection>) {
     let mut zoom = None;
     let mut focus = None;
     // A grid rather than two rows of its own, so the buttons line up under
     // each other however wide the words in front of them turn out to be.
     egui::Grid::new("drives").show(ui, |ui| {
         ui.label("Zoom");
-        if held(ui, "Out", "Widen the shot, for as long as the button is held") {
+        if held(ui, true, "Out", "Widen the shot, for as long as it is held") {
             zoom = Some(ZoomDirection::Out);
         }
-        if held(ui, "In", "Tighten the shot, for as long as the button is held") {
+        if held(ui, true, "In", "Tighten the shot, for as long as it is held") {
             zoom = Some(ZoomDirection::In);
         }
         ui.end_row();
 
+        // Drawn dead rather than left to do nothing, since a camera focusing
+        // for itself ignores them; the toggle that revives them is alongside.
+        let manual = !auto_focusing;
         ui.label("Focus");
-        if held(ui, "Near", "Focus closer, for as long as the button is held") {
+        if held(ui, manual, "Near", "Focus closer, for as long as it is held") {
             focus = Some(FocusDirection::Near);
         }
-        if held(ui, "Far", "Focus further away, for as long as the button is held") {
+        if held(ui, manual, "Far", "Focus further off, for as long as it is held") {
             focus = Some(FocusDirection::Far);
         }
         ui.end_row();
@@ -736,9 +767,10 @@ fn recall_tooltip(number: u8, description: Option<&str>) -> String {
 
 /// A button that reports whether it is being held down rather than whether it
 /// was clicked — one continuous drive runs for exactly as long as it is.
-fn held(ui: &mut Ui, label: &str, tooltip: &str) -> bool {
-    ui.button(label)
+fn held(ui: &mut Ui, enabled: bool, label: &str, tooltip: &str) -> bool {
+    ui.add_enabled(enabled, egui::Button::new(label))
         .on_hover_text(tooltip)
+        .on_disabled_hover_text("Turn off Auto focus to focus by hand")
         .is_pointer_button_down_on()
 }
 
@@ -1351,6 +1383,48 @@ mod tests {
         let (app, sent) = connected_app(None);
 
         assert_eq!(click(app, &sent, "Power on"), vec![Intent::SetPower(true)]);
+    }
+
+    #[test]
+    fn f_switches_focus_mode_as_it_does_in_the_tui() {
+        let (app, sent) = connected_app(Some(camera_state(true, true)));
+        let mut harness = ui_harness(app);
+
+        harness.key_press(Key::F);
+        harness.run();
+
+        assert_eq!(
+            sent.try_iter().collect::<Vec<_>>(),
+            vec![Intent::SetAutoFocus(false)]
+        );
+    }
+
+    #[test]
+    fn the_focus_keys_stay_out_of_a_cameras_way_while_it_focuses_itself() {
+        let (app, sent) = connected_app(Some(camera_state(true, true)));
+        let mut harness = ui_harness(app);
+
+        harness.key_down(Key::Period);
+        harness.run();
+
+        assert!(
+            sent.try_iter().next().is_none(),
+            "a camera focusing for itself ignores a manual focus drive"
+        );
+    }
+
+    #[test]
+    fn the_focus_keys_drive_once_the_camera_stops_focusing_itself() {
+        let (app, sent) = connected_app(Some(camera_state(true, false)));
+        let mut harness = ui_harness(app);
+
+        harness.key_down(Key::Period);
+        harness.run();
+
+        assert_eq!(
+            sent.try_iter().collect::<Vec<_>>(),
+            vec![Intent::DriveFocus(Some(FocusDirection::Far))]
+        );
     }
 
     #[test]

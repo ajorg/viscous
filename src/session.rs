@@ -44,6 +44,11 @@ pub const QUIESCENCE_INTERVAL: Duration = Duration::from_millis(300);
 /// terminals.
 pub const HELD_KEY_TIMEOUT: Duration = Duration::from_millis(700);
 
+/// What to say when a focus key is held against a camera that is focusing for
+/// itself — including the way out, since the focus keys are otherwise
+/// dead and nothing on screen says why.
+pub const AUTO_FOCUS_HINT: &str = "auto focus is on \u{2014} press f to focus by hand";
+
 /// Where a session's output goes: the TUI's status line and info panel, or
 /// the bare CLI's transcript.
 pub trait Report {
@@ -78,6 +83,10 @@ struct Session<'a, R: Report> {
     pending_state_query: bool,
     last_command_at: Instant,
     held: Option<HeldKey>,
+    /// Which way the camera said it was focusing, or `None` until it has said.
+    /// The focus keys can't hold against a camera focusing for itself, so the
+    /// loop has to know which it's doing before it starts one of those drives.
+    auto_focus: Option<bool>,
 }
 
 impl<'a, R: Report> Session<'a, R> {
@@ -92,6 +101,7 @@ impl<'a, R: Report> Session<'a, R> {
             pending_state_query: true,
             last_command_at: Instant::now() - QUIESCENCE_INTERVAL,
             held: None,
+            auto_focus: None,
         }
     }
 
@@ -122,6 +132,15 @@ impl<'a, R: Report> Session<'a, R> {
             Action::Quit => return Ok(key.kind == KeyEventKind::Press),
             Action::Camera(intent) if key.kind == KeyEventKind::Press => self.send(intent)?,
             Action::Camera(_) => {}
+            Action::ToggleAutoFocus if key.kind == KeyEventKind::Press => {
+                // Offer the mode that does something when the camera hasn't
+                // said which it's in yet: manual focus is what the focus keys
+                // need, and needing them is why anyone presses this.
+                let auto = !self.auto_focus.unwrap_or(true);
+                self.auto_focus = Some(auto);
+                self.send(Intent::SetAutoFocus(auto))?;
+            }
+            Action::ToggleAutoFocus => {}
             Action::Hold(hold) => self.handle_hold(key, hold)?,
         }
         Ok(false)
@@ -153,6 +172,12 @@ impl<'a, R: Report> Session<'a, R> {
     }
 
     fn start_hold(&mut self, code: KeyCode, hold: Hold) -> io::Result<()> {
+        // A camera focusing for itself ignores a manual focus drive, so say
+        // so rather than starting one that visibly does nothing.
+        if matches!(hold, Hold::Focus(_)) && self.auto_focus == Some(true) {
+            return self.report.status(AUTO_FOCUS_HINT);
+        }
+
         // Taking over from a key on the same control just re-aims it: the new
         // drive command replaces the old velocity outright. Taking over from a
         // different control would leave that one running, so stop it first.
@@ -196,7 +221,8 @@ impl<'a, R: Report> Session<'a, R> {
         loop {
             match self.results.try_recv() {
                 Ok(outcome) => match &outcome {
-                    Outcome::State(Ok(_)) => {
+                    Outcome::State(Ok(camera_state)) => {
+                        self.auto_focus = Some(camera_state.auto_focus);
                         self.report
                             .camera_state(&worker::describe_outcome(&outcome))?;
                     }
@@ -394,6 +420,17 @@ mod tests {
     fn go_stale(session: &mut Session<'_, Recorder>) {
         let held = session.held.as_mut().expect("a key should be held");
         held.last_seen = Instant::now() - HELD_KEY_TIMEOUT;
+    }
+
+    /// A camera state snapshot that differs only in how it is focusing.
+    fn focusing(auto_focus: bool) -> crate::state::CameraState {
+        crate::state::CameraState {
+            power_on: true,
+            pan_tilt: grafton_visca::camera::PanTiltPosition::new(0, 0),
+            zoom: grafton_visca::types::ZoomPosition::try_from(0u16).unwrap(),
+            focus: grafton_visca::types::FocusPosition::new(0),
+            auto_focus,
+        }
     }
 
     fn pan_tilt_direction(intent: Intent) -> PanTiltDirection {
@@ -687,13 +724,7 @@ mod tests {
             .unwrap();
         harness
             .outcomes
-            .send(Outcome::State(Ok(crate::state::CameraState {
-                power_on: true,
-                pan_tilt: grafton_visca::camera::PanTiltPosition::new(0, 0),
-                zoom: grafton_visca::types::ZoomPosition::try_from(0u16).unwrap(),
-                focus: grafton_visca::types::FocusPosition::new(0),
-                auto_focus: false,
-            })))
+            .send(Outcome::State(Ok(focusing(false))))
             .unwrap();
 
         {
@@ -703,6 +734,83 @@ mod tests {
 
         assert!(harness.report.statuses[0].contains("preset 3"));
         assert!(harness.report.camera_states[0].contains("power=on"));
+    }
+
+    #[test]
+    fn f_hands_focus_back_and_forth_between_the_camera_and_the_keys() {
+        let mut harness = Harness::new();
+        harness
+            .outcomes
+            .send(Outcome::State(Ok(focusing(true))))
+            .unwrap();
+        {
+            let mut session = harness.session();
+            session.drain().unwrap();
+            session.handle_key(press(KeyCode::Char('f'))).unwrap();
+            session.handle_key(press(KeyCode::Char('f'))).unwrap();
+        }
+
+        assert_eq!(
+            harness.sent(),
+            vec![Intent::SetAutoFocus(false), Intent::SetAutoFocus(true)]
+        );
+    }
+
+    #[test]
+    fn f_asks_for_manual_focus_first_when_the_camera_has_not_said_which_it_is_in() {
+        let mut harness = Harness::new();
+
+        harness
+            .session()
+            .handle_key(press(KeyCode::Char('f')))
+            .unwrap();
+
+        assert_eq!(harness.sent(), vec![Intent::SetAutoFocus(false)]);
+    }
+
+    #[test]
+    fn a_focus_key_says_why_it_does_nothing_while_the_camera_focuses_itself() {
+        let mut harness = Harness::new();
+        harness
+            .outcomes
+            .send(Outcome::State(Ok(focusing(true))))
+            .unwrap();
+        {
+            let mut session = harness.session();
+            session.drain().unwrap();
+            session.handle_key(press(KeyCode::Char('.'))).unwrap();
+            session.handle_key(release(KeyCode::Char('.'))).unwrap();
+        }
+
+        assert!(
+            harness.sent().is_empty(),
+            "a manual focus drive would be ignored by the camera"
+        );
+        assert!(
+            harness
+                .report
+                .statuses
+                .contains(&AUTO_FOCUS_HINT.to_string())
+        );
+    }
+
+    #[test]
+    fn the_focus_keys_drive_once_the_camera_stops_focusing_itself() {
+        let mut harness = Harness::new();
+        harness
+            .outcomes
+            .send(Outcome::State(Ok(focusing(false))))
+            .unwrap();
+        {
+            let mut session = harness.session();
+            session.drain().unwrap();
+            session.handle_key(press(KeyCode::Char('.'))).unwrap();
+        }
+
+        assert_eq!(
+            harness.sent(),
+            vec![Intent::DriveFocus(Some(FocusDirection::Far))]
+        );
     }
 
     #[test]

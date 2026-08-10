@@ -68,6 +68,13 @@ pub enum Action {
     Hold(Hold),
     /// Send a one-shot camera command.
     Camera(Intent),
+    /// Switch the camera between focusing for itself and leaving focus to
+    /// the focus keys.
+    ///
+    /// Not a [`Self::Camera`] intent, because which way to switch depends on
+    /// which way the camera is currently focusing and mapping a key can't
+    /// know that.
+    ToggleAutoFocus,
     /// Exit the application.
     Quit,
 }
@@ -112,6 +119,10 @@ pub fn map_key(key: KeyEvent) -> Option<Action> {
             let preset = digit.to_digit(10).expect("matched an ASCII digit") as u8;
             Action::Camera(Intent::RecallPreset(preset))
         }
+
+        // Manual focus doesn't hold while the camera is focusing for itself,
+        // so the way out of that has to be reachable from the keyboard too.
+        KeyCode::Char('f') => Action::ToggleAutoFocus,
 
         KeyCode::Char('q') => Action::Quit,
         // Ctrl-D is the conventional EOF/quit key for a terminal session.
@@ -252,6 +263,14 @@ mod tests {
         assert_eq!(
             map_key(press(KeyCode::Char('3'), KeyModifiers::NONE)),
             Some(Action::Camera(Intent::RecallPreset(3)))
+        );
+    }
+
+    #[test]
+    fn f_switches_between_focusing_modes() {
+        assert_eq!(
+            map_key(press(KeyCode::Char('f'), KeyModifiers::NONE)),
+            Some(Action::ToggleAutoFocus)
         );
     }
 

@@ -45,7 +45,7 @@ pub struct AppState {
 /// whole, so it names one way to reach each control and leaves the synonyms
 /// (`-=` for zoom, `<>` for focus, ctrl-D for quit) to be discovered.
 pub const KEY_LEGEND: &str = "hold to move: arrows  []zoom  ,.focus  shift=fast  \
-     1-6 preset  q quit";
+     1-6 preset  f auto  q quit";
 
 /// The narrowest terminal [`KEY_LEGEND`] is expected to fit in.
 pub const MIN_COLUMNS: usize = 80;
