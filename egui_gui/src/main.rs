@@ -319,7 +319,7 @@ impl App {
             }
         }
 
-        ui.add_space(8.0);
+        space(ui, 1.0);
         if matches!(self.connection, Connection::Connected { .. }) {
             self.draw_controls(ui);
         } else {
@@ -370,7 +370,7 @@ impl App {
             ui.text_edit_singleline(&mut self.port_input);
         });
         ui.small("a serial port (/dev/ttyUSB0, COM3), or tcp://host:port for VISCA over IP");
-        ui.add_space(8.0);
+        space(ui, 1.0);
         let connecting = matches!(self.connection, Connection::Connecting);
         if ui
             .add_enabled(!connecting, egui::Button::new("Connect"))
@@ -380,31 +380,31 @@ impl App {
             self.start_connect(&ctx);
         }
         if let Connection::Failed(error) = &self.connection {
-            ui.add_space(8.0);
+            space(ui, 1.0);
             ui.colored_label(egui::Color32::from_rgb(200, 60, 60), error);
         }
     }
 
     fn draw_controls(&mut self, ui: &mut Ui) {
         ui.label(self.status.as_deref().unwrap_or("Ready"));
-        ui.add_space(16.0);
+        space(ui, 2.0);
 
         let mut pointed = Drives::STOPPED;
         ui.horizontal(|ui| {
             let drives_height = ui
                 .vertical(|ui| {
-                    pointed.pan_tilt = joystick::pan_tilt_pad(ui, 240.0);
+                    pointed.pan_tilt = joystick::pan_tilt_pad(ui);
 
-                    ui.add_space(16.0);
+                    space(ui, 2.0);
                     (pointed.zoom, pointed.focus) = drive_buttons(ui);
 
-                    ui.add_space(8.0);
+                    space(ui, 1.0);
                     self.draw_camera_buttons(ui);
 
                     // The keys aren't discoverable from the buttons, the way
                     // the pad and the drives are, so they're spelled out —
                     // as the camera's older Windows control panel did.
-                    ui.add_space(8.0);
+                    space(ui, 1.0);
                     ui.small("Drag the pad to pan and tilt \u{2014} further out is faster");
                     ui.small("Arrows pan and tilt, with shift for full speed");
                     ui.small("Zoom with [ ] or PgUp/PgDn, focus with , and .");
@@ -423,7 +423,7 @@ impl App {
 
             ui.vertical(|ui| {
                 self.draw_presets(ui);
-                ui.add_space(12.0);
+                space(ui, 1.5);
                 self.draw_titles(ui);
             });
         });
@@ -437,7 +437,7 @@ impl App {
         }
 
         if let Some(state) = &self.camera_state {
-            ui.add_space(16.0);
+            space(ui, 2.0);
             ui.label(state::format_state(state));
         }
     }
@@ -726,6 +726,16 @@ fn keyboard_preset(ui: &Ui) -> Option<u8> {
             .position(|key| input.key_pressed(*key))
             .map(|index| index as u8 + 1)
     })
+}
+
+/// Opens a gap of `gaps` of the style's own spacing between widgets.
+///
+/// The layout's rhythm comes from the same measure egui already puts between
+/// everything it lays out, so a denser or roomier style moves the whole window
+/// together instead of leaving these gaps behind at a fixed size.
+fn space(ui: &mut Ui, gaps: f32) {
+    let gap = ui.spacing().item_spacing.x;
+    ui.add_space(gap * gaps);
 }
 
 /// Draws a small lamp for the camera's power state: lit when it's awake, dark
