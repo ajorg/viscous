@@ -1073,6 +1073,13 @@ mod tests {
         requested_size(&commands).expect("the first frame should size the window")
     }
 
+    /// The same, for the controls rather than the connect form.
+    fn connected_fit_on_screen(screen: Vec2) -> Vec2 {
+        let (mut app, _sent) = connected_app(None);
+        let commands = frame_on_screen(&mut app, &egui::Context::default(), screen);
+        requested_size(&commands).expect("the first frame should size the window")
+    }
+
     /// The description field belonging to preset `number`: the rows are drawn
     /// in order, so the nth text field is the nth preset's.
     fn description_field<'a>(harness: &'a Harness<'_, App>, number: u8) -> egui_kittest::Node<'a> {
@@ -1538,6 +1545,32 @@ mod tests {
         );
     }
 
+    /// The intents produced by holding the "Near" button down, with the
+    /// camera focusing the given way.
+    fn holding_focus_near(auto_focus: bool) -> Vec<Intent> {
+        let (app, sent) = connected_app(Some(camera_state(true, auto_focus)));
+        let mut harness = ui_harness(app);
+        harness.run();
+
+        let position = harness.get_by_label("Near").rect().center();
+        harness.drag_at(position);
+        harness.run();
+
+        sent.try_iter().collect()
+    }
+
+    #[test]
+    fn the_focus_buttons_stay_out_of_a_cameras_way_while_it_focuses_itself() {
+        assert_eq!(
+            holding_focus_near(false),
+            vec![Intent::DriveFocus(Some(FocusDirection::Near))]
+        );
+        assert!(
+            holding_focus_near(true).is_empty(),
+            "a button drawn dead should drive nothing"
+        );
+    }
+
     #[test]
     fn the_focus_keys_stay_out_of_a_cameras_way_while_it_focuses_itself() {
         let (app, sent) = connected_app(Some(camera_state(true, true)));
@@ -1600,6 +1633,18 @@ mod tests {
             small.x < 800.0 && small.y < 600.0,
             "the connect form should ask for less than the screen it was given: {small:?}"
         );
+    }
+
+    #[test]
+    fn a_narrow_screen_does_not_squeeze_the_description_fields() {
+        // The window is sized to fit its contents, so anything that sizes
+        // itself to the window in turn — a text field taking "what's left of
+        // the row" — can talk the two of them down to nothing, and the fit is
+        // only asked for once.
+        let cramped = connected_fit_on_screen(vec2(420.0, 300.0));
+        let roomy = connected_fit_on_screen(vec2(1600.0, 1200.0));
+
+        assert_eq!(cramped, roomy, "the screen should not decide the layout");
     }
 
     #[test]
