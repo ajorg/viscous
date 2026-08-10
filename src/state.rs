@@ -39,19 +39,32 @@ where
     })
 }
 
-/// Formats a camera state snapshot for display.
-pub fn format_state(state: &CameraState) -> String {
+/// Formats where the camera is pointing, zoomed and focused.
+///
+/// Split out from [`format_state`] for front ends that show the camera's power
+/// and focus mode in controls of their own: repeating them in a readout
+/// underneath only invites the two to disagree.
+pub fn format_position(state: &CameraState) -> String {
     // `ZoomPosition`/`FocusPosition`'s own `Display` impls already read
     // "Zoom 0x1000"/"Focus 0x1000" (grafton-visca bakes the label in), so
     // pairing that with our own "zoom="/"focus=" label would double it up;
     // use the raw value instead.
     format!(
-        "power={} pan={} tilt={} zoom=0x{:04X} focus=0x{:04X} ({})",
-        if state.power_on { "on" } else { "off" },
+        "pan={} tilt={} zoom=0x{:04X} focus=0x{:04X}",
         state.pan_tilt.pan,
         state.pan_tilt.tilt,
         state.zoom.value(),
         state.focus.value(),
+    )
+}
+
+/// Formats a camera state snapshot in full, for a display with nowhere else to
+/// put the power and focus mode.
+pub fn format_state(state: &CameraState) -> String {
+    format!(
+        "power={} {} ({})",
+        if state.power_on { "on" } else { "off" },
+        format_position(state),
         if state.auto_focus { "auto" } else { "manual" },
     )
 }
@@ -89,6 +102,16 @@ mod tests {
         };
 
         assert!(format_state(&auto).contains("auto"));
+    }
+
+    #[test]
+    fn format_position_leaves_out_what_a_control_already_shows() {
+        let text = format_position(&sample_state());
+
+        assert!(text.contains("pan=-120"));
+        assert!(text.contains("zoom=0x1000"));
+        assert!(!text.contains("power"));
+        assert!(!text.contains("manual"));
     }
 
     #[test]

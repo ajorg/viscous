@@ -102,6 +102,11 @@ impl<'a, R: Report> Session<'a, R> {
         let _ = self.intents.send(intent);
         self.pending_state_query = true;
         self.last_command_at = Instant::now();
+        // A drive is its own progress report — the picture moves — so it says
+        // nothing, and the key legend stays up while the key is held.
+        if worker::is_drive(intent) {
+            return Ok(());
+        }
         self.report.status(&worker::describe_busy(intent))
     }
 
@@ -190,13 +195,17 @@ impl<'a, R: Report> Session<'a, R> {
     fn drain(&mut self) -> io::Result<bool> {
         loop {
             match self.results.try_recv() {
-                Ok(outcome) => {
-                    let text = worker::describe_outcome(&outcome);
-                    match outcome {
-                        Outcome::State(Ok(_)) => self.report.camera_state(&text)?,
-                        _ => self.report.status(&text)?,
+                Ok(outcome) => match &outcome {
+                    Outcome::State(Ok(_)) => {
+                        self.report
+                            .camera_state(&worker::describe_outcome(&outcome))?;
                     }
-                }
+                    // A drive that worked was already visible before its
+                    // completion arrived; one that failed is the only kind
+                    // worth interrupting the legend for.
+                    Outcome::Done(intent, Ok(())) if worker::is_drive(*intent) => {}
+                    _ => self.report.status(&worker::describe_outcome(&outcome))?,
+                },
                 Err(TryRecvError::Empty) => return Ok(true),
                 Err(TryRecvError::Disconnected) => return Ok(false),
             }
@@ -404,6 +413,44 @@ mod tests {
         let sent = harness.sent();
         assert_eq!(sent.len(), 1, "one drive command, got {sent:?}");
         assert_eq!(pan_tilt_direction(sent[0]), PanTiltDirection::Right);
+    }
+
+    #[test]
+    fn driving_leaves_the_status_line_to_say_something_else() {
+        let mut harness = Harness::new();
+        let mut session = harness.session();
+
+        session.handle_key(press(KeyCode::Right)).unwrap();
+        session.handle_key(release(KeyCode::Right)).unwrap();
+        harness
+            .outcomes
+            .send(Outcome::Done(Intent::DrivePanTilt(Velocity::STOP), Ok(())))
+            .unwrap();
+        let mut session = harness.session();
+        session.drain().unwrap();
+
+        assert!(
+            harness.report.statuses.is_empty(),
+            "a move is its own report: {:?}",
+            harness.report.statuses
+        );
+    }
+
+    #[test]
+    fn a_drive_that_failed_is_still_worth_saying() {
+        let mut harness = Harness::new();
+        harness
+            .outcomes
+            .send(Outcome::Done(
+                Intent::DrivePanTilt(Velocity::STOP),
+                Err(grafton_visca::Error::Timeout),
+            ))
+            .unwrap();
+
+        harness.session().drain().unwrap();
+
+        assert_eq!(harness.report.statuses.len(), 1);
+        assert!(harness.report.statuses[0].contains("error"));
     }
 
     #[test]

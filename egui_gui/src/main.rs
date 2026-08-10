@@ -72,6 +72,30 @@ impl Drives {
     }
 }
 
+/// A line of feedback for the operator, and whether it reports a failure —
+/// the one kind that's worth colouring, since it's the one that needs looking
+/// at rather than just reading.
+struct Status {
+    text: String,
+    failed: bool,
+}
+
+impl Status {
+    fn ok(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            failed: false,
+        }
+    }
+
+    fn failed(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            failed: true,
+        }
+    }
+}
+
 /// Where the camera connection attempt currently stands.
 enum Connection {
     Disconnected,
@@ -118,7 +142,7 @@ struct App {
     /// rather than as text: the power lamp and the focus-mode toggle answer
     /// from it, not just the readout at the bottom.
     camera_state: Option<CameraState>,
-    status: Option<String>,
+    status: Option<Status>,
     /// What each preset is of, in the operator's own words, keyed by the same
     /// 1-based number as the buttons.
     preset_labels: BTreeMap<u8, String>,
@@ -183,7 +207,7 @@ impl App {
                 app.preset_labels = config.presets;
                 app.titles = config.titles;
             }
-            Some(Err(error)) => app.status = Some(error.to_string()),
+            Some(Err(error)) => app.status = Some(Status::failed(error.to_string())),
             None => {}
         }
         app
@@ -197,7 +221,11 @@ impl App {
         if let Some(intents) = &self.intents {
             let _ = intents.send(intent);
         }
-        self.status = Some(worker::describe_busy(intent));
+        // A drive is its own progress report — the picture moves — and a drag
+        // sends one of them per frame, which would leave nothing else legible.
+        if !worker::is_drive(intent) {
+            self.status = Some(Status::ok(worker::describe_busy(intent)));
+        }
         self.pending_state_query = true;
         self.last_command_at = Instant::now();
     }
@@ -266,10 +294,21 @@ impl App {
     /// query becomes the status line; a successful state query updates the
     /// camera-state panel instead — mirrors the TUI's own `Report` impl.
     fn apply_outcome(&mut self, outcome: Outcome) {
-        match &outcome {
-            Outcome::State(Ok(camera_state)) => self.camera_state = Some(*camera_state),
-            _ => self.status = Some(worker::describe_outcome(&outcome)),
-        }
+        let failed = match &outcome {
+            Outcome::State(Ok(camera_state)) => {
+                self.camera_state = Some(*camera_state);
+                return;
+            }
+            // A drive that worked was already visible before its completion
+            // arrived; one that failed is the only kind still worth saying.
+            Outcome::Done(intent, Ok(())) if worker::is_drive(*intent) => return,
+            Outcome::Done(_, result) => result.is_err(),
+            Outcome::State(_) => true,
+        };
+        self.status = Some(Status {
+            text: worker::describe_outcome(&outcome),
+            failed,
+        });
     }
 
     fn drain_results(&mut self) {
@@ -381,12 +420,12 @@ impl App {
         }
         if let Connection::Failed(error) = &self.connection {
             space(ui, 1.0);
-            ui.colored_label(egui::Color32::from_rgb(200, 60, 60), error);
+            ui.colored_label(ui.visuals().error_fg_color, error);
         }
     }
 
     fn draw_controls(&mut self, ui: &mut Ui) {
-        ui.label(self.status.as_deref().unwrap_or("Ready"));
+        self.draw_status(ui);
         space(ui, 2.0);
 
         let mut pointed = Drives::STOPPED;
@@ -438,7 +477,25 @@ impl App {
 
         if let Some(state) = &self.camera_state {
             space(ui, 2.0);
-            ui.label(state::format_state(state));
+            // Power and focus mode are already shown by the lamp and the
+            // toggle, so what's left is only the numbers, kept quiet: they're
+            // there to be checked, not read.
+            ui.weak(state::format_position(state));
+        }
+    }
+
+    /// The one line of feedback for whatever was last asked of the camera.
+    fn draw_status(&mut self, ui: &mut Ui) {
+        match &self.status {
+            Some(status) if status.failed => {
+                ui.colored_label(ui.visuals().error_fg_color, &status.text);
+            }
+            Some(status) => {
+                ui.label(&status.text);
+            }
+            None => {
+                ui.label("Ready");
+            }
         }
     }
 
@@ -576,7 +633,7 @@ impl App {
             titles: written(&self.titles),
         };
         if let Err(error) = config::save(&config, &path) {
-            self.status = Some(error.to_string());
+            self.status = Some(Status::failed(error.to_string()));
         }
     }
 
@@ -977,6 +1034,51 @@ mod tests {
             ))]
         );
         assert_eq!(released, vec![Intent::DrivePanTilt(Velocity::STOP)]);
+    }
+
+    #[test]
+    fn driving_leaves_the_status_line_to_say_something_else() {
+        let (app, _sent) = connected_app(None);
+        let mut harness = ui_harness(app);
+
+        harness.key_down(Key::ArrowRight);
+        harness.run();
+        harness.key_up(Key::ArrowRight);
+        harness.run();
+        harness
+            .state_mut()
+            .apply_outcome(Outcome::Done(Intent::DrivePanTilt(Velocity::STOP), Ok(())));
+
+        assert!(
+            harness.state().status.is_none(),
+            "a move is its own report: {:?}",
+            harness.state().status.as_ref().map(|status| &status.text)
+        );
+    }
+
+    #[test]
+    fn a_drive_that_failed_is_reported_as_a_failure() {
+        let (mut app, _sent) = connected_app(None);
+
+        app.apply_outcome(Outcome::Done(
+            Intent::DrivePanTilt(Velocity::STOP),
+            Err(grafton_visca::Error::Timeout),
+        ));
+
+        let status = app.status.expect("a failed drive should be reported");
+        assert!(status.failed);
+        assert!(status.text.contains("error"));
+    }
+
+    #[test]
+    fn a_one_off_command_says_it_is_under_way() {
+        let (mut app, _sent) = connected_app(None);
+
+        app.send_intent(Intent::RecallPreset(3));
+
+        let status = app.status.expect("a preset recall should be reported");
+        assert!(!status.failed);
+        assert!(status.text.contains("preset 3"));
     }
 
     #[test]

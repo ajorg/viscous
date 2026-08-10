@@ -97,6 +97,16 @@ fn control(intent: Intent) -> Option<Control> {
     }
 }
 
+/// Whether this intent drives one of the camera's continuous controls rather
+/// than being a command that happens once.
+///
+/// Both front ends use it to keep drives out of the status line: a move
+/// announces itself in the picture, and saying "pan/tilt right..." for every
+/// one of them would bury the messages that only the status line can carry.
+pub fn is_drive(intent: Intent) -> bool {
+    control(intent).is_some()
+}
+
 /// Drops every queued drive command that a later one for the same control
 /// has already superseded, leaving everything else in order.
 ///
