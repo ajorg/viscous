@@ -537,11 +537,13 @@ impl App {
     /// bare numbers — so it lives in this program's config file and comes back
     /// on the next run.
     fn draw_presets(&mut self, ui: &mut Ui) {
+        ui.label("Presets");
         for number in 1..=PRESETS {
             ui.horizontal(|ui| {
+                let description = self.preset_labels.get(&number).map(String::as_str);
                 if ui
                     .button(number.to_string())
-                    .on_hover_text(format!("Go to preset {number}"))
+                    .on_hover_text(recall_tooltip(number, description))
                     .clicked()
                 {
                     self.send_intent(Intent::RecallPreset(number));
@@ -552,9 +554,15 @@ impl App {
                     self.save_config();
                 }
 
+                // "Mark", as the camera's older Windows control panel called
+                // it: next to a description field, a button reading "Save"
+                // looks like it saves the description, when what it stores is
+                // where the camera is pointing.
                 if ui
-                    .button("Save")
-                    .on_hover_text(format!("Store this position as preset {number}"))
+                    .button("Mark")
+                    .on_hover_text(format!(
+                        "Store where the camera is pointing now as preset {number}"
+                    ))
                     .clicked()
                 {
                     self.send_intent(Intent::SavePreset(number));
@@ -687,25 +695,51 @@ impl App {
 ///
 /// Held rather than clicked: a continuous drive runs for exactly as long as
 /// the button is down, which is the same interaction as holding the TUI's
-/// zoom and focus keys.
+/// zoom and focus keys. They read "Out"/"In" and "Near"/"Far" rather than
+/// "−"/"+", because neither control has a more or a less of it — zoom has a
+/// wide end and a tight one, and focus has a near and a far.
 fn drive_buttons(ui: &mut egui::Ui) -> (Option<ZoomDirection>, Option<FocusDirection>) {
     let mut zoom = None;
     let mut focus = None;
-    ui.horizontal(|ui| {
-        if ui.button("Zoom \u{2212}").is_pointer_button_down_on() {
+    // A grid rather than two rows of its own, so the buttons line up under
+    // each other however wide the words in front of them turn out to be.
+    egui::Grid::new("drives").show(ui, |ui| {
+        ui.label("Zoom");
+        if held(ui, "Out", "Widen the shot, for as long as the button is held") {
             zoom = Some(ZoomDirection::Out);
         }
-        if ui.button("Zoom +").is_pointer_button_down_on() {
+        if held(ui, "In", "Tighten the shot, for as long as the button is held") {
             zoom = Some(ZoomDirection::In);
         }
-        if ui.button("Focus \u{2212}").is_pointer_button_down_on() {
+        ui.end_row();
+
+        ui.label("Focus");
+        if held(ui, "Near", "Focus closer, for as long as the button is held") {
             focus = Some(FocusDirection::Near);
         }
-        if ui.button("Focus +").is_pointer_button_down_on() {
+        if held(ui, "Far", "Focus further away, for as long as the button is held") {
             focus = Some(FocusDirection::Far);
         }
+        ui.end_row();
     });
     (zoom, focus)
+}
+
+/// What the button for preset `number` promises, named by what the operator
+/// called the shot rather than only by the number the camera knows it as.
+fn recall_tooltip(number: u8, description: Option<&str>) -> String {
+    match description.map(str::trim).filter(|text| !text.is_empty()) {
+        Some(shot) => format!("Go to preset {number}: {shot}"),
+        None => format!("Go to preset {number}"),
+    }
+}
+
+/// A button that reports whether it is being held down rather than whether it
+/// was clicked — one continuous drive runs for exactly as long as it is.
+fn held(ui: &mut Ui, label: &str, tooltip: &str) -> bool {
+    ui.button(label)
+        .on_hover_text(tooltip)
+        .is_pointer_button_down_on()
 }
 
 /// Whether the keyboard currently belongs to a widget — a preset description
@@ -1196,6 +1230,16 @@ mod tests {
     }
 
     #[test]
+    fn a_preset_button_offers_the_shot_it_was_described_as() {
+        assert_eq!(
+            recall_tooltip(3, Some("Wide shot of stand")),
+            "Go to preset 3: Wide shot of stand"
+        );
+        assert_eq!(recall_tooltip(3, None), "Go to preset 3");
+        assert_eq!(recall_tooltip(3, Some("   ")), "Go to preset 3");
+    }
+
+    #[test]
     fn a_numbered_preset_button_goes_to_that_preset() {
         let (app, sent) = connected_app(None);
 
@@ -1208,9 +1252,9 @@ mod tests {
         let mut harness = ui_harness(app);
 
         harness
-            .get_all_by_label("Save")
+            .get_all_by_label("Mark")
             .nth(2)
-            .expect("there should be a Save button for every preset")
+            .expect("there should be a Mark button for every preset")
             .click();
         harness.run();
 
