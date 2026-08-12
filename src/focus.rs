@@ -10,6 +10,8 @@ use grafton_visca::{
     types::SpeedLevel,
 };
 
+use crate::rocker;
+
 /// Which way a focus drive moves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FocusDirection {
@@ -19,18 +21,43 @@ pub enum FocusDirection {
     Far,
 }
 
-/// Starts driving focus in `direction`, or stops it when `direction` is
-/// `None`.
+/// A focus drive: which way, and how fast.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FocusDrive {
+    /// Which way focus is travelling.
+    pub direction: FocusDirection,
+    /// How fast. Focus is the control that most wants a slow setting: the
+    /// distance between sharp and soft is small, and at the camera's own pace
+    /// it is easy to drive straight past it.
+    pub speed: SpeedLevel,
+}
+
+impl FocusDrive {
+    /// The drive a rocker pushed to `deflection` asks for — negative for
+    /// near, positive for far — or `None` while it's still at rest.
+    pub fn from_deflection(deflection: f32) -> Option<Self> {
+        let direction = if deflection < 0.0 {
+            FocusDirection::Near
+        } else {
+            FocusDirection::Far
+        };
+        rocker::speed(deflection.abs()).map(|speed| Self { direction, speed })
+    }
+}
+
+/// Starts `drive`, or stops the focus when it's `None`.
 pub fn drive_focus<T>(
     camera: &BlockingClient<GenericVisca, T>,
-    direction: Option<FocusDirection>,
+    drive: Option<FocusDrive>,
 ) -> Result<(), Error>
 where
     T: BlockingTransport + HasTransportConfig + 'static,
 {
-    match direction {
-        Some(FocusDirection::Near) => camera.focus_near(SpeedLevel::Medium),
-        Some(FocusDirection::Far) => camera.focus_far(SpeedLevel::Medium),
+    match drive {
+        Some(drive) => match drive.direction {
+            FocusDirection::Near => camera.focus_near(drive.speed),
+            FocusDirection::Far => camera.focus_far(drive.speed),
+        },
         None => camera.focus_stop(),
     }
 }
@@ -63,12 +90,40 @@ mod tests {
             .expect("camera should build from a scripted transport")
     }
 
+    fn drive(direction: FocusDirection) -> Option<FocusDrive> {
+        Some(FocusDrive {
+            direction,
+            speed: SpeedLevel::Medium,
+        })
+    }
+
     #[test]
     fn drive_focus_starts_a_drive_in_each_direction() {
-        drive_focus(&scripted_camera(), Some(FocusDirection::Near))
+        drive_focus(&scripted_camera(), drive(FocusDirection::Near))
             .expect("scripted camera should ack and complete focus near");
-        drive_focus(&scripted_camera(), Some(FocusDirection::Far))
+        drive_focus(&scripted_camera(), drive(FocusDirection::Far))
             .expect("scripted camera should ack and complete focus far");
+    }
+
+    #[test]
+    fn a_rocker_at_rest_asks_for_no_focus_and_either_way_off_centre_focuses() {
+        assert_eq!(FocusDrive::from_deflection(0.0), None);
+        assert_eq!(
+            FocusDrive::from_deflection(1.0).map(|drive| drive.direction),
+            Some(FocusDirection::Far)
+        );
+        assert_eq!(
+            FocusDrive::from_deflection(-1.0).map(|drive| drive.direction),
+            Some(FocusDirection::Near)
+        );
+    }
+
+    #[test]
+    fn pushing_the_rocker_further_focuses_faster() {
+        let nudged = FocusDrive::from_deflection(0.2).expect("past the deadzone should drive");
+        let pushed = FocusDrive::from_deflection(1.0).expect("past the deadzone should drive");
+
+        assert_ne!(nudged.speed, pushed.speed);
     }
 
     #[test]

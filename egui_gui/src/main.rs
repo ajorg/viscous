@@ -10,6 +10,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod joystick;
+mod rocker;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -22,14 +23,14 @@ use egui::{Key, TextWrapMode, Ui, Vec2, vec2};
 use viscous::{
     config,
     connection::{self, Target, format_camera, format_version},
-    focus::FocusDirection,
+    focus::FocusDrive,
     keymap::{FAST_KEY_DEFLECTION, KEY_DEFLECTION},
     pan_tilt::{self, Velocity},
     session::{POLL_INTERVAL, QUIESCENCE_INTERVAL},
     state::{self, CameraState},
     title::{self, Title},
     worker::{self, Intent, Outcome},
-    zoom::ZoomDirection,
+    zoom::ZoomDrive,
 };
 
 /// What to offer in the camera field before anything has connected: the shape
@@ -52,8 +53,8 @@ const TITLES: u8 = 3;
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Drives {
     pan_tilt: Velocity,
-    zoom: Option<ZoomDirection>,
-    focus: Option<FocusDirection>,
+    zoom: Option<ZoomDrive>,
+    focus: Option<FocusDrive>,
 }
 
 impl Drives {
@@ -198,8 +199,8 @@ struct App {
     /// on the camera by itself, so these say what it's already doing — and a
     /// command only goes out when a control is asked for something different.
     pan_tilt: Velocity,
-    zoom: Option<ZoomDirection>,
-    focus: Option<FocusDirection>,
+    zoom: Option<ZoomDrive>,
+    focus: Option<FocusDrive>,
 }
 
 impl Default for App {
@@ -521,7 +522,7 @@ impl App {
                     pointed.pan_tilt = joystick::pan_tilt_pad(ui, self.pad_size);
 
                     space(ui, 2.0);
-                    (pointed.zoom, pointed.focus) = drive_buttons(ui, self.auto_focusing());
+                    (pointed.zoom, pointed.focus) = drive_rockers(ui, self.auto_focusing());
 
                     space(ui, 1.0);
                     self.draw_camera_buttons(ui);
@@ -815,46 +816,57 @@ impl App {
     }
 }
 
-/// Draws the zoom and focus buttons, reporting which direction each is being
-/// held in.
+/// The rockers that drive zoom and focus, reporting what each is being pushed
+/// to ask for.
 ///
-/// Held rather than clicked: a continuous drive runs for exactly as long as
-/// the button is down, which is the same interaction as holding the TUI's
-/// zoom and focus keys. They read "Out"/"In" and "Near"/"Far" rather than
-/// "−"/"+", because neither control has a more or a less of it — zoom has a
-/// wide end and a tight one, and focus has a near and a far.
-fn drive_buttons(
-    ui: &mut egui::Ui,
-    auto_focusing: bool,
-) -> (Option<ZoomDirection>, Option<FocusDirection>) {
-    let mut zoom = None;
-    let mut focus = None;
-    // A grid rather than two rows of its own, so the buttons line up under
-    // each other however wide the words in front of them turn out to be.
-    egui::Grid::new("drives").show(ui, |ui| {
-        ui.label("Zoom");
-        if held(ui, true, "Out", "Hold to widen the shot") {
-            zoom = Some(ZoomDirection::Out);
-        }
-        if held(ui, true, "In", "Hold to tighten the shot") {
-            zoom = Some(ZoomDirection::In);
-        }
-        ui.end_row();
-
-        // Drawn dead rather than left to do nothing, since a camera focusing
-        // for itself ignores them; the toggle that revives them is alongside.
-        let manual = !auto_focusing;
-        ui.label("Focus");
-        if held(ui, manual, "Near", "Hold to focus closer") {
-            focus = Some(FocusDirection::Near);
-        }
-        if held(ui, manual, "Far", "Hold to focus further off") {
-            focus = Some(FocusDirection::Far);
-        }
-        ui.end_row();
-    });
-    (zoom, focus)
+/// Pushed rather than clicked: a drive runs for exactly as long as the rocker
+/// is held off centre, and how far it's pushed sets how fast — which the
+/// camera has always accepted on these two controls, and which a pair of
+/// buttons had no way to express. A slow zoom is the difference between a
+/// shot that can go out live and one that lurches.
+///
+/// The ends carry the marks these controls have on the camera itself rather
+/// than English words: W and T for the wide and telephoto ends of the zoom,
+/// and the macro flower and infinity sign for the near and far ends of focus,
+/// as printed on a lens barrel. The tooltips say it in words for anyone who
+/// hasn't met them.
+fn drive_rockers(ui: &mut Ui, auto_focusing: bool) -> (Option<ZoomDrive>, Option<FocusDrive>) {
+    let zoom = rocker::rocker(
+        ui,
+        &rocker::Marks {
+            label: "Zoom",
+            ends: ("W", "T"),
+            tooltips: (
+                "Wide \u{2014} push further to widen faster",
+                "Telephoto \u{2014} push further to tighten faster",
+            ),
+        },
+        true,
+        "",
+    );
+    // Drawn dead rather than left to do nothing, since a camera focusing for
+    // itself ignores it; the toggle that revives it is just below.
+    let focus = rocker::rocker(
+        ui,
+        &rocker::Marks {
+            label: "Focus",
+            ends: ("\u{273F}", "\u{221E}"),
+            tooltips: (
+                "Near \u{2014} push further to focus closer faster",
+                "Far \u{2014} push further to focus further off faster",
+            ),
+        },
+        !auto_focusing,
+        AUTO_FOCUS_HINT,
+    );
+    (
+        ZoomDrive::from_deflection(zoom),
+        FocusDrive::from_deflection(focus),
+    )
 }
+
+/// What to say about a focus control the camera is currently overriding.
+const AUTO_FOCUS_HINT: &str = "Turn off Auto focus to focus by hand";
 
 /// What the button for preset `number` promises, named by what the operator
 /// called the shot rather than only by the number the camera knows it as.
@@ -863,15 +875,6 @@ fn recall_tooltip(number: u8, description: Option<&str>) -> String {
         Some(shot) => format!("Go to preset {number}: {shot}"),
         None => format!("Go to preset {number}"),
     }
-}
-
-/// A button that reports whether it is being held down rather than whether it
-/// was clicked — one continuous drive runs for exactly as long as it is.
-fn held(ui: &mut Ui, enabled: bool, label: &str, tooltip: &str) -> bool {
-    ui.add_enabled(enabled, egui::Button::new(label))
-        .on_hover_text(tooltip)
-        .on_disabled_hover_text("Turn off Auto focus to focus by hand")
-        .is_pointer_button_down_on()
 }
 
 /// Whether the keyboard currently belongs to a widget — a preset description
@@ -900,33 +903,30 @@ fn held_drives(down: impl Fn(Key) -> bool, shift: bool) -> Drives {
         _ => 0.0,
     };
 
+    let zoom = opposed(
+        down(Key::OpenBracket) || down(Key::Minus) || down(Key::PageDown),
+        down(Key::CloseBracket) || down(Key::Equals) || down(Key::PageUp),
+        deflection,
+    );
+    let focus = opposed(down(Key::Comma), down(Key::Period), deflection);
+
     Drives {
         pan_tilt: pan_tilt::velocity_from_axes(
             axis(Key::ArrowLeft, Key::ArrowRight),
             axis(Key::ArrowDown, Key::ArrowUp),
         ),
-        zoom: direction(
-            down(Key::OpenBracket) || down(Key::Minus) || down(Key::PageDown),
-            down(Key::CloseBracket) || down(Key::Equals) || down(Key::PageUp),
-            ZoomDirection::Out,
-            ZoomDirection::In,
-        ),
-        focus: direction(
-            down(Key::Comma),
-            down(Key::Period),
-            FocusDirection::Near,
-            FocusDirection::Far,
-        ),
+        zoom: ZoomDrive::from_deflection(zoom),
+        focus: FocusDrive::from_deflection(focus),
     }
 }
 
-/// Which of two opposed keys is asking for its direction, or neither when
-/// both are — a control can only go one way at a time.
-fn direction<T>(negative: bool, positive: bool, out: T, in_: T) -> Option<T> {
+/// How far two opposed keys push the rocker they share, which is nowhere when
+/// both are down — a control can only go one way at a time.
+fn opposed(negative: bool, positive: bool, deflection: f32) -> f32 {
     match (negative, positive) {
-        (true, false) => Some(out),
-        (false, true) => Some(in_),
-        _ => None,
+        (true, false) => -deflection,
+        (false, true) => deflection,
+        _ => 0.0,
     }
 }
 
@@ -955,9 +955,9 @@ fn keyboard_preset(ui: &Ui) -> Option<u8> {
 /// the pad and the drives are, and the camera's older Windows control panel
 /// listed its own the same way.
 fn draw_key_help(ui: &mut Ui) {
-    ui.small("Drag the pad to pan and tilt \u{2014} further out is faster");
-    ui.small("Arrows pan and tilt, with shift for full speed");
-    ui.small("Zoom with [ ] or PgUp/PgDn, focus with , and .");
+    ui.small("Drag the pad and push the rockers \u{2014} further is faster");
+    ui.small("Arrows pan and tilt, [ ] or PgUp/PgDn zoom, , and . focus");
+    ui.small("Shift on any of those drives at full speed");
     ui.small("Keys 1-6 go to presets, f switches auto focus");
 }
 
@@ -1043,6 +1043,7 @@ mod tests {
     use egui::{Pos2, Rect, ViewportCommand};
     use egui_kittest::{Harness, kittest::Queryable};
     use grafton_visca::{camera::PanTiltPosition, types::FocusPosition, types::ZoomPosition};
+    use viscous::{focus::FocusDirection, zoom::ZoomDirection};
 
     /// An app already connected to a camera, plus the receiving end of the
     /// channel its controls send intents down — what a click actually
@@ -1183,14 +1184,34 @@ mod tests {
         assert_eq!(both, Drives::STOPPED);
     }
 
+    /// Which way a set of held keys drives zoom, and which way focus.
+    fn zoom_way(keys: &[Key]) -> Option<ZoomDirection> {
+        held(keys).zoom.map(|drive| drive.direction)
+    }
+
+    fn focus_way(keys: &[Key]) -> Option<FocusDirection> {
+        held(keys).focus.map(|drive| drive.direction)
+    }
+
     #[test]
     fn the_zoom_and_focus_keys_drive_those() {
-        assert_eq!(held(&[Key::CloseBracket]).zoom, Some(ZoomDirection::In));
-        assert_eq!(held(&[Key::Minus]).zoom, Some(ZoomDirection::Out));
-        assert_eq!(held(&[Key::PageUp]).zoom, Some(ZoomDirection::In));
-        assert_eq!(held(&[Key::PageDown]).zoom, Some(ZoomDirection::Out));
-        assert_eq!(held(&[Key::Comma]).focus, Some(FocusDirection::Near));
-        assert_eq!(held(&[Key::Period]).focus, Some(FocusDirection::Far));
+        assert_eq!(zoom_way(&[Key::CloseBracket]), Some(ZoomDirection::In));
+        assert_eq!(zoom_way(&[Key::Minus]), Some(ZoomDirection::Out));
+        assert_eq!(zoom_way(&[Key::PageUp]), Some(ZoomDirection::In));
+        assert_eq!(zoom_way(&[Key::PageDown]), Some(ZoomDirection::Out));
+        assert_eq!(focus_way(&[Key::Comma]), Some(FocusDirection::Near));
+        assert_eq!(focus_way(&[Key::Period]), Some(FocusDirection::Far));
+    }
+
+    #[test]
+    fn shift_drives_zoom_and_focus_faster_as_it_does_the_pan() {
+        let framing = held(&[Key::CloseBracket]).zoom.expect("a held key drives");
+        let fast = held_drives(|key| key == Key::CloseBracket, true)
+            .zoom
+            .expect("a held key drives");
+
+        assert_eq!(fast.direction, framing.direction);
+        assert_ne!(fast.speed, framing.speed);
     }
 
     #[test]
@@ -1204,7 +1225,10 @@ mod tests {
         let both = dragging.or(zooming);
 
         assert_eq!(both.pan_tilt, dragging.pan_tilt);
-        assert_eq!(both.zoom, Some(ZoomDirection::In));
+        assert_eq!(
+            both.zoom.map(|drive| drive.direction),
+            Some(ZoomDirection::In)
+        );
     }
 
     #[test]
@@ -1598,30 +1622,47 @@ mod tests {
         );
     }
 
-    /// The intents produced by holding the "Near" button down, with the
-    /// camera focusing the given way.
+    /// The intents produced by pushing the focus rocker towards its near
+    /// end, with the camera focusing the given way.
     fn holding_focus_near(auto_focus: bool) -> Vec<Intent> {
         let (app, sent) = connected_app(Some(camera_state(true, auto_focus)));
         let mut harness = ui_harness(app);
         harness.run();
 
-        let position = harness.get_by_label("Near").rect().center();
-        harness.drag_at(position);
+        // Zoom's track is drawn first, so focus's is the second slider.
+        let track = harness
+            .get_all_by_role(egui::accesskit::Role::Slider)
+            .nth(1)
+            .expect("focus should have a rocker")
+            .rect();
+        harness.drag_at(track.left_center());
         harness.run();
 
         sent.try_iter().collect()
     }
 
     #[test]
-    fn the_focus_buttons_stay_out_of_a_cameras_way_while_it_focuses_itself() {
+    fn the_focus_rocker_stays_out_of_a_cameras_way_while_it_focuses_itself() {
         assert_eq!(
-            holding_focus_near(false),
-            vec![Intent::DriveFocus(Some(FocusDirection::Near))]
+            holding_focus_near(false)
+                .into_iter()
+                .map(focus_direction)
+                .collect::<Vec<_>>(),
+            vec![Some(FocusDirection::Near)]
         );
         assert!(
             holding_focus_near(true).is_empty(),
-            "a button drawn dead should drive nothing"
+            "a rocker drawn dead should drive nothing"
         );
+    }
+
+    /// Which way an intent drives focus, for asserting on direction without
+    /// pinning down the speed a particular push happened to ask for.
+    fn focus_direction(intent: Intent) -> Option<FocusDirection> {
+        match intent {
+            Intent::DriveFocus(drive) => drive.map(|drive| drive.direction),
+            other => panic!("expected a focus drive, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1647,8 +1688,8 @@ mod tests {
         harness.run();
 
         assert_eq!(
-            sent.try_iter().collect::<Vec<_>>(),
-            vec![Intent::DriveFocus(Some(FocusDirection::Far))]
+            sent.try_iter().map(focus_direction).collect::<Vec<_>>(),
+            vec![Some(FocusDirection::Far)]
         );
     }
 

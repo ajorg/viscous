@@ -335,7 +335,11 @@ fn run_loop<R: Report>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{focus::FocusDirection, pan_tilt::Velocity, zoom::ZoomDirection};
+    use crate::{
+        focus::{FocusDirection, FocusDrive},
+        pan_tilt::Velocity,
+        zoom::{ZoomDirection, ZoomDrive},
+    };
     use crossterm::event::KeyModifiers;
     use grafton_visca::command::PanTiltDirection;
     use std::sync::mpsc::channel;
@@ -430,6 +434,20 @@ mod tests {
             zoom: grafton_visca::types::ZoomPosition::try_from(0u16).unwrap(),
             focus: grafton_visca::types::FocusPosition::new(0),
             auto_focus,
+        }
+    }
+
+    fn zoom_direction(intent: Intent) -> ZoomDirection {
+        match intent {
+            Intent::DriveZoom(Some(ZoomDrive { direction, .. })) => direction,
+            other => panic!("expected a zoom drive, got {other:?}"),
+        }
+    }
+
+    fn focus_direction(intent: Intent) -> FocusDirection {
+        match intent {
+            Intent::DriveFocus(Some(FocusDrive { direction, .. })) => direction,
+            other => panic!("expected a focus drive, got {other:?}"),
         }
     }
 
@@ -602,7 +620,7 @@ mod tests {
         let sent = harness.sent();
         assert_eq!(pan_tilt_direction(sent[0]), PanTiltDirection::Right);
         assert_eq!(sent[1], Intent::DrivePanTilt(Velocity::STOP));
-        assert_eq!(sent[2], Intent::DriveZoom(Some(ZoomDirection::In)));
+        assert_eq!(zoom_direction(sent[2]), ZoomDirection::In);
         assert_eq!(sent.len(), 3);
     }
 
@@ -615,13 +633,10 @@ mod tests {
             session.handle_key(release(KeyCode::Char(','))).unwrap();
         }
 
-        assert_eq!(
-            harness.sent(),
-            vec![
-                Intent::DriveFocus(Some(FocusDirection::Near)),
-                Intent::DriveFocus(None),
-            ]
-        );
+        let sent = harness.sent();
+        assert_eq!(focus_direction(sent[0]), FocusDirection::Near);
+        assert_eq!(sent[1], Intent::DriveFocus(None));
+        assert_eq!(sent.len(), 2);
     }
 
     #[test]
@@ -807,10 +822,9 @@ mod tests {
             session.handle_key(press(KeyCode::Char('.'))).unwrap();
         }
 
-        assert_eq!(
-            harness.sent(),
-            vec![Intent::DriveFocus(Some(FocusDirection::Far))]
-        );
+        let sent = harness.sent();
+        assert_eq!(focus_direction(sent[0]), FocusDirection::Far);
+        assert_eq!(sent.len(), 1);
     }
 
     #[test]

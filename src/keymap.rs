@@ -11,10 +11,10 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::{
-    focus::FocusDirection,
+    focus::FocusDrive,
     pan_tilt::{Velocity, velocity_from_axes},
     worker::Intent,
-    zoom::ZoomDirection,
+    zoom::ZoomDrive,
 };
 
 /// How far a movement key deflects its axis, as a fraction of full speed. A
@@ -28,10 +28,10 @@ pub const FAST_KEY_DEFLECTION: f32 = 1.0;
 pub enum Hold {
     /// Drive pan/tilt at a fixed velocity.
     PanTilt(Velocity),
-    /// Drive zoom in a direction.
-    Zoom(ZoomDirection),
-    /// Drive focus in a direction.
-    Focus(FocusDirection),
+    /// Drive zoom.
+    Zoom(ZoomDrive),
+    /// Drive focus.
+    Focus(FocusDrive),
 }
 
 impl Hold {
@@ -39,8 +39,8 @@ impl Hold {
     pub fn start(self) -> Intent {
         match self {
             Self::PanTilt(velocity) => Intent::DrivePanTilt(velocity),
-            Self::Zoom(direction) => Intent::DriveZoom(Some(direction)),
-            Self::Focus(direction) => Intent::DriveFocus(Some(direction)),
+            Self::Zoom(drive) => Intent::DriveZoom(Some(drive)),
+            Self::Focus(drive) => Intent::DriveFocus(Some(drive)),
         }
     }
 
@@ -98,6 +98,19 @@ pub fn map_key(key: KeyEvent) -> Option<Action> {
             tilt * deflection,
         )))
     };
+    // Both key deflections are well past the rocker's deadzone, so there is
+    // always a drive to be had from one.
+    let zoom = |way: f32, deflection: f32| {
+        Action::Hold(Hold::Zoom(
+            ZoomDrive::from_deflection(way * deflection).expect("a key deflects past the deadzone"),
+        ))
+    };
+    let focus = |way: f32, deflection: f32| {
+        Action::Hold(Hold::Focus(
+            FocusDrive::from_deflection(way * deflection)
+                .expect("a key deflects past the deadzone"),
+        ))
+    };
 
     let action = match key.code {
         KeyCode::Up => pan_tilt(0.0, 1.0),
@@ -105,15 +118,20 @@ pub fn map_key(key: KeyEvent) -> Option<Action> {
         KeyCode::Left => pan_tilt(-1.0, 0.0),
         KeyCode::Right => pan_tilt(1.0, 0.0),
 
-        KeyCode::Char('[') | KeyCode::Char('-') => Action::Hold(Hold::Zoom(ZoomDirection::Out)),
-        KeyCode::Char(']') | KeyCode::Char('=') => Action::Hold(Hold::Zoom(ZoomDirection::In)),
+        KeyCode::Char('[') | KeyCode::Char('-') => zoom(-1.0, deflection),
+        KeyCode::Char(']') | KeyCode::Char('=') => zoom(1.0, deflection),
 
-        // `<`/`>` are Shift+`,`/`.` on the keys that produce them. They used
-        // to stand for a longer focus nudge; now that focus runs for as long
-        // as the key is held, how far it travels is the user's to decide and
-        // the two pairs mean the same thing.
-        KeyCode::Char(',') | KeyCode::Char('<') => Action::Hold(Hold::Focus(FocusDirection::Near)),
-        KeyCode::Char('.') | KeyCode::Char('>') => Action::Hold(Hold::Focus(FocusDirection::Far)),
+        // The shifted punctuation on the same keys, which many terminals send
+        // as the character alone without also setting the modifier — so they
+        // are matched here rather than left to the modifier check above. They
+        // mean what shift means everywhere else: the same drive, faster.
+        KeyCode::Char('{') | KeyCode::Char('_') => zoom(-1.0, FAST_KEY_DEFLECTION),
+        KeyCode::Char('}') | KeyCode::Char('+') => zoom(1.0, FAST_KEY_DEFLECTION),
+
+        KeyCode::Char(',') => focus(-1.0, deflection),
+        KeyCode::Char('.') => focus(1.0, deflection),
+        KeyCode::Char('<') => focus(-1.0, FAST_KEY_DEFLECTION),
+        KeyCode::Char('>') => focus(1.0, FAST_KEY_DEFLECTION),
 
         KeyCode::Char(digit @ '1'..='6') => {
             let preset = digit.to_digit(10).expect("matched an ASCII digit") as u8;
@@ -137,6 +155,7 @@ pub fn map_key(key: KeyEvent) -> Option<Action> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{focus::FocusDirection, zoom::ZoomDirection};
     use grafton_visca::command::PanTiltDirection;
 
     fn press(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
@@ -193,6 +212,22 @@ mod tests {
         );
     }
 
+    /// Which way a key drives zoom, and how fast.
+    fn zoom_drive(code: KeyCode) -> ZoomDrive {
+        match map_key(press(code, KeyModifiers::NONE)) {
+            Some(Action::Hold(Hold::Zoom(drive))) => drive,
+            other => panic!("expected a zoom hold, got {other:?}"),
+        }
+    }
+
+    /// The same, for focus.
+    fn focus_drive(code: KeyCode) -> FocusDrive {
+        match map_key(press(code, KeyModifiers::NONE)) {
+            Some(Action::Hold(Hold::Focus(drive))) => drive,
+            other => panic!("expected a focus hold, got {other:?}"),
+        }
+    }
+
     #[test]
     fn both_zoom_key_pairs_map_to_the_same_actions() {
         assert_eq!(
@@ -207,42 +242,47 @@ mod tests {
 
     #[test]
     fn zoom_and_focus_keys_hold_their_own_direction() {
+        assert_eq!(zoom_drive(KeyCode::Char(']')).direction, ZoomDirection::In);
+        assert_eq!(zoom_drive(KeyCode::Char('[')).direction, ZoomDirection::Out);
         assert_eq!(
-            map_key(press(KeyCode::Char(']'), KeyModifiers::NONE)),
-            Some(Action::Hold(Hold::Zoom(ZoomDirection::In)))
+            focus_drive(KeyCode::Char(',')).direction,
+            FocusDirection::Near
         );
         assert_eq!(
-            map_key(press(KeyCode::Char('['), KeyModifiers::NONE)),
-            Some(Action::Hold(Hold::Zoom(ZoomDirection::Out)))
-        );
-        assert_eq!(
-            map_key(press(KeyCode::Char(','), KeyModifiers::NONE)),
-            Some(Action::Hold(Hold::Focus(FocusDirection::Near)))
-        );
-        assert_eq!(
-            map_key(press(KeyCode::Char('.'), KeyModifiers::NONE)),
-            Some(Action::Hold(Hold::Focus(FocusDirection::Far)))
+            focus_drive(KeyCode::Char('.')).direction,
+            FocusDirection::Far
         );
     }
 
     #[test]
-    fn shifted_focus_punctuation_holds_the_same_drive_as_the_unshifted_key() {
+    fn the_shifted_punctuation_drives_the_same_way_faster() {
         // Deliberately no SHIFT modifier: many terminals fold shift into the
         // character for punctuation and don't also set the modifier bit.
-        assert_eq!(
-            map_key(press(KeyCode::Char('<'), KeyModifiers::NONE)),
-            map_key(press(KeyCode::Char(','), KeyModifiers::NONE))
+        let (near, fast_near) = (
+            focus_drive(KeyCode::Char(',')),
+            focus_drive(KeyCode::Char('<')),
         );
+        let (wide, fast_wide) = (
+            zoom_drive(KeyCode::Char('[')),
+            zoom_drive(KeyCode::Char('{')),
+        );
+
+        assert_eq!(fast_near.direction, near.direction);
+        assert_eq!(fast_wide.direction, wide.direction);
+        assert_ne!(fast_near.speed, near.speed);
+        assert_ne!(fast_wide.speed, wide.speed);
         assert_eq!(
-            map_key(press(KeyCode::Char('>'), KeyModifiers::NONE)),
-            map_key(press(KeyCode::Char('.'), KeyModifiers::NONE))
+            zoom_drive(KeyCode::Char('_')),
+            zoom_drive(KeyCode::Char('{'))
         );
     }
 
     #[test]
     fn a_hold_starts_and_stops_the_control_it_drives() {
-        let hold = Hold::Zoom(ZoomDirection::In);
-        assert_eq!(hold.start(), Intent::DriveZoom(Some(ZoomDirection::In)));
+        let drive = zoom_drive(KeyCode::Char(']'));
+        let hold = Hold::Zoom(drive);
+
+        assert_eq!(hold.start(), Intent::DriveZoom(Some(drive)));
         assert_eq!(hold.stop(), Intent::DriveZoom(None));
     }
 
@@ -250,12 +290,12 @@ mod tests {
     fn holds_on_the_same_control_share_a_stop_and_holds_on_others_do_not() {
         let up = Hold::PanTilt(velocity_from_axes(0.0, 1.0));
         let down = Hold::PanTilt(velocity_from_axes(0.0, -1.0));
+        let zoom = Hold::Zoom(zoom_drive(KeyCode::Char(']')));
+        let focus = Hold::Focus(focus_drive(KeyCode::Char('.')));
+
         assert_eq!(up.stop(), down.stop());
-        assert_ne!(up.stop(), Hold::Zoom(ZoomDirection::In).stop());
-        assert_ne!(
-            Hold::Zoom(ZoomDirection::In).stop(),
-            Hold::Focus(FocusDirection::Near).stop()
-        );
+        assert_ne!(up.stop(), zoom.stop());
+        assert_ne!(zoom.stop(), focus.stop());
     }
 
     #[test]

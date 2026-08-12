@@ -13,12 +13,12 @@ use grafton_visca::{
 };
 
 use crate::{
-    focus::{self, FocusDirection},
+    focus::{self, FocusDirection, FocusDrive},
     pan_tilt::{self, Velocity},
     power, preset,
     state::{self, CameraState},
     title::{self, Title},
-    zoom::{self, ZoomDirection},
+    zoom::{self, ZoomDirection, ZoomDrive},
 };
 
 /// How long to wait for the camera to confirm a stop sent on the way out
@@ -31,10 +31,10 @@ const STOP_CONFIRM_TIMEOUT: Duration = Duration::from_millis(500);
 pub enum Intent {
     /// Set the continuous pan/tilt drive, or stop it.
     DrivePanTilt(Velocity),
-    /// Start driving zoom in a direction, or stop it with `None`.
-    DriveZoom(Option<ZoomDirection>),
-    /// Start driving focus in a direction, or stop it with `None`.
-    DriveFocus(Option<FocusDirection>),
+    /// Start driving zoom, or stop it with `None`.
+    DriveZoom(Option<ZoomDrive>),
+    /// Start driving focus, or stop it with `None`.
+    DriveFocus(Option<FocusDrive>),
     /// Focus automatically, or leave focus to the manual drive.
     SetAutoFocus(bool),
     /// Recall the given 1-based preset number.
@@ -139,11 +139,15 @@ pub fn describe(intent: Intent) -> String {
             format!("pan/tilt {}", direction_label(velocity.direction))
         }
         Intent::DriveZoom(None) => "zoom stop".to_string(),
-        Intent::DriveZoom(Some(ZoomDirection::In)) => "zoom in".to_string(),
-        Intent::DriveZoom(Some(ZoomDirection::Out)) => "zoom out".to_string(),
+        Intent::DriveZoom(Some(drive)) => match drive.direction {
+            ZoomDirection::In => "zoom in".to_string(),
+            ZoomDirection::Out => "zoom out".to_string(),
+        },
         Intent::DriveFocus(None) => "focus stop".to_string(),
-        Intent::DriveFocus(Some(FocusDirection::Near)) => "focus near".to_string(),
-        Intent::DriveFocus(Some(FocusDirection::Far)) => "focus far".to_string(),
+        Intent::DriveFocus(Some(drive)) => match drive.direction {
+            FocusDirection::Near => "focus near".to_string(),
+            FocusDirection::Far => "focus far".to_string(),
+        },
         Intent::SetAutoFocus(true) => "auto focus".to_string(),
         Intent::SetAutoFocus(false) => "manual focus".to_string(),
         Intent::RecallPreset(number) => format!("recall preset {number}"),
@@ -279,6 +283,13 @@ mod tests {
             .expect("camera should build from a scripted transport")
     }
 
+    fn zoom_in() -> ZoomDrive {
+        ZoomDrive {
+            direction: ZoomDirection::In,
+            speed: grafton_visca::types::SpeedLevel::Medium,
+        }
+    }
+
     fn drive_right() -> Intent {
         Intent::DrivePanTilt(pan_tilt::velocity_from_axes(1.0, 0.0))
     }
@@ -298,9 +309,7 @@ mod tests {
         let (result_tx, result_rx) = channel();
 
         intent_tx.send(Intent::RecallPreset(1)).unwrap();
-        intent_tx
-            .send(Intent::DriveZoom(Some(ZoomDirection::In)))
-            .unwrap();
+        intent_tx.send(Intent::DriveZoom(Some(zoom_in()))).unwrap();
         drop(intent_tx);
 
         run(&camera, &intent_rx, &result_tx);
@@ -392,7 +401,7 @@ mod tests {
     fn coalescing_keeps_only_the_last_drive_for_each_control() {
         let batch = [
             drive_right(),
-            Intent::DriveZoom(Some(ZoomDirection::In)),
+            Intent::DriveZoom(Some(zoom_in())),
             drive_left(),
             Intent::DriveZoom(None),
         ];
@@ -508,13 +517,13 @@ mod tests {
 
     #[test]
     fn describe_distinguishes_starting_a_drive_from_stopping_it() {
-        assert_eq!(
-            describe(Intent::DriveZoom(Some(ZoomDirection::In))),
-            "zoom in"
-        );
+        assert_eq!(describe(Intent::DriveZoom(Some(zoom_in()))), "zoom in");
         assert_eq!(describe(Intent::DriveZoom(None)), "zoom stop");
         assert_eq!(
-            describe(Intent::DriveFocus(Some(FocusDirection::Near))),
+            describe(Intent::DriveFocus(Some(FocusDrive {
+                direction: FocusDirection::Near,
+                speed: grafton_visca::types::SpeedLevel::Medium,
+            }))),
             "focus near"
         );
         assert_eq!(describe(Intent::DriveFocus(None)), "focus stop");
@@ -556,7 +565,7 @@ mod tests {
     #[test]
     fn describe_outcome_reports_a_failed_command() {
         let text = describe_outcome(&Outcome::Done(
-            Intent::DriveZoom(Some(ZoomDirection::In)),
+            Intent::DriveZoom(Some(zoom_in())),
             Err(Error::Timeout),
         ));
         assert!(text.contains("error"));

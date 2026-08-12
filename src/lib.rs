@@ -9,6 +9,7 @@ pub mod keymap;
 pub mod pan_tilt;
 pub mod power;
 pub mod preset;
+pub mod rocker;
 pub mod session;
 pub mod state;
 pub mod title;

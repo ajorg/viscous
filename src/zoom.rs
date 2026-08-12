@@ -10,7 +10,10 @@ use grafton_visca::{
     BlockingClient, Error,
     camera::profiles::GenericVisca,
     transport::{BlockingTransport, HasTransportConfig},
+    types::SpeedLevel,
 };
+
+use crate::rocker;
 
 /// Which way a zoom drive moves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,18 +24,47 @@ pub enum ZoomDirection {
     Out,
 }
 
-/// Starts driving zoom in `direction`, or stops it when `direction` is
-/// `None`.
+/// A zoom drive: which way, and how fast.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ZoomDrive {
+    /// Which way the shot is going.
+    pub direction: ZoomDirection,
+    /// How fast, which the camera holds until told otherwise. A slow zoom is
+    /// the difference between a shot that can go out live and one that
+    /// lurches, so this is worth expressing rather than leaving to the
+    /// camera's default.
+    pub speed: SpeedLevel,
+}
+
+impl ZoomDrive {
+    /// The drive a rocker pushed to `deflection` asks for — negative for
+    /// wide, positive for tele — or `None` while it's still at rest.
+    pub fn from_deflection(deflection: f32) -> Option<Self> {
+        let direction = if deflection < 0.0 {
+            ZoomDirection::Out
+        } else {
+            ZoomDirection::In
+        };
+        rocker::speed(deflection.abs()).map(|speed| Self { direction, speed })
+    }
+}
+
+/// Starts `drive`, or stops the zoom when it's `None`.
 pub fn drive_zoom<T>(
     camera: &BlockingClient<GenericVisca, T>,
-    direction: Option<ZoomDirection>,
+    drive: Option<ZoomDrive>,
 ) -> Result<(), Error>
 where
     T: BlockingTransport + HasTransportConfig + 'static,
 {
-    match direction {
-        Some(ZoomDirection::In) => camera.zoom_tele(None),
-        Some(ZoomDirection::Out) => camera.zoom_wide(None),
+    match drive {
+        Some(drive) => {
+            let speed = Some(drive.speed.into());
+            match drive.direction {
+                ZoomDirection::In => camera.zoom_tele(speed),
+                ZoomDirection::Out => camera.zoom_wide(speed),
+            }
+        }
         None => camera.zoom_stop(),
     }
 }
@@ -49,12 +81,40 @@ mod tests {
             .expect("camera should build from a scripted transport")
     }
 
+    fn drive(direction: ZoomDirection) -> Option<ZoomDrive> {
+        Some(ZoomDrive {
+            direction,
+            speed: SpeedLevel::Medium,
+        })
+    }
+
     #[test]
     fn drive_zoom_starts_a_drive_in_each_direction() {
-        drive_zoom(&scripted_camera(), Some(ZoomDirection::In))
+        drive_zoom(&scripted_camera(), drive(ZoomDirection::In))
             .expect("scripted camera should ack and complete zoom in");
-        drive_zoom(&scripted_camera(), Some(ZoomDirection::Out))
+        drive_zoom(&scripted_camera(), drive(ZoomDirection::Out))
             .expect("scripted camera should ack and complete zoom out");
+    }
+
+    #[test]
+    fn a_rocker_at_rest_asks_for_no_zoom_and_either_way_off_centre_zooms() {
+        assert_eq!(ZoomDrive::from_deflection(0.0), None);
+        assert_eq!(
+            ZoomDrive::from_deflection(1.0).map(|drive| drive.direction),
+            Some(ZoomDirection::In)
+        );
+        assert_eq!(
+            ZoomDrive::from_deflection(-1.0).map(|drive| drive.direction),
+            Some(ZoomDirection::Out)
+        );
+    }
+
+    #[test]
+    fn pushing_the_rocker_further_zooms_faster() {
+        let nudged = ZoomDrive::from_deflection(0.2).expect("past the deadzone should drive");
+        let pushed = ZoomDrive::from_deflection(1.0).expect("past the deadzone should drive");
+
+        assert_ne!(nudged.speed, pushed.speed);
     }
 
     #[test]
