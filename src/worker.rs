@@ -286,7 +286,7 @@ mod tests {
     fn zoom_in() -> ZoomDrive {
         ZoomDrive {
             direction: ZoomDirection::In,
-            speed: grafton_visca::types::SpeedLevel::Medium,
+            speed: grafton_visca::types::ZoomSpeed::new(4).unwrap(),
         }
     }
 

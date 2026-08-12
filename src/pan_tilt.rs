@@ -17,6 +17,8 @@ use grafton_visca::{
     types::{PanSpeed, TiltSpeed},
 };
 
+use crate::deflection;
+
 /// The slowest speed VISCA's drive command accepts on either axis. Zero
 /// isn't "stopped" — the command rejects it outright — so this is as slow as
 /// movement gets, and stopping is [`Velocity::STOP`]'s job.
@@ -28,11 +30,6 @@ pub const MAX_PAN_SPEED: u8 = 24;
 /// The fastest tilt speed VISCA's drive command accepts (0x14 — genuinely a
 /// shorter range than pan's).
 pub const MAX_TILT_SPEED: u8 = 20;
-
-/// How far off center a control has to be before it counts as asking for
-/// movement, as a fraction of full deflection. Keeps a joystick released
-/// near-but-not-exactly center, or a trembling hand, from creeping.
-const DEADZONE: f32 = 0.1;
 
 /// A continuous pan/tilt drive request: which way to drive, and how fast
 /// along each axis.
@@ -69,18 +66,8 @@ impl Velocity {
 
 /// Maps one axis's deflection onto the drive speed range, or `None` if it's
 /// inside the deadzone.
-///
-/// The travel outside the deadzone spans the whole speed range, so the
-/// slowest speed sits right at the deadzone edge and the fastest is only
-/// reachable at full deflection.
 fn axis_speed(deflection: f32, max_speed: u8) -> Option<u8> {
-    let magnitude = deflection.abs();
-    if magnitude <= DEADZONE {
-        return None;
-    }
-    let fraction = ((magnitude - DEADZONE) / (1.0 - DEADZONE)).clamp(0.0, 1.0);
-    let span = f32::from(max_speed - MIN_SPEED);
-    Some(MIN_SPEED + (fraction * span).round() as u8)
+    deflection::speed(deflection.abs(), MIN_SPEED..=max_speed)
 }
 
 /// Builds a velocity from a control's deflection along each axis, each a
@@ -176,6 +163,15 @@ mod tests {
     }
 
     #[test]
+    fn the_deadzone_is_the_one_every_other_control_uses() {
+        // A hand that has learned the rockers has learned the pad.
+        assert_eq!(
+            velocity_from_axes(deflection::DEADZONE, 0.0),
+            Velocity::STOP
+        );
+    }
+
+    #[test]
     fn a_single_axis_drives_a_cardinal_direction() {
         assert_eq!(
             velocity_from_axes(1.0, 0.0).direction,
@@ -222,9 +218,33 @@ mod tests {
     #[test]
     fn deflection_just_past_the_deadzone_asks_for_the_slowest_speed() {
         assert_eq!(
-            velocity_from_axes(DEADZONE + 0.001, 0.0).pan_speed,
+            velocity_from_axes(deflection::DEADZONE + 0.001, 0.0).pan_speed,
             MIN_SPEED
         );
+    }
+
+    #[test]
+    fn half_a_push_asks_for_far_less_than_half_the_top_speed() {
+        // What makes the pad usable for framing rather than only for getting
+        // somewhere: a straight mapping would put this near 12 of 24, which
+        // crosses a room faster than anyone can follow a subject.
+        let half = velocity_from_axes(0.5, 0.0).pan_speed;
+
+        assert!(
+            half < MAX_PAN_SPEED / 3,
+            "half the travel should stay slow, got {half} of {MAX_PAN_SPEED}"
+        );
+    }
+
+    #[test]
+    fn the_slow_half_of_the_pad_stays_in_the_slow_speeds() {
+        for step in 11..=50 {
+            let speed = velocity_from_axes(step as f32 / 100.0, 0.0).pan_speed;
+            assert!(
+                speed < MAX_PAN_SPEED / 3,
+                "{step}% of full push asked for {speed} of {MAX_PAN_SPEED}"
+            );
+        }
     }
 
     #[test]

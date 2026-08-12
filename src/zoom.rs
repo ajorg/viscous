@@ -10,10 +10,10 @@ use grafton_visca::{
     BlockingClient, Error,
     camera::profiles::GenericVisca,
     transport::{BlockingTransport, HasTransportConfig},
-    types::SpeedLevel,
+    types::ZoomSpeed,
 };
 
-use crate::rocker;
+use crate::deflection;
 
 /// Which way a zoom drive moves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,8 +33,17 @@ pub struct ZoomDrive {
     /// the difference between a shot that can go out live and one that
     /// lurches, so this is worth expressing rather than leaving to the
     /// camera's default.
-    pub speed: SpeedLevel,
+    ///
+    /// The camera's own number rather than one of the library's five named
+    /// levels: VISCA's variable zoom takes a speed of 0 to 7 directly, and 0
+    /// is a genuine slowest rather than a stop, so going through the named
+    /// levels would throw away three of the eight -- including the slowest
+    /// one, which is the one a zoom most wants.
+    pub speed: ZoomSpeed,
 }
+
+/// The speeds VISCA's variable zoom accepts, slowest first.
+const ZOOM_SPEEDS: std::ops::RangeInclusive<u8> = 0..=7;
 
 impl ZoomDrive {
     /// The drive a rocker pushed to `deflection` asks for — negative for
@@ -45,7 +54,11 @@ impl ZoomDrive {
         } else {
             ZoomDirection::In
         };
-        rocker::speed(deflection.abs()).map(|speed| Self { direction, speed })
+        deflection::speed(deflection.abs(), ZOOM_SPEEDS).map(|speed| Self {
+            direction,
+            // In range by construction: `speed` never leaves ZOOM_SPEEDS.
+            speed: ZoomSpeed::new(speed).expect("a zoom speed from the accepted range"),
+        })
     }
 }
 
@@ -59,7 +72,7 @@ where
 {
     match drive {
         Some(drive) => {
-            let speed = Some(drive.speed.into());
+            let speed = Some(drive.speed);
             match drive.direction {
                 ZoomDirection::In => camera.zoom_tele(speed),
                 ZoomDirection::Out => camera.zoom_wide(speed),
@@ -84,7 +97,7 @@ mod tests {
     fn drive(direction: ZoomDirection) -> Option<ZoomDrive> {
         Some(ZoomDrive {
             direction,
-            speed: SpeedLevel::Medium,
+            speed: ZoomSpeed::new(4).unwrap(),
         })
     }
 
@@ -115,6 +128,27 @@ mod tests {
         let pushed = ZoomDrive::from_deflection(1.0).expect("past the deadzone should drive");
 
         assert_ne!(nudged.speed, pushed.speed);
+    }
+
+    #[test]
+    fn a_gentle_push_asks_for_the_slowest_zoom_the_camera_has() {
+        // The one that matters most on a live shot, and the one a mapping
+        // through the library's named speed levels cannot reach at all.
+        let nudged = ZoomDrive::from_deflection(0.2).expect("past the deadzone should drive");
+
+        assert_eq!(nudged.speed.value(), 0);
+    }
+
+    #[test]
+    fn half_a_push_is_still_near_the_slow_end() {
+        // A straight mapping would put this in the middle of the range.
+        let half = ZoomDrive::from_deflection(0.5).expect("past the deadzone should drive");
+
+        assert!(
+            half.speed.value() <= 2,
+            "half a push should stay slow, got speed {}",
+            half.speed.value()
+        );
     }
 
     #[test]

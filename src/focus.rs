@@ -10,7 +10,7 @@ use grafton_visca::{
     types::SpeedLevel,
 };
 
-use crate::rocker;
+use crate::deflection;
 
 /// Which way a focus drive moves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,6 +32,21 @@ pub struct FocusDrive {
     pub speed: SpeedLevel,
 }
 
+/// The speeds a focus drive offers, slowest first.
+///
+/// All five the library names, [`SpeedLevel::Slowest`] included: it is focus
+/// speed 0, which VISCA's variable focus reads as its slowest setting rather
+/// than as a stop, and it is exactly the one worth having. Unlike zoom, focus
+/// is only reachable through these named levels, so this is the whole range
+/// the camera offers here.
+const FOCUS_SPEEDS: [SpeedLevel; 5] = [
+    SpeedLevel::Slowest,
+    SpeedLevel::Slow,
+    SpeedLevel::Medium,
+    SpeedLevel::Fast,
+    SpeedLevel::Fastest,
+];
+
 impl FocusDrive {
     /// The drive a rocker pushed to `deflection` asks for — negative for
     /// near, positive for far — or `None` while it's still at rest.
@@ -41,7 +56,7 @@ impl FocusDrive {
         } else {
             FocusDirection::Far
         };
-        rocker::speed(deflection.abs()).map(|speed| Self { direction, speed })
+        deflection::choose(deflection.abs(), &FOCUS_SPEEDS).map(|speed| Self { direction, speed })
     }
 }
 
