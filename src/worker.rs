@@ -524,7 +524,7 @@ mod tests {
         assert_eq!(
             describe(Intent::DriveFocus(Some(FocusDrive {
                 direction: FocusDirection::Near,
-                speed: grafton_visca::types::SpeedLevel::Medium,
+                speed: grafton_visca::command::FocusSpeed::new(4).unwrap(),
             }))),
             "focus near"
         );

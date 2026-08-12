@@ -153,6 +153,24 @@ fn axis_sign(direction: u8, positive: u8) -> f64 {
     }
 }
 
+/// How fast a variable zoom or focus drive runs, as a fraction of this
+/// camera's top lens speed.
+///
+/// VISCA carries the speed in the low nibble of the `2p`/`3p` forms, 0 to 7,
+/// where **0 is the slowest setting the camera has and not a stop** — stopping
+/// is its own command (`00`). So nothing here comes out zero: a simulated
+/// camera that stood still at the slowest notch would be evidence for exactly
+/// the wrong conclusion. The standard-speed forms (`02`/`03`) carry no speed
+/// at all and leave the pace to the camera, so they land in the middle.
+fn lens_speed_fraction(command: u8) -> f64 {
+    let level = if command >= 0x20 {
+        f64::from(command & 0x0F)
+    } else {
+        4.0
+    };
+    (level + 1.0) / 8.0
+}
+
 /// A drive command's rate along one axis, in raw units per second: its
 /// direction, at a speed scaled from VISCA's `1..=max_speed` range onto the
 /// simulated top speed.
@@ -433,12 +451,12 @@ impl CameraSim {
             }
             // Zoom tele (in), with or without an explicit speed nibble.
             [0x04, 0x07, b] if *b == 0x02 || (0x20..=0x2F).contains(b) => {
-                self.zoom_rate = ZOOM_FOCUS_UNITS_PER_SEC;
+                self.zoom_rate = ZOOM_FOCUS_UNITS_PER_SEC * lens_speed_fraction(*b);
                 Duration::ZERO
             }
             // Zoom wide (out), with or without an explicit speed nibble.
             [0x04, 0x07, b] if *b == 0x03 || (0x30..=0x3F).contains(b) => {
-                self.zoom_rate = -ZOOM_FOCUS_UNITS_PER_SEC;
+                self.zoom_rate = -ZOOM_FOCUS_UNITS_PER_SEC * lens_speed_fraction(*b);
                 Duration::ZERO
             }
             // Focus stop.
@@ -448,12 +466,12 @@ impl CameraSim {
             }
             // Focus far, with or without an explicit speed nibble (0x02, or 0x20..=0x2F).
             [0x04, 0x08, b] if *b == 0x02 || (0x20..=0x2F).contains(b) => {
-                self.focus_rate = ZOOM_FOCUS_UNITS_PER_SEC;
+                self.focus_rate = ZOOM_FOCUS_UNITS_PER_SEC * lens_speed_fraction(*b);
                 Duration::ZERO
             }
             // Focus near, with or without an explicit speed nibble (0x03, or 0x30..=0x3F).
             [0x04, 0x08, b] if *b == 0x03 || (0x30..=0x3F).contains(b) => {
-                self.focus_rate = -ZOOM_FOCUS_UNITS_PER_SEC;
+                self.focus_rate = -ZOOM_FOCUS_UNITS_PER_SEC * lens_speed_fraction(*b);
                 Duration::ZERO
             }
             // Preset: 04 3F action preset_number
