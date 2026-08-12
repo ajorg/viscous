@@ -23,6 +23,7 @@ use egui::{Key, TextWrapMode, Ui, Vec2, vec2};
 use viscous::{
     config,
     connection::{self, Target, format_camera, format_version},
+    drives::Drives,
     focus::FocusDrive,
     keymap::{FAST_KEY_DEFLECTION, KEY_DEFLECTION},
     pan_tilt::{self, Velocity},
@@ -47,39 +48,6 @@ const PRESETS: u8 = 6;
 /// How many titles to keep on hand. The camera holds one at a time; these are
 /// the ones an operator switches between during a session.
 const TITLES: u8 = 3;
-
-/// What the controls are asking the camera to be doing right now — one
-/// snapshot per frame, whichever control it came from.
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct Drives {
-    pan_tilt: Velocity,
-    zoom: Option<ZoomDrive>,
-    focus: Option<FocusDrive>,
-}
-
-impl Drives {
-    /// Nothing being asked for: every control at rest.
-    const STOPPED: Self = Self {
-        pan_tilt: Velocity::STOP,
-        zoom: None,
-        focus: None,
-    };
-
-    /// This set of drives, filled in from `other` wherever it asks for
-    /// nothing — so two controls can be live at once (a drag while a zoom key
-    /// is held) without either cancelling the other.
-    fn or(self, other: Self) -> Self {
-        Self {
-            pan_tilt: if self.pan_tilt.is_stop() {
-                other.pan_tilt
-            } else {
-                self.pan_tilt
-            },
-            zoom: self.zoom.or(other.zoom),
-            focus: self.focus.or(other.focus),
-        }
-    }
-}
 
 /// A line of feedback for the operator, and whether it reports a failure —
 /// the one kind that's worth colouring, since it's the one that needs looking
