@@ -26,7 +26,7 @@ use viscous::{
     focus::FocusDrive,
     keymap::{FAST_KEY_DEFLECTION, KEY_DEFLECTION},
     pan_tilt::{self, Velocity},
-    session::{POLL_INTERVAL, QUIESCENCE_INTERVAL},
+    session::{self, POLL_INTERVAL, QUIESCENCE_INTERVAL, RETRY_INTERVAL},
     state::{self, CameraState},
     title::{self, Title},
     worker::{self, Intent, Outcome},
@@ -193,8 +193,9 @@ struct App {
     room: Vec2,
     around_pad: Vec2,
     pad_size: f32,
-    pending_state_query: bool,
-    last_command_at: Instant,
+    /// When to ask the camera for a fresh snapshot, or `None` when what we
+    /// have is current. Same shape and the same reasoning as the TUI's.
+    next_query_at: Option<Instant>,
     /// What each continuous control was last told to do. A drive keeps running
     /// on the camera by itself, so these say what it's already doing — and a
     /// command only goes out when a control is asked for something different.
@@ -223,8 +224,7 @@ impl Default for App {
             room: Vec2::ZERO,
             around_pad: Vec2::ZERO,
             pad_size: 0.0,
-            pending_state_query: false,
-            last_command_at: Instant::now(),
+            next_query_at: None,
             pan_tilt: Velocity::STOP,
             zoom: None,
             focus: None,
@@ -272,8 +272,7 @@ impl App {
         if !worker::is_drive(intent) {
             self.status = Some(Status::ok(worker::describe_busy(intent)));
         }
-        self.pending_state_query = true;
-        self.last_command_at = Instant::now();
+        self.next_query_at = Some(Instant::now() + QUIESCENCE_INTERVAL);
     }
 
     /// Whether the camera is focusing for itself, in which case the focus
@@ -281,7 +280,16 @@ impl App {
     /// sees the scene again. Unknown counts as not, so the controls stay live
     /// until the camera has actually said otherwise.
     fn auto_focusing(&self) -> bool {
-        self.camera_state.is_some_and(|state| state.auto_focus)
+        self.camera_state
+            .and_then(|state| state.lens)
+            .is_some_and(|lens| lens.auto_focus)
+    }
+
+    /// Whether the camera has said it is in standby, in which case it will
+    /// refuse everything the controls could ask of it. Unknown counts as
+    /// awake, so nothing is greyed out until the camera has actually said so.
+    fn asleep(&self) -> bool {
+        self.camera_state.is_some_and(|state| !state.power_on)
     }
 
     /// Whether any control is currently being driven.
@@ -298,16 +306,13 @@ impl App {
     /// query is four inquiry round trips on the same serial line — one in
     /// flight is one more thing the stop command has to wait behind.
     fn send_query_state_if_due(&mut self) {
-        if self.driving()
-            || !self.pending_state_query
-            || self.last_command_at.elapsed() < QUIESCENCE_INTERVAL
-        {
+        if self.driving() || self.next_query_at.is_none_or(|at| Instant::now() < at) {
             return;
         }
         if let Some(intents) = &self.intents {
             let _ = intents.send(Intent::QueryState);
         }
-        self.pending_state_query = false;
+        self.next_query_at = None;
     }
 
     fn start_connect(&mut self, ctx: &egui::Context) {
@@ -345,10 +350,8 @@ impl App {
                 self.intents = Some(worker.intents);
                 self.results = Some(worker.results);
                 // Query once up front so the info panel doesn't sit empty
-                // until the first command; `elapsed() >= QUIESCENCE_INTERVAL`
-                // is already true here.
-                self.pending_state_query = true;
-                self.last_command_at = Instant::now() - QUIESCENCE_INTERVAL;
+                // until the first command, and without waiting for it.
+                self.next_query_at = Some(Instant::now());
             }
             Err(error) => self.connection = Connection::Failed(error),
         }
@@ -361,13 +364,26 @@ impl App {
         let failed = match &outcome {
             Outcome::State(Ok(camera_state)) => {
                 self.camera_state = Some(*camera_state);
+                // An awake camera that isn't answering for its lens yet is one
+                // still coming up, so keep asking until it does. A sleeping
+                // one has nothing more to say and is left alone.
+                if camera_state.power_on && camera_state.lens.is_none() {
+                    self.next_query_at = Some(Instant::now() + RETRY_INTERVAL);
+                }
+                return;
+            }
+            // A camera that didn't answer is usually one that is busy waking
+            // up, so ask again rather than reporting a fault and giving up on
+            // ever noticing it came back.
+            Outcome::State(Err(_)) => {
+                self.next_query_at = Some(Instant::now() + RETRY_INTERVAL);
+                self.status = Some(Status::ok(session::NO_ANSWER_HINT.to_string()));
                 return;
             }
             // A drive that worked was already visible before its completion
             // arrived; one that failed is the only kind still worth saying.
             Outcome::Done(intent, Ok(())) if worker::is_drive(*intent) => return,
             Outcome::Done(_, result) => result.is_err(),
-            Outcome::State(_) => true,
         };
         self.status = Some(Status {
             text: worker::describe_outcome(&outcome),
@@ -448,10 +464,14 @@ impl App {
             // A dark lamp is only a colour; a camera in standby ignores every
             // control on this window, which is worth saying in words — as the
             // camera's older Windows control panel did beside its own lamp.
-            ui.label(power_words(powered));
+            ui.label(power_words(self.camera_state));
             // Nothing is known about power until the first state reply lands,
             // and the useful thing to offer meanwhile is the one that wakes a
             // camera that turns out to be asleep.
+            //
+            // Never disabled, not even part-way through waking: this is the
+            // one control that has to work when nothing else does, and a
+            // camera that is slow to answer must not become a dead end.
             let on = powered.unwrap_or(false);
             if ui
                 .button(if on { "Power off" } else { "Power on" })
@@ -514,18 +534,25 @@ impl App {
         self.draw_status(ui);
         space(ui, 2.0);
 
+        // A sleeping camera refuses all of this, so it is drawn dead rather
+        // than left to look live and do nothing. Drawn, though, and in its
+        // usual place: the pad's size is what the window is fitted around, and
+        // controls that came and went would resize the window under the hand
+        // reaching for them.
+        let live = !self.asleep();
         let mut pointed = Drives::STOPPED;
         ui.horizontal(|ui| {
             let drives_height = ui
                 .vertical(|ui| {
                     self.pad_size = self.pad_size_in(ui);
-                    pointed.pan_tilt = joystick::pan_tilt_pad(ui, self.pad_size);
+                    pointed.pan_tilt =
+                        joystick::pan_tilt_pad(ui, self.pad_size, live, STANDBY_HINT);
 
                     space(ui, 2.0);
-                    (pointed.zoom, pointed.focus) = drive_rockers(ui, self.auto_focusing());
+                    (pointed.zoom, pointed.focus) = drive_rockers(ui, live, self.auto_focusing());
 
                     space(ui, 1.0);
-                    self.draw_camera_buttons(ui);
+                    ui.add_enabled_ui(live, |ui| self.draw_camera_buttons(ui));
                 })
                 .response
                 .rect
@@ -538,31 +565,38 @@ impl App {
                 ui.separator();
             });
 
-            ui.vertical(|ui| self.draw_shots(ui));
+            ui.vertical(|ui| self.draw_shots(ui, live));
         });
 
         // The pointer wins where both are asking at once: a hand on the mouse
         // is aiming at a particular shot, and a key that was never released
         // (a window that lost focus mid-drive, say) shouldn't override it.
         self.apply_drives(pointed.or(self.keyboard_drives(ui)));
-        if let Some(preset) = keyboard_preset(ui) {
+        if let Some(preset) = keyboard_preset(ui).filter(|_| live) {
             self.send_intent(Intent::RecallPreset(preset));
         }
-        // The same key the TUI uses, so the fingers that learned it there
-        // reach the toggle drawn just above.
-        if !typing(ui) && ui.input(|input| input.key_pressed(Key::F)) {
-            self.send_intent(Intent::SetAutoFocus(!self.auto_focusing()));
+        // The same keys the TUI uses, so the fingers that learned them there
+        // reach the controls drawn just above.
+        if !typing(ui) {
+            if live && ui.input(|input| input.key_pressed(Key::F)) {
+                self.send_intent(Intent::SetAutoFocus(!self.auto_focusing()));
+            }
+            // Not gated on `live` — this is the way out of standby.
+            if ui.input(|input| input.key_pressed(Key::P)) {
+                let on = self.camera_state.is_none_or(|state| !state.power_on);
+                self.send_intent(Intent::SetPower(on));
+            }
         }
 
         space(ui, 1.0);
         draw_key_help(ui);
 
-        if let Some(state) = &self.camera_state {
+        if let Some(lens) = self.camera_state.and_then(|state| state.lens) {
             space(ui, 1.0);
             // Power and focus mode are already shown by the lamp and the
             // toggle, so what's left is only the numbers, kept quiet: they're
             // there to be checked, not read.
-            ui.weak(state::format_position(state));
+            ui.weak(state::format_position(&lens));
         }
     }
 
@@ -624,7 +658,10 @@ impl App {
     /// Nothing, while a description field has the keyboard: a "1" typed there
     /// is a digit, not a preset, and an arrow key is a cursor.
     fn keyboard_drives(&self, ui: &Ui) -> Drives {
-        if typing(ui) {
+        // Nothing either, while the camera is asleep: the pad and the rockers
+        // are drawn dead, and keys that still drove would be disagreeing with
+        // what the window is showing.
+        if typing(ui) || self.asleep() {
             return Drives::STOPPED;
         }
         let mut drives =
@@ -651,25 +688,30 @@ impl App {
     /// offers a description field what's left of the row, and this column's
     /// width is in turn decided by what it asks for — so the two would talk
     /// each other down to nothing.
-    fn draw_shots(&mut self, ui: &mut Ui) {
+    ///
+    /// Only the buttons answer to `live`: the descriptions and titles are the
+    /// operator's own words, kept in this program's config file, and there is
+    /// no reason a sleeping camera should stop anyone writing them down.
+    fn draw_shots(&mut self, ui: &mut Ui, live: bool) {
         ui.label("Presets");
-        self.draw_presets(ui);
+        self.draw_presets(ui, live);
         space(ui, 1.5);
         ui.label("Titles");
-        self.draw_titles(ui);
+        self.draw_titles(ui, live);
         ui.small(format!(
             "Up to {} uppercase characters, drawn over the picture",
             title::LENGTH
         ));
     }
 
-    fn draw_presets(&mut self, ui: &mut Ui) {
+    fn draw_presets(&mut self, ui: &mut Ui, live: bool) {
         for number in 1..=PRESETS {
             ui.horizontal(|ui| {
                 let description = self.preset_labels.get(&number).map(String::as_str);
                 if ui
-                    .button(number.to_string())
+                    .add_enabled(live, egui::Button::new(number.to_string()))
                     .on_hover_text(recall_tooltip(number, description))
+                    .on_disabled_hover_text(STANDBY_HINT)
                     .clicked()
                 {
                     self.send_intent(Intent::RecallPreset(number));
@@ -685,10 +727,11 @@ impl App {
                 // looks like it saves the description, when what it stores is
                 // where the camera is pointing.
                 if ui
-                    .button("Mark")
+                    .add_enabled(live, egui::Button::new("Mark"))
                     .on_hover_text(format!(
                         "Store where the camera is pointing now as preset {number}"
                     ))
+                    .on_disabled_hover_text(STANDBY_HINT)
                     .clicked()
                 {
                     self.send_intent(Intent::SavePreset(number));
@@ -704,13 +747,14 @@ impl App {
     /// operator — a name under a speaker, which hymn is being sung — so what
     /// goes out is what the camera can actually draw: twenty characters,
     /// uppercase, from its own character set.
-    fn draw_titles(&mut self, ui: &mut Ui) {
+    fn draw_titles(&mut self, ui: &mut Ui, live: bool) {
         for number in 1..=TITLES {
             ui.horizontal(|ui| {
                 let mut shown = self.shown_title == Some(number);
                 if ui
-                    .checkbox(&mut shown, "Show")
+                    .add_enabled(live, egui::Checkbox::new(&mut shown, "Show"))
                     .on_hover_text("Burn this title into the video output")
+                    .on_disabled_hover_text(STANDBY_HINT)
                     .changed()
                 {
                     self.show_title(shown.then_some(number));
@@ -830,7 +874,11 @@ impl App {
 /// and the macro flower and infinity sign for the near and far ends of focus,
 /// as printed on a lens barrel. The tooltips say it in words for anyone who
 /// hasn't met them.
-fn drive_rockers(ui: &mut Ui, auto_focusing: bool) -> (Option<ZoomDrive>, Option<FocusDrive>) {
+fn drive_rockers(
+    ui: &mut Ui,
+    live: bool,
+    auto_focusing: bool,
+) -> (Option<ZoomDrive>, Option<FocusDrive>) {
     let zoom = rocker::rocker(
         ui,
         &rocker::Marks {
@@ -841,11 +889,13 @@ fn drive_rockers(ui: &mut Ui, auto_focusing: bool) -> (Option<ZoomDrive>, Option
                 "Telephoto \u{2014} push further to tighten faster",
             ),
         },
-        true,
-        "",
+        live,
+        STANDBY_HINT,
     );
     // Drawn dead rather than left to do nothing, since a camera focusing for
-    // itself ignores it; the toggle that revives it is just below.
+    // itself ignores it; the toggle that revives it is just below. A sleeping
+    // camera ignores it too, and says so first: it is the nearer problem, and
+    // turning off auto focus wouldn't help.
     let focus = rocker::rocker(
         ui,
         &rocker::Marks {
@@ -856,8 +906,8 @@ fn drive_rockers(ui: &mut Ui, auto_focusing: bool) -> (Option<ZoomDrive>, Option
                 "Far \u{2014} push further to focus further off faster",
             ),
         },
-        !auto_focusing,
-        AUTO_FOCUS_HINT,
+        live && !auto_focusing,
+        if live { AUTO_FOCUS_HINT } else { STANDBY_HINT },
     );
     (
         ZoomDrive::from_deflection(zoom),
@@ -867,6 +917,10 @@ fn drive_rockers(ui: &mut Ui, auto_focusing: bool) -> (Option<ZoomDrive>, Option
 
 /// What to say about a focus control the camera is currently overriding.
 const AUTO_FOCUS_HINT: &str = "Turn off Auto focus to focus by hand";
+
+/// What to say about any control a sleeping camera would refuse. Points at the
+/// switch rather than at the key, since the switch is right there on screen.
+const STANDBY_HINT: &str = "The camera is in standby \u{2014} switch it on first";
 
 /// What the button for preset `number` promises, named by what the operator
 /// called the shot rather than only by the number the camera knows it as.
@@ -958,7 +1012,7 @@ fn draw_key_help(ui: &mut Ui) {
     ui.small("Drag the pad and push the rockers \u{2014} further is faster");
     ui.small("Arrows pan and tilt, [ ] or PgUp/PgDn zoom, , and . focus");
     ui.small("Shift on any of those drives at full speed");
-    ui.small("Keys 1-6 go to presets, f switches auto focus");
+    ui.small("Keys 1-6 go to presets, f switches auto focus, p switches power");
 }
 
 /// Opens a gap of `gaps` of the style's own spacing between widgets.
@@ -972,10 +1026,24 @@ fn space(ui: &mut Ui, gaps: f32) {
 }
 
 /// What the power lamp beside this means, in words.
-fn power_words(powered: Option<bool>) -> &'static str {
-    match powered {
-        Some(true) => "Camera is on",
-        Some(false) => "Camera is in standby",
+///
+/// Awake-but-not-yet-answering is worth a word of its own: it is what the
+/// first few seconds after switching on look like, and an operator who is told
+/// only "Camera is on" while none of the controls work has been told the
+/// wrong thing.
+fn power_words(state: Option<CameraState>) -> &'static str {
+    match state {
+        Some(CameraState {
+            power_on: true,
+            lens: Some(_),
+        }) => "Camera is on",
+        Some(CameraState {
+            power_on: true,
+            lens: None,
+        }) => "Camera is starting up",
+        Some(CameraState {
+            power_on: false, ..
+        }) => "Camera is in standby",
         None => "Waiting for the camera",
     }
 }
@@ -1080,10 +1148,21 @@ mod tests {
     fn camera_state(power_on: bool, auto_focus: bool) -> CameraState {
         CameraState {
             power_on,
-            pan_tilt: PanTiltPosition::new(0, 0),
-            zoom: ZoomPosition::try_from(0u16).unwrap(),
-            focus: FocusPosition::new(0),
-            auto_focus,
+            lens: Some(viscous::state::Lens {
+                pan_tilt: PanTiltPosition::new(0, 0),
+                zoom: ZoomPosition::try_from(0u16).unwrap(),
+                focus: FocusPosition::new(0),
+                auto_focus,
+            }),
+        }
+    }
+
+    /// A camera part-way through waking up: awake, but not yet answering for
+    /// its lens.
+    fn starting_up() -> CameraState {
+        CameraState {
+            power_on: true,
+            lens: None,
         }
     }
 
@@ -1579,9 +1658,19 @@ mod tests {
 
     #[test]
     fn the_camera_row_says_in_words_what_the_lamp_says_in_colour() {
-        assert_eq!(power_words(Some(true)), "Camera is on");
-        assert_eq!(power_words(Some(false)), "Camera is in standby");
+        assert_eq!(power_words(Some(camera_state(true, false))), "Camera is on");
+        assert_eq!(
+            power_words(Some(camera_state(false, false))),
+            "Camera is in standby"
+        );
         assert_eq!(power_words(None), "Waiting for the camera");
+    }
+
+    #[test]
+    fn a_camera_that_is_awake_but_not_answering_yet_is_not_called_ready() {
+        // "Camera is on" beside controls that all refuse would be a lie the
+        // operator can see through but not explain.
+        assert_eq!(power_words(Some(starting_up())), "Camera is starting up");
     }
 
     #[test]
@@ -1654,6 +1743,66 @@ mod tests {
             holding_focus_near(true).is_empty(),
             "a rocker drawn dead should drive nothing"
         );
+    }
+
+    /// The intents produced by pushing a rocker or dragging the pad, with the
+    /// camera in the given state.
+    fn holding_the_drives(state: CameraState) -> Vec<Intent> {
+        let (app, sent) = connected_app(Some(state));
+        let mut harness = ui_harness(app);
+        harness.run();
+
+        let zoom = harness
+            .get_all_by_role(egui::accesskit::Role::Slider)
+            .next()
+            .expect("zoom should have a rocker")
+            .rect();
+        harness.drag_at(zoom.right_center());
+        harness.run();
+
+        sent.try_iter().collect()
+    }
+
+    #[test]
+    fn a_sleeping_camera_is_not_driven() {
+        // Every one of these would come back "not executable": better to draw
+        // the controls dead than to spend a round trip being told so.
+        assert!(
+            holding_the_drives(camera_state(false, false)).is_empty(),
+            "controls drawn dead should drive nothing"
+        );
+        assert!(
+            !holding_the_drives(camera_state(true, false)).is_empty(),
+            "and an awake camera should still be driveable"
+        );
+    }
+
+    #[test]
+    fn the_keys_stay_quiet_while_the_camera_sleeps_too() {
+        // The pad and the rockers are drawn dead; keys that still drove would
+        // be contradicting what the window is showing.
+        let (app, _sent) = connected_app(Some(camera_state(false, false)));
+        let ctx = egui::Context::default();
+        let mut app = app;
+        let _ = frame_on_screen(&mut app, &ctx, vec2(800.0, 600.0));
+
+        assert_eq!(
+            app.keyboard_drives(&Ui::new(
+                ctx.clone(),
+                egui::Id::new("keys"),
+                egui::UiBuilder::new(),
+            )),
+            Drives::STOPPED
+        );
+    }
+
+    #[test]
+    fn the_power_switch_still_works_while_everything_else_is_dead() {
+        // The one control that has to survive standby: without it the window
+        // would be a dead end with no way back.
+        let (app, sent) = connected_app(Some(camera_state(false, false)));
+
+        assert_eq!(click(app, &sent, "Power on"), vec![Intent::SetPower(true)]);
     }
 
     /// Which way an intent drives focus, for asserting on direction without

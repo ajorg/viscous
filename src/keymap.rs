@@ -75,6 +75,11 @@ pub enum Action {
     /// which way the camera is currently focusing and mapping a key can't
     /// know that.
     ToggleAutoFocus,
+    /// Wake the camera, or put it back into standby.
+    ///
+    /// A [`Self::ToggleAutoFocus`] for the same reason: which way to switch
+    /// depends on whether the camera is currently awake.
+    TogglePower,
     /// Exit the application.
     Quit,
 }
@@ -141,6 +146,10 @@ pub fn map_key(key: KeyEvent) -> Option<Action> {
         // Manual focus doesn't hold while the camera is focusing for itself,
         // so the way out of that has to be reachable from the keyboard too.
         KeyCode::Char('f') => Action::ToggleAutoFocus,
+        // Likewise for standby, which ignores every other key here: without
+        // this one a camera that went to sleep could only be woken by
+        // quitting and finding some other way to do it.
+        KeyCode::Char('p') => Action::TogglePower,
 
         KeyCode::Char('q') => Action::Quit,
         // Ctrl-D is the conventional EOF/quit key for a terminal session.

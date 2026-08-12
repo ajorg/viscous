@@ -54,14 +54,20 @@ pub fn least_pad_size(ui: &Ui) -> f32 {
 }
 
 /// Draws the pad and returns the velocity the pointer is asking for, which is
-/// [`Velocity::STOP`] whenever nothing is holding it.
+/// [`Velocity::STOP`] whenever nothing is holding it — or whenever it isn't
+/// `live`, which draws it dead and says `why` on hover.
 ///
 /// The puck's position is derived from the live pointer state rather than
 /// remembered between frames: "let go" is exactly "no pointer button held on
 /// this widget", which is also precisely when the camera should stop.
-pub fn pan_tilt_pad(ui: &mut Ui, size: f32) -> Velocity {
+pub fn pan_tilt_pad(ui: &mut Ui, size: f32, live: bool, why: &str) -> Velocity {
     let radius = size / 2.0;
-    let (rect, response) = ui.allocate_exact_size(vec2(size, size), Sense::click_and_drag());
+    let sense = if live {
+        Sense::click_and_drag()
+    } else {
+        Sense::hover()
+    };
+    let (rect, response) = ui.allocate_exact_size(vec2(size, size), sense);
     let center = rect.center();
 
     let offset = match response.interact_pointer_pos() {
@@ -71,7 +77,11 @@ pub fn pan_tilt_pad(ui: &mut Ui, size: f32) -> Velocity {
 
     let visuals = ui.visuals();
     let track_color = visuals.extreme_bg_color;
-    let accent = visuals.selection.bg_fill;
+    let accent = if live {
+        visuals.selection.bg_fill
+    } else {
+        visuals.weak_text_color()
+    };
     // The theme's own hairline, so the ticks match the separators and frame
     // edges drawn beside them at whatever width it draws those.
     let tick_stroke = Stroke::new(
@@ -107,6 +117,12 @@ pub fn pan_tilt_pad(ui: &mut Ui, size: f32) -> Velocity {
     }
     painter.circle_filled(center, center_radius, accent.gamma_multiply(0.6));
     painter.circle_filled(puck_center, puck_radius, accent);
+
+    // A hand-painted control is invisible to a screen reader unless it says
+    // what it is — and this is also how a test finds it.
+    response
+        .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Other, live, "Pan and tilt"));
+    response.on_hover_text(why);
 
     velocity_for_offset(offset, radius)
 }

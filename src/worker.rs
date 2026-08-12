@@ -492,10 +492,12 @@ mod tests {
     fn sample_camera_state() -> CameraState {
         CameraState {
             power_on: true,
-            pan_tilt: grafton_visca::camera::PanTiltPosition::new(0, 0),
-            zoom: grafton_visca::types::ZoomPosition::try_from(0u16).unwrap(),
-            focus: grafton_visca::types::FocusPosition::new(0),
-            auto_focus: false,
+            lens: Some(crate::state::Lens {
+                pan_tilt: grafton_visca::camera::PanTiltPosition::new(0, 0),
+                zoom: grafton_visca::types::ZoomPosition::try_from(0u16).unwrap(),
+                focus: grafton_visca::types::FocusPosition::new(0),
+                auto_focus: false,
+            }),
         }
     }
 

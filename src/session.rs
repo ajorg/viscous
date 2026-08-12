@@ -31,6 +31,17 @@ pub const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// regardless of whether anything changed.
 pub const QUIESCENCE_INTERVAL: Duration = Duration::from_millis(300);
 
+/// How long to wait before asking again after a state query the camera didn't
+/// answer.
+///
+/// A camera that has just been woken takes seconds to come up, and says
+/// nothing at all meanwhile — so the snapshot that reports it awake is one
+/// that has to be retried rather than one that arrives by itself. Longer than
+/// the quiescence interval because a retry competes with the operator's own
+/// commands on a 9600-baud line, and there is no hurry: nothing is waiting on
+/// it but a readout.
+pub const RETRY_INTERVAL: Duration = Duration::from_millis(1000);
+
 /// How long a held key's drive survives without another press, repeat or
 /// release arriving for it.
 ///
@@ -48,6 +59,18 @@ pub const HELD_KEY_TIMEOUT: Duration = Duration::from_millis(700);
 /// itself — including the way out, since the focus keys are otherwise
 /// dead and nothing on screen says why.
 pub const AUTO_FOCUS_HINT: &str = "auto focus is on \u{2014} press f to focus by hand";
+
+/// What to say when a movement key is held against a camera that is asleep.
+/// Names the way out for the same reason [`AUTO_FOCUS_HINT`] does: nothing
+/// else on screen says why the keys stopped working.
+pub const STANDBY_HINT: &str = "the camera is in standby \u{2014} press p to wake it";
+
+/// What to say while the camera isn't answering questions about itself.
+///
+/// The plain truth, and better than the protocol error underneath it: the
+/// commonest reason for it is a camera part-way through waking up, which is
+/// not a fault and shouldn't be dressed as one.
+pub const NO_ANSWER_HINT: &str = "waiting for the camera to answer...";
 
 /// Where a session's output goes: the TUI's status line and info panel, or
 /// the bare CLI's transcript.
@@ -80,13 +103,19 @@ struct Session<'a, R: Report> {
     intents: &'a Sender<Intent>,
     results: &'a Receiver<Outcome>,
     report: &'a mut R,
-    pending_state_query: bool,
-    last_command_at: Instant,
+    /// When to ask the camera for a fresh snapshot, or `None` when what we
+    /// have is current. One instant rather than a flag and a timestamp,
+    /// because the two things that arm it — a command that changed something,
+    /// and a query that went unanswered — differ only in how long to wait.
+    next_query_at: Option<Instant>,
     held: Option<HeldKey>,
     /// Which way the camera said it was focusing, or `None` until it has said.
     /// The focus keys can't hold against a camera focusing for itself, so the
     /// loop has to know which it's doing before it starts one of those drives.
     auto_focus: Option<bool>,
+    /// Whether the camera said it was awake, or `None` until it has said. A
+    /// camera in standby ignores every movement key there is.
+    power_on: Option<bool>,
 }
 
 impl<'a, R: Report> Session<'a, R> {
@@ -96,12 +125,11 @@ impl<'a, R: Report> Session<'a, R> {
             results,
             report,
             // Query once up front so the state display doesn't sit empty
-            // until the first command; the quiescence interval below is
-            // already satisfied on the first pass.
-            pending_state_query: true,
-            last_command_at: Instant::now() - QUIESCENCE_INTERVAL,
+            // until the first command, and without waiting for it.
+            next_query_at: Some(Instant::now()),
             held: None,
             auto_focus: None,
+            power_on: None,
         }
     }
 
@@ -110,8 +138,7 @@ impl<'a, R: Report> Session<'a, R> {
     /// [`Self::drain`].
     fn send(&mut self, intent: Intent) -> io::Result<()> {
         let _ = self.intents.send(intent);
-        self.pending_state_query = true;
-        self.last_command_at = Instant::now();
+        self.next_query_at = Some(Instant::now() + QUIESCENCE_INTERVAL);
         // A drive is its own progress report — the picture moves — so it says
         // nothing, and the key legend stays up while the key is held.
         if worker::is_drive(intent) {
@@ -141,6 +168,15 @@ impl<'a, R: Report> Session<'a, R> {
                 self.send(Intent::SetAutoFocus(auto))?;
             }
             Action::ToggleAutoFocus => {}
+            Action::TogglePower if key.kind == KeyEventKind::Press => {
+                // Offer the state that does something when the camera hasn't
+                // said which it's in yet: waking it is what every other key
+                // needs, and needing them is why anyone presses this.
+                let on = !self.power_on.unwrap_or(false);
+                self.power_on = Some(on);
+                self.send(Intent::SetPower(on))?;
+            }
+            Action::TogglePower => {}
             Action::Hold(hold) => self.handle_hold(key, hold)?,
         }
         Ok(false)
@@ -172,6 +208,11 @@ impl<'a, R: Report> Session<'a, R> {
     }
 
     fn start_hold(&mut self, code: KeyCode, hold: Hold) -> io::Result<()> {
+        // A camera in standby has parked its lens and will refuse the drive;
+        // starting one anyway spends a round trip to be told so.
+        if self.power_on == Some(false) {
+            return self.report.status(STANDBY_HINT);
+        }
         // A camera focusing for itself ignores a manual focus drive, so say
         // so rather than starting one that visibly does nothing.
         if matches!(hold, Hold::Focus(_)) && self.auto_focus == Some(true) {
@@ -222,9 +263,27 @@ impl<'a, R: Report> Session<'a, R> {
             match self.results.try_recv() {
                 Ok(outcome) => match &outcome {
                     Outcome::State(Ok(camera_state)) => {
-                        self.auto_focus = Some(camera_state.auto_focus);
+                        self.power_on = Some(camera_state.power_on);
+                        // A camera that isn't reporting its lens hasn't told
+                        // us how it's focusing either, so stop claiming to
+                        // know rather than holding the last answer.
+                        self.auto_focus = camera_state.lens.map(|lens| lens.auto_focus);
+                        // An awake camera that isn't answering for its lens
+                        // yet is one still coming up, so keep asking until it
+                        // does. A sleeping one has nothing more to say and is
+                        // left alone until the operator asks for something.
+                        if camera_state.power_on && camera_state.lens.is_none() {
+                            self.next_query_at = Some(Instant::now() + RETRY_INTERVAL);
+                        }
                         self.report
                             .camera_state(&worker::describe_outcome(&outcome))?;
+                    }
+                    // A camera that didn't answer is usually one that is busy
+                    // waking up, so ask again rather than reporting a fault
+                    // and giving up on ever noticing it came back.
+                    Outcome::State(Err(_)) => {
+                        self.next_query_at = Some(Instant::now() + RETRY_INTERVAL);
+                        self.report.status(NO_ANSWER_HINT)?;
                     }
                     // A drive that worked was already visible before its
                     // completion arrived; one that failed is the only kind
@@ -246,14 +305,11 @@ impl<'a, R: Report> Session<'a, R> {
     /// state query is four inquiry round trips on the same serial line — one
     /// in flight is one more thing the stop command has to wait behind.
     fn query_if_due(&mut self) {
-        if self.held.is_some()
-            || !self.pending_state_query
-            || self.last_command_at.elapsed() < QUIESCENCE_INTERVAL
-        {
+        if self.held.is_some() || self.next_query_at.is_none_or(|at| Instant::now() < at) {
             return;
         }
         let _ = self.intents.send(Intent::QueryState);
-        self.pending_state_query = false;
+        self.next_query_at = None;
     }
 
     /// Stops anything still being driven on the way out, waiting for the
@@ -430,10 +486,20 @@ mod tests {
     fn focusing(auto_focus: bool) -> crate::state::CameraState {
         crate::state::CameraState {
             power_on: true,
-            pan_tilt: grafton_visca::camera::PanTiltPosition::new(0, 0),
-            zoom: grafton_visca::types::ZoomPosition::try_from(0u16).unwrap(),
-            focus: grafton_visca::types::FocusPosition::new(0),
-            auto_focus,
+            lens: Some(crate::state::Lens {
+                pan_tilt: grafton_visca::camera::PanTiltPosition::new(0, 0),
+                zoom: grafton_visca::types::ZoomPosition::try_from(0u16).unwrap(),
+                focus: grafton_visca::types::FocusPosition::new(0),
+                auto_focus,
+            }),
+        }
+    }
+
+    /// What a camera in standby reports: its power, and nothing else.
+    fn asleep() -> crate::state::CameraState {
+        crate::state::CameraState {
+            power_on: false,
+            lens: None,
         }
     }
 
@@ -707,7 +773,7 @@ mod tests {
             session.handle_key(press(KeyCode::Right)).unwrap();
             // Long settled, but the camera is still moving: asking where it
             // is would only get in the way of the stop command.
-            session.last_command_at = Instant::now() - QUIESCENCE_INTERVAL;
+            session.next_query_at = Some(Instant::now());
             session.query_if_due();
         }
 
@@ -723,11 +789,166 @@ mod tests {
             let mut session = harness.session();
             session.handle_key(press(KeyCode::Right)).unwrap();
             session.handle_key(release(KeyCode::Right)).unwrap();
-            session.last_command_at = Instant::now() - QUIESCENCE_INTERVAL;
+            session.next_query_at = Some(Instant::now());
             session.query_if_due();
         }
 
         assert_eq!(harness.sent().last(), Some(&Intent::QueryState));
+    }
+
+    /// When the session next wants to ask the camera about itself, once it has
+    /// taken up `outcome`.
+    ///
+    /// Sends the opening query first, the way the loop does, so that what's
+    /// left is only what `outcome` itself asked for — otherwise every answer
+    /// looks like it armed a retry.
+    fn next_query_after(harness: &mut Harness, outcome: Outcome) -> Option<Instant> {
+        harness.outcomes.send(outcome).unwrap();
+        let mut session = harness.session();
+        session.query_if_due();
+        session.drain().unwrap();
+        session.next_query_at
+    }
+
+    #[test]
+    fn a_movement_key_against_a_sleeping_camera_says_so_instead_of_driving() {
+        let mut harness = Harness::new();
+        harness.outcomes.send(Outcome::State(Ok(asleep()))).unwrap();
+
+        {
+            let mut session = harness.session();
+            session.drain().unwrap();
+            session.handle_key(press(KeyCode::Right)).unwrap();
+        }
+
+        assert!(
+            !harness
+                .sent()
+                .iter()
+                .any(|intent| worker::is_drive(*intent)),
+            "a camera in standby would only refuse the drive"
+        );
+        assert!(harness.report.statuses.contains(&STANDBY_HINT.to_string()));
+    }
+
+    #[test]
+    fn p_wakes_a_camera_that_said_it_was_asleep() {
+        let mut harness = Harness::new();
+        harness.outcomes.send(Outcome::State(Ok(asleep()))).unwrap();
+
+        {
+            let mut session = harness.session();
+            session.drain().unwrap();
+            session.handle_key(press(KeyCode::Char('p'))).unwrap();
+        }
+
+        assert!(harness.sent().contains(&Intent::SetPower(true)));
+    }
+
+    #[test]
+    fn p_puts_an_awake_camera_into_standby() {
+        let mut harness = Harness::new();
+        harness
+            .outcomes
+            .send(Outcome::State(Ok(focusing(false))))
+            .unwrap();
+
+        {
+            let mut session = harness.session();
+            session.drain().unwrap();
+            session.handle_key(press(KeyCode::Char('p'))).unwrap();
+        }
+
+        assert!(harness.sent().contains(&Intent::SetPower(false)));
+    }
+
+    #[test]
+    fn p_offers_to_wake_a_camera_that_has_not_said_which_it_is() {
+        let mut harness = Harness::new();
+
+        {
+            let mut session = harness.session();
+            session.handle_key(press(KeyCode::Char('p'))).unwrap();
+        }
+
+        // Waking is what every other key needs, and needing them is why
+        // anyone reaches for this one.
+        assert!(harness.sent().contains(&Intent::SetPower(true)));
+    }
+
+    #[test]
+    fn a_state_query_the_camera_did_not_answer_is_asked_again() {
+        let mut harness = Harness::new();
+        let outcome = Outcome::State(Err(grafton_visca::Error::Timeout));
+
+        let next = next_query_after(&mut harness, outcome);
+
+        assert!(next.is_some(), "an unanswered query should be retried");
+        assert!(
+            next.is_some_and(|at| at > Instant::now()),
+            "and not straight away, which would be a spin"
+        );
+        assert!(
+            harness
+                .report
+                .statuses
+                .contains(&NO_ANSWER_HINT.to_string()),
+            "an unanswered query should say so plainly, got {:?}",
+            harness.report.statuses
+        );
+    }
+
+    #[test]
+    fn a_camera_that_is_awake_but_not_reporting_its_lens_yet_is_asked_again() {
+        let mut harness = Harness::new();
+        let waking = Outcome::State(Ok(crate::state::CameraState {
+            power_on: true,
+            lens: None,
+        }));
+
+        assert!(
+            next_query_after(&mut harness, waking).is_some(),
+            "a camera still coming up should be asked again"
+        );
+    }
+
+    #[test]
+    fn a_sleeping_camera_is_left_alone_rather_than_asked_over_and_over() {
+        let mut harness = Harness::new();
+
+        assert!(
+            next_query_after(&mut harness, Outcome::State(Ok(asleep()))).is_none(),
+            "standby is a settled answer, not one to keep asking about"
+        );
+    }
+
+    #[test]
+    fn a_camera_that_reports_its_lens_is_not_asked_again_until_something_changes() {
+        let mut harness = Harness::new();
+        let reporting = Outcome::State(Ok(focusing(false)));
+
+        assert!(
+            next_query_after(&mut harness, reporting).is_none(),
+            "a complete answer is the end of the retry, not another round"
+        );
+    }
+
+    #[test]
+    fn a_camera_that_stops_reporting_its_lens_stops_claiming_a_focus_mode() {
+        let mut harness = Harness::new();
+        harness
+            .outcomes
+            .send(Outcome::State(Ok(focusing(true))))
+            .unwrap();
+        harness.outcomes.send(Outcome::State(Ok(asleep()))).unwrap();
+
+        let mut session = harness.session();
+        session.drain().unwrap();
+
+        assert_eq!(
+            session.auto_focus, None,
+            "the last known focus mode isn't the camera's current answer"
+        );
     }
 
     #[test]

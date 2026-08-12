@@ -44,8 +44,8 @@ pub struct AppState {
 /// shares the footer with the status line and has to fit a narrow terminal
 /// whole, so it names one way to reach each control and leaves the synonyms
 /// (`-=` for zoom, `<>` for focus, ctrl-D for quit) to be discovered.
-pub const KEY_LEGEND: &str = "hold to move: arrows  []zoom  ,.focus  shift=fast  \
-     1-6 preset  f auto  q quit";
+pub const KEY_LEGEND: &str = "hold: arrows  []zoom  ,.focus  shift=fast  \
+     1-6 preset  f auto  p power  q quit";
 
 /// The narrowest terminal [`KEY_LEGEND`] is expected to fit in.
 pub const MIN_COLUMNS: usize = 80;
@@ -151,7 +151,7 @@ mod tests {
         };
         let content = render_to_string(&state);
         assert!(content.contains("preset 3 saved"));
-        assert!(!content.contains("hold to move"));
+        assert!(!content.contains("hold: arrows"));
     }
 
     #[test]

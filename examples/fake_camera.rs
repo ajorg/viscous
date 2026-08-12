@@ -94,8 +94,15 @@ struct Preset {
     focus: u16,
 }
 
+/// How long a woken camera takes to come up, during which it answers for its
+/// power and nothing else. Real cameras take several seconds; long enough here
+/// to be visible in a client, short enough not to be tedious to sit through.
+const WAKE_TIME: Duration = Duration::from_secs(3);
+
 struct CameraSim {
     power_on: bool,
+    /// When the camera will have finished waking, if it is still doing so.
+    awake_at: Option<Instant>,
     auto_focus: bool,
     /// The title the camera is holding, in its own character codes, and
     /// whether it's currently burned into the video output.
@@ -158,6 +165,7 @@ impl CameraSim {
     fn new() -> Self {
         Self {
             power_on: true,
+            awake_at: None,
             auto_focus: false,
             title: [SPACE; TITLE_LENGTH],
             title_shown: false,
@@ -244,13 +252,19 @@ impl CameraSim {
 
         println!("RECV: {}", describe_message(message));
 
+        let body = &message[2..message.len() - 1];
+        if !self.is_awake_enough_for(body) {
+            println!("      (refused: the camera is not awake)");
+            return Reply::Immediate(not_executable_reply());
+        }
+
         match message[1] {
-            0x09 => match self.handle_inquiry(&message[2..message.len() - 1]) {
+            0x09 => match self.handle_inquiry(body) {
                 Some(bytes) => Reply::Immediate(bytes),
                 None => Reply::None,
             },
             0x01 => {
-                let delay = self.apply_command(&message[2..message.len() - 1]);
+                let delay = self.apply_command(body);
                 Reply::Command {
                     ack: ack_reply(1),
                     delay,
@@ -259,6 +273,35 @@ impl CameraSim {
             }
             _ => Reply::None,
         }
+    }
+
+    /// Whether the camera will deal with this message at all in its current
+    /// state.
+    ///
+    /// A camera in standby has parked its lens and powered down everything
+    /// that would answer, and so has one that is part-way through waking up.
+    /// What both still answer is the handful of things that would otherwise
+    /// leave no way back: what model it is, whether it is on, and being told
+    /// to switch. Everything else is refused outright — which is the whole
+    /// point of simulating standby, since a client that is never refused can
+    /// never be shown to handle it.
+    fn is_awake_enough_for(&self, body: &[u8]) -> bool {
+        let always_answered = matches!(
+            body,
+            // Version inquiry: answered even asleep, so connecting to a
+            // camera that happens to be in standby still works.
+            [0x00, 0x02]
+                // Power inquiry, and the command to switch it either way.
+                | [0x04, 0x00]
+                | [0x04, 0x00, 0x02 | 0x03]
+        );
+        always_answered || (self.power_on && self.finished_waking())
+    }
+
+    /// Whether enough time has passed since being woken for the camera to
+    /// answer for its lens.
+    fn finished_waking(&self) -> bool {
+        self.awake_at.is_none_or(|at| Instant::now() >= at)
     }
 
     fn handle_inquiry(&self, body: &[u8]) -> Option<Vec<u8>> {
@@ -338,9 +381,21 @@ impl CameraSim {
                 self.tilt = 0;
                 sweep + home
             }
-            // Power on / off (standby).
+            // Power on / off (standby). Waking is not instant: the camera
+            // acknowledges at once and then spends a few seconds coming up,
+            // answering for its power alone in the meantime.
             [0x04, 0x00, on @ (0x02 | 0x03)] => {
+                let waking = *on == 0x02 && !self.power_on;
                 self.power_on = *on == 0x02;
+                self.awake_at = waking.then(|| Instant::now() + WAKE_TIME);
+                // A camera going into standby parks its lens, so whatever was
+                // being driven stops with it.
+                if !self.power_on {
+                    self.pan_rate = 0.0;
+                    self.tilt_rate = 0.0;
+                    self.zoom_rate = 0.0;
+                    self.focus_rate = 0.0;
+                }
                 Duration::ZERO
             }
             // Title set: 73 pp <10 bytes>. Part 00 is where the title goes,
@@ -500,6 +555,12 @@ fn inquiry_reply(payload: &[u8]) -> Vec<u8> {
     reply.extend_from_slice(payload);
     reply.push(TERMINATOR);
     reply
+}
+
+/// What a camera says to something it won't do in its current state: VISCA
+/// error 0x41, "command not executable".
+fn not_executable_reply() -> Vec<u8> {
+    vec![0x90, 0x60, 0x41, TERMINATOR]
 }
 
 fn ack_reply(socket: u8) -> Vec<u8> {
