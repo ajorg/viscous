@@ -172,9 +172,11 @@ impl<'a, R: Report> Session<'a, R> {
                 // Offer the state that does something when the camera hasn't
                 // said which it's in yet: waking it is what every other key
                 // needs, and needing them is why anyone presses this.
-                let on = !self.power_on.unwrap_or(false);
-                self.power_on = Some(on);
-                self.send(Intent::SetPower(on))?;
+                //
+                // Nothing is recorded here. What the camera is doing is the
+                // camera's to say, and it says so when it confirms the
+                // command — see [`Self::drain`].
+                self.send(Intent::SetPower(!self.power_on.unwrap_or(false)))?;
             }
             Action::TogglePower => {}
             Action::Hold(hold) => self.handle_hold(key, hold)?,
@@ -277,6 +279,16 @@ impl<'a, R: Report> Session<'a, R> {
                         }
                         self.report
                             .camera_state(&worker::describe_outcome(&outcome))?;
+                    }
+                    // A confirmed switch is the camera's own word on what it
+                    // is doing, and better than waiting for the next inquiry
+                    // to come round to it.
+                    Outcome::Done(Intent::SetPower(on), Ok(())) => {
+                        self.power_on = Some(*on);
+                        // Whichever way it went, the lens is no longer where
+                        // it was: it has just parked or is about to unpark.
+                        self.auto_focus = None;
+                        self.report.status(&worker::describe_outcome(&outcome))?;
                     }
                     // A camera that didn't answer is usually one that is busy
                     // waking up, so ask again rather than reporting a fault
@@ -874,6 +886,50 @@ mod tests {
         // Waking is what every other key needs, and needing them is why
         // anyone reaches for this one.
         assert!(harness.sent().contains(&Intent::SetPower(true)));
+    }
+
+    #[test]
+    fn the_camera_confirming_the_switch_is_what_teaches_the_session_about_power() {
+        // Not the keypress: what the camera is doing is the camera's to say,
+        // and it says so as soon as it confirms. Without this the next p
+        // would ask for the same thing again until an inquiry came round.
+        let mut harness = Harness::new();
+        harness
+            .outcomes
+            .send(Outcome::Done(Intent::SetPower(true), Ok(())))
+            .unwrap();
+
+        {
+            let mut session = harness.session();
+            session.drain().unwrap();
+            session.handle_key(press(KeyCode::Char('p'))).unwrap();
+        }
+
+        assert!(
+            harness.sent().contains(&Intent::SetPower(false)),
+            "a camera confirmed on should next be offered standby"
+        );
+    }
+
+    #[test]
+    fn waking_the_camera_stops_the_session_claiming_to_know_how_it_focuses() {
+        let mut harness = Harness::new();
+        harness
+            .outcomes
+            .send(Outcome::State(Ok(focusing(true))))
+            .unwrap();
+        harness
+            .outcomes
+            .send(Outcome::Done(Intent::SetPower(false), Ok(())))
+            .unwrap();
+
+        let mut session = harness.session();
+        session.drain().unwrap();
+
+        assert_eq!(
+            session.auto_focus, None,
+            "a camera that just parked its lens is no longer focusing any way at all"
+        );
     }
 
     #[test]

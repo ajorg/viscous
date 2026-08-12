@@ -372,6 +372,19 @@ impl App {
                 }
                 return;
             }
+            // A confirmed switch is the camera's own word on what it is doing,
+            // and better than waiting for the next inquiry to come round to
+            // it. Whichever way it went, the lens is no longer where it was:
+            // it has just parked, or is about to unpark.
+            Outcome::Done(Intent::SetPower(on), Ok(())) => {
+                self.camera_state = Some(CameraState {
+                    power_on: *on,
+                    lens: None,
+                });
+                // Falls through to the status line: the switch worked, and
+                // saying so is what every other one-off command does.
+                false
+            }
             // A camera that didn't answer is usually one that is busy waking
             // up, so ask again rather than reporting a fault and giving up on
             // ever noticing it came back.
@@ -1793,6 +1806,35 @@ mod tests {
                 egui::UiBuilder::new(),
             )),
             Drives::STOPPED
+        );
+    }
+
+    #[test]
+    fn the_camera_confirming_the_switch_is_what_flips_what_it_offers() {
+        // Not the click: the camera's own confirmation. Without this the
+        // button would go on offering "Power off" until an inquiry came round
+        // to it, which is the shape of the bug this all started with.
+        let (mut app, _sent) = connected_app(Some(camera_state(true, false)));
+
+        app.apply_outcome(Outcome::Done(Intent::SetPower(false), Ok(())));
+
+        assert_eq!(app.camera_state.map(|state| state.power_on), Some(false));
+        assert!(
+            app.asleep(),
+            "a camera confirmed into standby should draw its controls dead"
+        );
+    }
+
+    #[test]
+    fn waking_the_camera_does_not_claim_the_lens_is_where_it_was() {
+        let (mut app, _sent) = connected_app(Some(camera_state(false, false)));
+
+        app.apply_outcome(Outcome::Done(Intent::SetPower(true), Ok(())));
+
+        assert_eq!(
+            power_words(app.camera_state),
+            "Camera is starting up",
+            "a camera that has just been woken is not yet a camera that is on"
         );
     }
 
