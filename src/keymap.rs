@@ -19,11 +19,11 @@ use crate::{
 
 /// How far a movement key deflects its axis, as a fraction of full travel. A
 /// keyboard can only really express a couple of speeds, so the plain key is
-/// slow enough to frame a shot with, and shift is everything the camera has.
+/// slow enough to frame a shot with, and shift is the fastest a control drives.
 ///
 /// Chosen for the speed it comes out at rather than for the number itself: it
-/// lands on 7 of the camera's 24 pan speeds, which is the pace a held arrow
-/// key wants. Since a key has no travel to feel its way along, it doesn't
+/// lands on 5 of the 12 pan speeds a control asks for, which is the pace a held
+/// arrow key wants. Since a key has no travel to feel its way along, it doesn't
 /// benefit from [`deflection`](crate::deflection)'s curve — it only has to
 /// land in the same place the curve puts that speed.
 pub const KEY_DEFLECTION: f32 = 0.55;
@@ -230,10 +230,10 @@ mod tests {
         // response curve moved where a given deflection comes out, and this
         // is what keeps the constant honest about the speed it was picked for.
         assert!(
-            normal.pan_speed > crate::pan_tilt::MAX_PAN_SPEED / 8,
+            normal.pan_speed > *crate::pan_tilt::PAN_SPEEDS.end() / 4,
             "the plain key should still move the shot, got {} of {}",
             normal.pan_speed,
-            crate::pan_tilt::MAX_PAN_SPEED
+            *crate::pan_tilt::PAN_SPEEDS.end()
         );
     }
 

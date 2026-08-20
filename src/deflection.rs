@@ -19,17 +19,21 @@ pub const DEADZONE: f32 = 0.1;
 
 /// How sharply speed builds as a control is pushed further.
 ///
-/// A straight mapping spends the whole bottom of the travel on speeds too fast
-/// to frame with: half-way out on the pad is half of a top speed that crosses
-/// the room in seconds, and the slow end that actually gets used is a sliver
-/// too small to hold steady. Squaring it hands that sliver most of the travel
-/// — half a push now asks for a fifth of the speed — while full deflection
-/// still means full speed, so nothing is given up at the top.
+/// A straight mapping gives the fast end more of the travel than it is worth:
+/// half a push asks for half the speed, and the slow speeds a shot is framed
+/// with are crowded into the first part of the push, too small to hold steady.
+/// Bending it hands them more room — half a push now asks for about a third of
+/// the range — while full deflection still means the top of the range, so
+/// nothing is given up.
 ///
-/// Two rather than three: the same reasoning says cube it, but past a point
-/// the far end of the travel turns into a cliff, where a little more push is a
-/// lot more speed and the shot lurches.
-const EXPO: f32 = 2.0;
+/// One and a half rather than two. Squaring it was picked while a control drove
+/// the camera's whole mechanical range, where the top was so fast that the only
+/// way to make the rest usable was to bury it in the last of the travel. Now
+/// that the range itself stops at a speed worth driving at
+/// ([`PAN_SPEEDS`](crate::pan_tilt::PAN_SPEEDS)), that much curve only pushes
+/// every speed towards the far end and leaves the middle of the travel — where
+/// a hand naturally sits — asking for barely any speed at all.
+const EXPO: f32 = 1.5;
 
 /// What share of a control's speed range a push of `magnitude` (`0.0..=1.0`)
 /// asks for, or `None` while it's still inside the deadzone.
@@ -92,29 +96,33 @@ mod tests {
     }
 
     #[test]
-    fn the_low_end_of_the_travel_is_where_the_slow_speeds_live() {
+    fn half_a_push_asks_for_well_under_half_the_speed() {
         // The whole point of the curve, and what a straight mapping does not
-        // do: half a push is nowhere near half the speed.
+        // do: the middle of the travel is worth about a third of the range.
         let half = speed(0.5, SPEEDS).expect("half a push drives");
 
         assert!(
-            half < 25,
-            "half the travel should ask for well under a quarter of the speed, got {half}"
+            (25..40).contains(&half),
+            "half the travel should ask for around a third of the speed, got {half}"
         );
     }
 
     #[test]
-    fn the_first_half_of_the_travel_covers_more_speeds_than_a_straight_mapping_would() {
-        // Counted rather than reasoned about: how many distinct speeds the
-        // slow half of the travel can actually reach. A straight mapping
-        // spends half its speeds there and leaves the slow end coarse.
-        let reachable = (0..=50)
-            .filter_map(|step| speed(step as f32 / 100.0, SPEEDS))
-            .collect::<std::collections::BTreeSet<_>>();
+    fn the_slow_speeds_get_more_of_the_travel_than_their_share() {
+        // Counted rather than reasoned about. A straight mapping would spend
+        // exactly a third of the travel on the slowest third of the speeds;
+        // framing happens down there, so the curve owes it more room.
+        let steps = 11..=100;
+        let total = steps.clone().count();
+        let slow = steps
+            .filter(|step| {
+                speed(*step as f32 / 100.0, SPEEDS).expect("past the deadzone drives") <= 33
+            })
+            .count();
 
         assert!(
-            reachable.iter().all(|&speed| speed < 25),
-            "the slow half of the travel should stay in the slow speeds, got {reachable:?}"
+            slow * 3 > total,
+            "the slowest third of the speeds got only {slow} of {total} steps of travel"
         );
     }
 

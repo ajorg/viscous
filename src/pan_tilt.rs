@@ -9,6 +9,8 @@
 //! command produce the same sweep as a single smooth motion, with nothing
 //! left queued behind them.
 
+use std::ops::RangeInclusive;
+
 use grafton_visca::{
     BlockingClient, Error,
     camera::profiles::GenericVisca,
@@ -30,6 +32,23 @@ pub const MAX_PAN_SPEED: u8 = 24;
 /// The fastest tilt speed VISCA's drive command accepts (0x14 — genuinely a
 /// shorter range than pan's).
 pub const MAX_TILT_SPEED: u8 = 20;
+
+/// The pan speeds a control will actually ask for, slowest first.
+///
+/// Deliberately short of what the camera can do. The top of VISCA's range is a
+/// speed for slewing somewhere, not for pointing at anything: it swings past a
+/// subject before a hand can stop it, and the picture arrives as a blur either
+/// way. Held to half of that, every position on a control is a speed worth
+/// driving at, and the ones in the middle are the ones a shot is framed with.
+///
+/// Nothing is lost by giving the top up: getting somewhere far away in a hurry
+/// is what the presets and [`home`] are for, and they arrive at the camera's
+/// own pace without anyone having to hold a stick over.
+pub const PAN_SPEEDS: RangeInclusive<u8> = MIN_SPEED..=MAX_PAN_SPEED / 2;
+
+/// The tilt speeds a control will actually ask for, slowest first. Half of
+/// what the camera accepts, for the reasons [`PAN_SPEEDS`] gives.
+pub const TILT_SPEEDS: RangeInclusive<u8> = MIN_SPEED..=MAX_TILT_SPEED / 2;
 
 /// A continuous pan/tilt drive request: which way to drive, and how fast
 /// along each axis.
@@ -64,10 +83,10 @@ impl Velocity {
     }
 }
 
-/// Maps one axis's deflection onto the drive speed range, or `None` if it's
+/// Maps one axis's deflection onto that axis's speed range, or `None` if it's
 /// inside the deadzone.
-fn axis_speed(deflection: f32, max_speed: u8) -> Option<u8> {
-    deflection::speed(deflection.abs(), MIN_SPEED..=max_speed)
+fn axis_speed(deflection: f32, speeds: RangeInclusive<u8>) -> Option<u8> {
+    deflection::speed(deflection.abs(), speeds)
 }
 
 /// Builds a velocity from a control's deflection along each axis, each a
@@ -77,8 +96,8 @@ fn axis_speed(deflection: f32, max_speed: u8) -> Option<u8> {
 /// little up pans fast while tilting slowly: the diagonals cover a whole
 /// range of arcs rather than a fixed 45 degrees.
 pub fn velocity_from_axes(pan: f32, tilt: f32) -> Velocity {
-    let pan_speed = axis_speed(pan, MAX_PAN_SPEED);
-    let tilt_speed = axis_speed(tilt, MAX_TILT_SPEED);
+    let pan_speed = axis_speed(pan, PAN_SPEEDS);
+    let tilt_speed = axis_speed(tilt, TILT_SPEEDS);
 
     let direction = match (pan_speed.map(|_| pan > 0.0), tilt_speed.map(|_| tilt > 0.0)) {
         (None, None) => return Velocity::STOP,
@@ -211,8 +230,24 @@ mod tests {
     #[test]
     fn full_deflection_asks_for_the_top_speed_of_each_axis() {
         let velocity = velocity_from_axes(1.0, 1.0);
-        assert_eq!(velocity.pan_speed, MAX_PAN_SPEED);
-        assert_eq!(velocity.tilt_speed, MAX_TILT_SPEED);
+        assert_eq!(velocity.pan_speed, *PAN_SPEEDS.end());
+        assert_eq!(velocity.tilt_speed, *TILT_SPEEDS.end());
+    }
+
+    #[test]
+    fn the_fastest_a_control_asks_for_is_well_short_of_what_the_camera_can_do() {
+        // Measured on the camera: driven at the top of VISCA's range it swings
+        // past anything worth looking at, so no amount of pushing reaches it.
+        assert!(
+            *PAN_SPEEDS.end() <= MAX_PAN_SPEED / 2,
+            "pushing the pad flat out asked for {} of the camera's {MAX_PAN_SPEED}",
+            *PAN_SPEEDS.end()
+        );
+        assert!(
+            *TILT_SPEEDS.end() <= MAX_TILT_SPEED / 2,
+            "pushing the pad flat out asked for {} of the camera's {MAX_TILT_SPEED}",
+            *TILT_SPEEDS.end()
+        );
     }
 
     #[test]
@@ -226,13 +261,14 @@ mod tests {
     #[test]
     fn half_a_push_asks_for_far_less_than_half_the_top_speed() {
         // What makes the pad usable for framing rather than only for getting
-        // somewhere: a straight mapping would put this near 12 of 24, which
-        // crosses a room faster than anyone can follow a subject.
+        // somewhere: a straight mapping would put half a push at half the top
+        // speed, which crosses a room faster than a subject can be followed.
         let half = velocity_from_axes(0.5, 0.0).pan_speed;
 
         assert!(
-            half < MAX_PAN_SPEED / 3,
-            "half the travel should stay slow, got {half} of {MAX_PAN_SPEED}"
+            half * 3 <= *PAN_SPEEDS.end(),
+            "half the travel should stay slow, got {half} of {}",
+            *PAN_SPEEDS.end()
         );
     }
 
@@ -241,10 +277,26 @@ mod tests {
         for step in 11..=50 {
             let speed = velocity_from_axes(step as f32 / 100.0, 0.0).pan_speed;
             assert!(
-                speed < MAX_PAN_SPEED / 3,
-                "{step}% of full push asked for {speed} of {MAX_PAN_SPEED}"
+                speed * 3 <= *PAN_SPEEDS.end(),
+                "{step}% of full push asked for {speed} of {}",
+                *PAN_SPEEDS.end()
             );
         }
+    }
+
+    #[test]
+    fn the_middle_of_the_travel_is_where_the_middle_speeds_are() {
+        // What a hand reaches for most: a push it can hold somewhere short of
+        // the stops should come out somewhere near the middle of the range,
+        // not pinned to either end of it.
+        let top = *PAN_SPEEDS.end();
+        let middle = velocity_from_axes(0.65, 0.0).pan_speed;
+
+        assert!(
+            (top / 3..=top * 2 / 3).contains(&middle),
+            "two thirds of a push asked for {middle} of {}",
+            *PAN_SPEEDS.end()
+        );
     }
 
     #[test]
@@ -262,9 +314,9 @@ mod tests {
         // Hard right, barely up: pan should be at its own maximum while tilt
         // stays near the bottom of its range.
         let velocity = velocity_from_axes(1.0, 0.2);
-        assert_eq!(velocity.pan_speed, MAX_PAN_SPEED);
+        assert_eq!(velocity.pan_speed, *PAN_SPEEDS.end());
         assert!(
-            velocity.tilt_speed < MAX_TILT_SPEED / 2,
+            velocity.tilt_speed < *TILT_SPEEDS.end() / 2,
             "tilt should stay slow when the control is barely deflected up"
         );
     }
@@ -278,7 +330,7 @@ mod tests {
 
     #[test]
     fn deflection_beyond_full_travel_is_capped_rather_than_rejected() {
-        assert_eq!(velocity_from_axes(3.0, 0.0).pan_speed, MAX_PAN_SPEED);
+        assert_eq!(velocity_from_axes(3.0, 0.0).pan_speed, *PAN_SPEEDS.end());
     }
 
     fn scripted_camera(
