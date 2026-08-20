@@ -44,6 +44,18 @@ pub struct Pad {
     pub buttons: Buttons,
 }
 
+impl Pad {
+    /// How far the triggers are pushing focus, from -1 (fully near) to 1
+    /// (fully far).
+    ///
+    /// They oppose each other, so both at once is neither — and one number is
+    /// what a control drawn as a rocker takes, which is how the front end shows
+    /// what the triggers are doing.
+    pub fn focus_deflection(&self) -> f32 {
+        self.right_trigger - self.left_trigger
+    }
+}
+
 /// Something the operator asked for by pressing a button, as opposed to the
 /// continuous drives the sticks and triggers ask for by being held.
 ///
@@ -150,7 +162,7 @@ fn drives(pad: &Pad) -> Drives {
         // the distance between sharp and soft is smallest. The triggers are
         // analogue, so they keep speed-by-deflection, and they are under
         // different fingers, so neither disturbs the other.
-        focus: FocusDrive::from_deflection(pad.right_trigger - pad.left_trigger),
+        focus: FocusDrive::from_deflection(pad.focus_deflection()),
     }
 }
 
@@ -239,6 +251,18 @@ mod tests {
             asked_for(far).0.focus.map(|drive| drive.direction),
             Some(FocusDirection::Far)
         );
+    }
+
+    #[test]
+    fn the_triggers_read_as_one_push_between_near_and_far() {
+        let pad = Pad {
+            left_trigger: 0.25,
+            right_trigger: 1.0,
+            ..resting()
+        };
+
+        assert_eq!(pad.focus_deflection(), 0.75);
+        assert_eq!(resting().focus_deflection(), 0.0);
     }
 
     #[test]

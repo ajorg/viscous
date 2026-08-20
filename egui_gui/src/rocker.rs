@@ -32,12 +32,16 @@ pub struct Marks<'a> {
 /// Like the pad, the knob's position comes from the live pointer rather than
 /// from anything remembered between frames: letting go *is* the spring that
 /// returns it to the middle.
-pub fn rocker(ui: &mut Ui, marks: &Marks<'_>, live: bool, why: &str) -> f32 {
+///
+/// With no pointer on it the knob shows `stick` instead — how far a game
+/// controller's own control for this is being pushed — so that this is the one
+/// place to see what the camera is being asked for, whichever hand is asking.
+pub fn rocker(ui: &mut Ui, marks: &Marks<'_>, live: bool, why: &str, stick: f32) -> f32 {
     ui.add_enabled_ui(live, |ui| {
         ui.horizontal(|ui| {
             ui.label(marks.label);
             end(ui, marks.ends.0, marks.tooltips.0, why);
-            let deflection = track(ui, marks.label, live, why);
+            let deflection = track(ui, marks.label, live, why, stick);
             end(ui, marks.ends.1, marks.tooltips.1, why);
             deflection
         })
@@ -55,7 +59,7 @@ fn end(ui: &mut Ui, mark: &str, tooltip: &str, why: &str) {
 }
 
 /// The track and its knob, without the marks around them.
-fn track(ui: &mut Ui, label: &str, live: bool, why: &str) -> f32 {
+fn track(ui: &mut Ui, label: &str, live: bool, why: &str, stick: f32) -> f32 {
     let text = ui.text_style_height(&egui::TextStyle::Body);
     let thickness = text * TRACK_THICKNESS;
     let sense = if live {
@@ -67,12 +71,16 @@ fn track(ui: &mut Ui, label: &str, live: bool, why: &str) -> f32 {
 
     let center = rect.center();
     let reach = rect.width() / 2.0;
-    let deflection = match response.interact_pointer_pos() {
+    let pushed = match response.interact_pointer_pos() {
         Some(pos) if response.is_pointer_button_down_on() => {
-            ((pos.x - center.x) / reach).clamp(-1.0, 1.0)
+            Some(((pos.x - center.x) / reach).clamp(-1.0, 1.0))
         }
-        _ => 0.0,
+        _ => None,
     };
+    // What this rocker is asking for, and where its knob is: the same thing
+    // under the pointer, but a stick is only ever being shown here.
+    let deflection = pushed.unwrap_or(0.0);
+    let shown = pushed.unwrap_or_else(|| stick.clamp(-1.0, 1.0));
 
     let visuals = ui.visuals();
     let knob_color = if live {
@@ -97,7 +105,7 @@ fn track(ui: &mut Ui, label: &str, live: bool, why: &str) -> f32 {
         hairline,
     );
     painter.circle_filled(
-        pos2(center.x + deflection * reach, center.y),
+        pos2(center.x + shown * reach, center.y),
         thickness * KNOB / 2.0,
         knob_color,
     );
@@ -105,7 +113,7 @@ fn track(ui: &mut Ui, label: &str, live: bool, why: &str) -> f32 {
     // A hand-painted control is invisible to a screen reader unless it says
     // what it is; a slider is exactly what this behaves like, so it says so —
     // and that is also how a test finds it.
-    response.widget_info(|| egui::WidgetInfo::slider(live, f64::from(deflection), label));
+    response.widget_info(|| egui::WidgetInfo::slider(live, f64::from(shown), label));
     response.on_hover_text(why);
     deflection
 }
@@ -113,7 +121,10 @@ fn track(ui: &mut Ui, label: &str, live: bool, why: &str) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use egui_kittest::{Harness, kittest::Queryable};
+    use egui_kittest::{
+        Harness,
+        kittest::{NodeT, Queryable},
+    };
     use std::cell::Cell;
 
     fn zoom_marks() -> Marks<'static> {
@@ -129,7 +140,7 @@ mod tests {
     fn deflection_after(live: bool, push: impl Fn(&mut Harness<'_, ()>, egui::Rect)) -> f32 {
         let reported = Cell::new(f32::NAN);
         let mut harness = Harness::new_ui(|ui| {
-            reported.set(rocker(ui, &zoom_marks(), live, "not just now"));
+            reported.set(rocker(ui, &zoom_marks(), live, "not just now", 0.0));
         });
         harness.run();
 
@@ -176,6 +187,43 @@ mod tests {
             near < far,
             "further out should ask for more ({near}, {far})"
         );
+    }
+
+    /// Where the knob is drawn while a stick is pushing this rocker: the track
+    /// reports it as the slider position it looks like, which is both what the
+    /// eye sees and what a screen reader would read out.
+    fn knob_showing(stick: f32) -> f64 {
+        let mut harness = Harness::new_ui(move |ui| {
+            rocker(ui, &zoom_marks(), true, "not just now", stick);
+        });
+        harness.run();
+        harness
+            .get_all_by_role(egui::accesskit::Role::Slider)
+            .next()
+            .expect("the rocker should offer a track")
+            .accesskit_node()
+            .numeric_value()
+            .expect("a slider should say where it is")
+    }
+
+    #[test]
+    fn the_knob_shows_a_stick_pushing_this_rocker() {
+        assert_eq!(knob_showing(0.0), 0.0);
+        assert!((knob_showing(0.6) - 0.6).abs() < 0.001);
+        assert!((knob_showing(-1.0) + 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn a_stick_shown_on_a_rocker_is_not_the_rocker_asking_for_it() {
+        // The stick reaches the camera by its own path; a rocker that also
+        // asked for what it is only showing would be asking twice.
+        let asked = Cell::new(f32::NAN);
+        Harness::new_ui(|ui| {
+            asked.set(rocker(ui, &zoom_marks(), true, "not just now", 1.0));
+        })
+        .run();
+
+        assert_eq!(asked.get(), 0.0);
     }
 
     #[test]

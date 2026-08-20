@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 eframe = "0.35.0"
 egui = "0.35.0"
+gilrs = "0.11.2"
 grafton-visca = { version = "1.0.0", features = ["transport-serial"] }
 viscous = { version = "0.1.0", path = ".." }
 

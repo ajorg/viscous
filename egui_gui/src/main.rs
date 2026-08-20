@@ -10,21 +10,24 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod joystick;
+mod pad;
 mod rocker;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 use egui::{Key, TextWrapMode, Ui, Vec2, vec2};
+use pad::Controller;
 use viscous::{
     config,
     connection::{self, Target, format_camera, format_version},
     drives::Drives,
     focus::FocusDrive,
+    gamepad::{Gamepad, Pad, Press},
     keymap::{FAST_KEY_DEFLECTION, KEY_DEFLECTION},
     pan_tilt::{self, Velocity},
     session::{self, POLL_INTERVAL, QUIESCENCE_INTERVAL, RETRY_INTERVAL},
@@ -48,6 +51,13 @@ const PRESETS: u8 = 6;
 /// How many titles to keep on hand. The camera holds one at a time; these are
 /// the ones an operator switches between during a session.
 const TITLES: u8 = 3;
+
+/// How often to draw a frame while a controller is plugged in.
+///
+/// A stick is read where a frame is drawn, so how often the window draws is how
+/// often the sticks are noticed — and a hand that moves a stick expects the
+/// shot to move with it, not a tenth of a second later.
+const CONTROLLER_INTERVAL: Duration = Duration::from_millis(16);
 
 /// A line of feedback for the operator, and whether it reports a failure —
 /// the one kind that's worth colouring, since it's the one that needs looking
@@ -170,6 +180,17 @@ struct App {
     pan_tilt: Velocity,
     zoom: Option<ZoomDrive>,
     focus: Option<FocusDrive>,
+    /// Where to read a game controller, when this platform has anywhere to read
+    /// one, and enough memory of the last reading to tell a press from a hold.
+    controller: Option<Box<dyn Controller>>,
+    gamepad: Gamepad,
+    /// Where the controller's sticks and triggers were when this frame started,
+    /// which the pad and the rockers draw themselves at — so there is one place
+    /// to watch the camera being driven, whatever is driving it.
+    stick: Pad,
+    /// Whether there was a controller to read last frame, which decides how
+    /// soon the next frame is asked for.
+    in_hand: bool,
 }
 
 impl Default for App {
@@ -196,6 +217,10 @@ impl Default for App {
             pan_tilt: Velocity::STOP,
             zoom: None,
             focus: None,
+            controller: None,
+            gamepad: Gamepad::default(),
+            stick: Pad::default(),
+            in_hand: false,
         }
     }
 }
@@ -521,16 +546,26 @@ impl App {
         // controls that came and went would resize the window under the hand
         // reaching for them.
         let live = !self.asleep();
+        // Read before anything is drawn, so the pad and the rockers show where
+        // the controller is now rather than where it was a frame ago.
+        let (held, pressed) = self.controller_input();
+        let stick = self.stick;
         let mut pointed = Drives::STOPPED;
         ui.horizontal(|ui| {
             let drives_height = ui
                 .vertical(|ui| {
                     self.pad_size = self.pad_size_in(ui);
-                    pointed.pan_tilt =
-                        joystick::pan_tilt_pad(ui, self.pad_size, live, STANDBY_HINT);
+                    pointed.pan_tilt = joystick::pan_tilt_pad(
+                        ui,
+                        self.pad_size,
+                        live,
+                        STANDBY_HINT,
+                        vec2(stick.left_stick.0, stick.left_stick.1),
+                    );
 
                     space(ui, 2.0);
-                    (pointed.zoom, pointed.focus) = drive_rockers(ui, live, self.auto_focusing());
+                    (pointed.zoom, pointed.focus) =
+                        drive_rockers(ui, live, self.auto_focusing(), &stick);
 
                     space(ui, 1.0);
                     ui.add_enabled_ui(live, |ui| self.draw_camera_buttons(ui));
@@ -552,7 +587,8 @@ impl App {
         // The pointer wins where both are asking at once: a hand on the mouse
         // is aiming at a particular shot, and a key that was never released
         // (a window that lost focus mid-drive, say) shouldn't override it.
-        self.apply_drives(pointed.or(self.keyboard_drives(ui)));
+        self.apply_drives(pointed.or(self.keyboard_drives(ui)).or(held));
+        self.apply_presses(&pressed);
         if let Some(preset) = keyboard_preset(ui).filter(|_| live) {
             self.send_intent(Intent::RecallPreset(preset));
         }
@@ -639,21 +675,72 @@ impl App {
     /// Nothing, while a description field has the keyboard: a "1" typed there
     /// is a digit, not a preset, and an arrow key is a cursor.
     fn keyboard_drives(&self, ui: &Ui) -> Drives {
-        // Nothing either, while the camera is asleep: the pad and the rockers
-        // are drawn dead, and keys that still drove would be disagreeing with
-        // what the window is showing.
-        if typing(ui) || self.asleep() {
+        if typing(ui) {
             return Drives::STOPPED;
         }
-        let mut drives =
-            ui.input(|input| held_drives(|key| input.key_down(key), input.modifiers.shift));
-        // The focus buttons are drawn disabled while the camera focuses for
-        // itself; the focus keys have to agree with them, or one of the two
-        // would be lying about what the camera will do.
-        if self.auto_focusing() {
-            drives.focus = None;
+        let held = ui.input(|input| held_drives(|key| input.key_down(key), input.modifiers.shift));
+        self.drivable(held)
+    }
+
+    /// What the game controller is asking for: the drives to hold for as long
+    /// as its sticks are held, and whatever was just pressed on it.
+    ///
+    /// A stick keeps driving while a description is being typed, where a key
+    /// doesn't: it is a control of its own, like the on-screen pad, and not
+    /// something a text field can swallow.
+    fn controller_input(&mut self) -> (Drives, Vec<Press>) {
+        let read = self
+            .controller
+            .as_mut()
+            .and_then(|controller| controller.poll());
+        self.in_hand = read.is_some();
+        self.stick = read.unwrap_or_default();
+        let Some(pad) = read else {
+            return (Drives::STOPPED, Vec::new());
+        };
+        let (drives, pressed) = self.gamepad.update(pad);
+        (self.drivable(drives), pressed)
+    }
+
+    /// A set of drives with whatever the camera won't take dropped out of it,
+    /// so that no control asks for what the window is drawn as refusing.
+    fn drivable(&self, drives: Drives) -> Drives {
+        // Nothing at all while the camera is asleep: the pad and the rockers
+        // are drawn dead, and anything that still drove would be disagreeing
+        // with what the window is showing.
+        if self.asleep() {
+            return Drives::STOPPED;
         }
-        drives
+        Drives {
+            // The focus buttons are drawn disabled while the camera focuses
+            // for itself; the other focus controls have to agree with them, or
+            // one of the two would be lying about what the camera will do.
+            focus: drives.focus.filter(|_| !self.auto_focusing()),
+            ..drives
+        }
+    }
+
+    /// Does whatever was just pressed on the controller — the commands that are
+    /// given once, as against the drives that are held.
+    fn apply_presses(&mut self, pressed: &[Press]) {
+        let live = !self.asleep();
+        for press in pressed {
+            match press {
+                // Not gated on `live`: this is the way out of standby, as the
+                // P key and the switch beside the lamp are.
+                Press::TogglePower => {
+                    let on = self.camera_state.is_none_or(|state| !state.power_on);
+                    self.send_intent(Intent::SetPower(on));
+                }
+                _ if !live => {}
+                Press::Recall(preset) => self.send_intent(Intent::RecallPreset(*preset)),
+                Press::Mark(preset) => self.send_intent(Intent::SavePreset(*preset)),
+                Press::Home => self.send_intent(Intent::Home),
+                Press::ToggleAutoFocus => {
+                    self.send_intent(Intent::SetAutoFocus(!self.auto_focusing()));
+                }
+            }
+        }
     }
 
     /// The preset slots: go to one, describe it, or store where the camera is
@@ -859,6 +946,7 @@ fn drive_rockers(
     ui: &mut Ui,
     live: bool,
     auto_focusing: bool,
+    stick: &Pad,
 ) -> (Option<ZoomDrive>, Option<FocusDrive>) {
     let zoom = rocker::rocker(
         ui,
@@ -872,6 +960,7 @@ fn drive_rockers(
         },
         live,
         STANDBY_HINT,
+        stick.right_stick.1,
     );
     // Drawn dead rather than left to do nothing, since a camera focusing for
     // itself ignores it; the toggle that revives it is just below. A sleeping
@@ -889,6 +978,7 @@ fn drive_rockers(
         },
         live && !auto_focusing,
         if live { AUTO_FOCUS_HINT } else { STANDBY_HINT },
+        stick.focus_deflection(),
     );
     (
         ZoomDrive::from_deflection(zoom),
@@ -994,6 +1084,13 @@ fn draw_key_help(ui: &mut Ui) {
     ui.small("Arrows pan and tilt, [ ] or PgUp/PgDn zoom, , and . focus");
     ui.small("Shift on any of those drives at full speed");
     ui.small("Keys 1-6 go to presets, f switches auto focus, p switches power");
+    // Always said, whether or not one is plugged in: a controller that turns
+    // out to be silent is worth being able to tell from one nobody knew this
+    // window would take — and the pad and rockers follow the sticks, so what
+    // this promises can be checked at a glance.
+    ui.small("A controller drives too: sticks pan/tilt and zoom, triggers focus");
+    ui.small("A/B/X/Y and the bumpers are presets 1-6, Start and one marks it");
+    ui.small("Stick clicks are Home and auto focus, Start+Back switches power");
 }
 
 /// Opens a gap of `gaps` of the style's own spacing between widgets.
@@ -1059,8 +1156,14 @@ impl eframe::App for App {
         self.draw(ui);
 
         // Keep polling for worker results / the debounced state query at
-        // the same cadence the session loop's own event poll uses.
-        ui.ctx().request_repaint_after(POLL_INTERVAL);
+        // the same cadence the session loop's own event poll uses — and far
+        // more often than that while there is a stick to read, since nothing
+        // wakes the window when one moves.
+        ui.ctx().request_repaint_after(if self.in_hand {
+            CONTROLLER_INTERVAL
+        } else {
+            POLL_INTERVAL
+        });
     }
 
     fn on_exit(&mut self) {
@@ -1082,7 +1185,11 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "Viscous",
         options,
-        Box::new(|_cc| Ok(Box::new(App::with_config(config::default_path().ok())))),
+        Box::new(|_cc| {
+            let mut app = App::with_config(config::default_path().ok());
+            app.controller = pad::Attached::open().map(|attached| Box::new(attached) as Box<_>);
+            Ok(Box::new(app))
+        }),
     )
 }
 
@@ -1090,8 +1197,14 @@ fn main() -> eframe::Result {
 mod tests {
     use super::*;
     use egui::{Pos2, Rect, ViewportCommand};
-    use egui_kittest::{Harness, kittest::Queryable};
-    use grafton_visca::{camera::PanTiltPosition, types::FocusPosition, types::ZoomPosition};
+    use egui_kittest::{
+        Harness,
+        kittest::{NodeT, Queryable},
+    };
+    use grafton_visca::{
+        camera::PanTiltPosition, command::PanTiltDirection, types::FocusPosition,
+        types::ZoomPosition,
+    };
     use viscous::{focus::FocusDirection, zoom::ZoomDirection};
 
     /// An app already connected to a camera, plus the receiving end of the
@@ -1867,6 +1980,168 @@ mod tests {
             vec![Intent::SetAutoFocus(false)],
             "an auto focusing camera should be offered manual focus back"
         );
+    }
+
+    /// A game controller held in one position for as long as a test needs it.
+    struct Held(Pad);
+
+    impl Controller for Held {
+        fn poll(&mut self) -> Option<Pad> {
+            Some(self.0)
+        }
+    }
+
+    /// What one frame with a controller held like `pad` asks of a camera in
+    /// `state` — the whole path, from the reading through the mapping to the
+    /// intents that go down the wire.
+    fn controller_asks(state: CameraState, pad: Pad) -> Vec<Intent> {
+        let (mut app, sent) = connected_app(Some(state));
+        app.controller = Some(Box::new(Held(pad)));
+        let mut harness = ui_harness(app);
+        harness.run();
+
+        sent.try_iter().collect()
+    }
+
+    /// The same, of a camera that is awake and focusing by hand.
+    fn controller_asks_awake(pad: Pad) -> Vec<Intent> {
+        controller_asks(camera_state(true, false), pad)
+    }
+
+    /// A controller with `set` done to its buttons and nothing else touched.
+    fn pressing(set: fn(&mut viscous::gamepad::Buttons)) -> Pad {
+        let mut pad = Pad::default();
+        set(&mut pad.buttons);
+        pad
+    }
+
+    #[test]
+    fn a_stick_on_the_controller_drives_the_camera() {
+        let intents = controller_asks_awake(Pad {
+            left_stick: (1.0, 0.0),
+            ..Pad::default()
+        });
+
+        let panning = intents.iter().any(|intent| {
+            matches!(intent, Intent::DrivePanTilt(velocity)
+                if velocity.direction == PanTiltDirection::Right)
+        });
+        assert!(panning, "the stick should pan: {intents:?}");
+    }
+
+    #[test]
+    fn a_button_on_the_controller_goes_to_its_preset() {
+        assert!(
+            controller_asks_awake(pressing(|buttons| buttons.south = true))
+                .contains(&Intent::RecallPreset(1)),
+        );
+    }
+
+    #[test]
+    fn start_and_a_button_stores_the_shot_instead_of_going_to_it() {
+        let intents = controller_asks_awake(pressing(|buttons| {
+            buttons.start = true;
+            buttons.south = true;
+        }));
+
+        assert!(intents.contains(&Intent::SavePreset(1)));
+        assert!(!intents.contains(&Intent::RecallPreset(1)));
+    }
+
+    #[test]
+    fn the_stick_clicks_send_the_camera_home_and_switch_focus_mode() {
+        assert!(
+            controller_asks_awake(pressing(|buttons| buttons.left_stick = true))
+                .contains(&Intent::Home)
+        );
+        assert!(
+            controller_asks_awake(pressing(|buttons| buttons.right_stick = true))
+                .contains(&Intent::SetAutoFocus(true))
+        );
+    }
+
+    #[test]
+    fn the_centre_buttons_together_switch_the_power() {
+        let combo = pressing(|buttons| {
+            buttons.start = true;
+            buttons.back = true;
+        });
+
+        assert!(controller_asks_awake(combo).contains(&Intent::SetPower(false)));
+        // The way back out of standby, where nothing else on the controller
+        // reaches the camera.
+        assert_eq!(
+            controller_asks(camera_state(false, false), combo),
+            vec![Intent::SetPower(true)]
+        );
+    }
+
+    #[test]
+    fn a_sleeping_camera_takes_nothing_else_from_the_controller() {
+        let asleep = camera_state(false, false);
+        let pad = Pad {
+            left_stick: (1.0, 1.0),
+            right_stick: (0.0, 1.0),
+            right_trigger: 1.0,
+            ..pressing(|buttons| buttons.south = true)
+        };
+
+        assert!(
+            controller_asks(asleep, pad).is_empty(),
+            "the controls are drawn dead; the stick has to agree with them"
+        );
+    }
+
+    #[test]
+    fn the_triggers_stay_out_of_a_cameras_way_while_it_focuses_itself() {
+        let pad = Pad {
+            right_trigger: 1.0,
+            ..Pad::default()
+        };
+
+        assert!(
+            controller_asks(camera_state(true, true), pad).is_empty(),
+            "the focus rocker is drawn dead while the camera focuses itself"
+        );
+        assert!(
+            !controller_asks_awake(pad).is_empty(),
+            "and live again once it stops"
+        );
+    }
+
+    /// Where the rockers are drawn, in the order they are drawn in: zoom, then
+    /// focus. They report themselves as sliders, so this is what the eye sees
+    /// and what a screen reader would read out.
+    fn rocker_knobs(pad: Pad) -> Vec<f64> {
+        let (mut app, _sent) = connected_app(Some(camera_state(true, false)));
+        app.controller = Some(Box::new(Held(pad)));
+        let mut harness = ui_harness(app);
+        harness.run();
+
+        harness
+            .get_all_by_role(egui::accesskit::Role::Slider)
+            .map(|slider| {
+                slider
+                    .accesskit_node()
+                    .numeric_value()
+                    .expect("a rocker should say where it is")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_rockers_show_what_the_controller_is_doing_to_them() {
+        // Feedback for the hand on the controller, which is otherwise driving
+        // a camera through a window that never moves.
+        assert_eq!(rocker_knobs(Pad::default()), vec![0.0, 0.0]);
+
+        let pushed = rocker_knobs(Pad {
+            right_stick: (0.0, 0.5),
+            left_trigger: 1.0,
+            ..Pad::default()
+        });
+        assert!((pushed[0] - 0.5).abs() < 0.001, "zoom: {pushed:?}");
+        assert!((pushed[1] + 1.0).abs() < 0.001, "focus: {pushed:?}");
     }
 
     #[test]

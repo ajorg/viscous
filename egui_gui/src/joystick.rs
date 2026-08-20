@@ -47,6 +47,16 @@ fn clamp_to_radius(offset: Vec2, radius: f32) -> Vec2 {
     }
 }
 
+/// Where the puck sits to show a game controller's stick: the same offset the
+/// pointer would be holding it at to ask for the same drive, with screen y
+/// flipped back, since a stick pushed up reads positive.
+///
+/// Clamped like a drag, so a stick pushed into its corners — where the two axes
+/// together reach past the circle — stays on the pad it belongs to.
+fn offset_for_stick(stick: Vec2, radius: f32) -> Vec2 {
+    clamp_to_radius(vec2(stick.x, -stick.y) * radius, radius)
+}
+
 /// The smallest pad the given `ui` should draw: a fixed number of lines of its
 /// own body text, so it scales with the interface rather than with the display.
 pub fn least_pad_size(ui: &Ui) -> f32 {
@@ -60,7 +70,15 @@ pub fn least_pad_size(ui: &Ui) -> f32 {
 /// The puck's position is derived from the live pointer state rather than
 /// remembered between frames: "let go" is exactly "no pointer button held on
 /// this widget", which is also precisely when the camera should stop.
-pub fn pan_tilt_pad(ui: &mut Ui, size: f32, live: bool, why: &str) -> Velocity {
+///
+/// With no pointer on it the puck shows `stick` instead — where a game
+/// controller's stick is being held, as fractions of full deflection, positive
+/// being right and up. The pad is then a display: one place to see the pan and
+/// tilt being asked for, whichever hand is asking. Where the stick is shown
+/// even when the pad isn't `live`, in the dead colour the rest of it is drawn
+/// in: that a stick is answering is worth seeing whatever the camera is doing
+/// about it.
+pub fn pan_tilt_pad(ui: &mut Ui, size: f32, live: bool, why: &str, stick: Vec2) -> Velocity {
     let radius = size / 2.0;
     let sense = if live {
         Sense::click_and_drag()
@@ -70,10 +88,13 @@ pub fn pan_tilt_pad(ui: &mut Ui, size: f32, live: bool, why: &str) -> Velocity {
     let (rect, response) = ui.allocate_exact_size(vec2(size, size), sense);
     let center = rect.center();
 
-    let offset = match response.interact_pointer_pos() {
-        Some(pos) if response.is_pointer_button_down_on() => clamp_to_radius(pos - center, radius),
-        _ => Vec2::ZERO,
+    let dragged = match response.interact_pointer_pos() {
+        Some(pos) if response.is_pointer_button_down_on() => {
+            Some(clamp_to_radius(pos - center, radius))
+        }
+        _ => None,
     };
+    let offset = dragged.unwrap_or_else(|| offset_for_stick(stick, radius));
 
     let visuals = ui.visuals();
     let track_color = visuals.extreme_bg_color;
@@ -124,7 +145,10 @@ pub fn pan_tilt_pad(ui: &mut Ui, size: f32, live: bool, why: &str) -> Velocity {
         .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Other, live, "Pan and tilt"));
     response.on_hover_text(why);
 
-    velocity_for_offset(offset, radius)
+    // Only the pointer's own drag is asked for here; what the stick asks for
+    // reaches the camera by its own path, and returning it too would have the
+    // pad ask for it a second time.
+    velocity_for_offset(dragged.unwrap_or(Vec2::ZERO), radius)
 }
 
 #[cfg(test)]
@@ -221,5 +245,45 @@ mod tests {
     fn dragging_past_the_edge_is_clamped_to_it() {
         assert_eq!(clamp_to_radius(vec2(500.0, 0.0), RADIUS), vec2(RADIUS, 0.0));
         assert_eq!(clamp_to_radius(vec2(10.0, 0.0), RADIUS), vec2(10.0, 0.0));
+    }
+
+    #[test]
+    fn the_puck_shows_a_stick_where_a_drag_asking_the_same_would_be() {
+        // A stick pushed up is drawn up the screen, which is downward in the
+        // numbers, and the drive it stands for is the one that drag asks for.
+        let up = offset_for_stick(vec2(0.0, 1.0), RADIUS);
+
+        assert_eq!(up, vec2(0.0, -RADIUS));
+        assert_eq!(
+            velocity_for_offset(up, RADIUS).direction,
+            PanTiltDirection::Up
+        );
+        assert_eq!(
+            offset_for_stick(vec2(-1.0, 0.0), RADIUS),
+            vec2(-RADIUS, 0.0)
+        );
+    }
+
+    #[test]
+    fn a_stick_in_its_corner_still_lands_on_the_pad() {
+        let corner = offset_for_stick(vec2(1.0, 1.0), RADIUS);
+
+        assert!(
+            (corner.length() - RADIUS).abs() < 0.001,
+            "the corner should sit on the edge, not past it: {corner:?}"
+        );
+    }
+
+    #[test]
+    fn a_stick_shown_on_the_pad_is_not_the_pad_asking_for_it() {
+        // The stick reaches the camera by its own path; a pad that also asked
+        // for what it is only showing would be asking twice.
+        let asked = Cell::new(Velocity::STOP);
+        Harness::new_ui(|ui| {
+            asked.set(pan_tilt_pad(ui, 200.0, true, "", vec2(1.0, 1.0)));
+        })
+        .run();
+
+        assert!(asked.get().is_stop());
     }
 }
