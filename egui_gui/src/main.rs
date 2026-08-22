@@ -1237,12 +1237,28 @@ impl eframe::App for App {
     }
 }
 
+/// The logo, compiled in rather than read from beside the executable: what
+/// gets copied onto the machine that runs this is one file, and an icon that
+/// lives in a second one is an icon that goes missing.
+const LOGO: &[u8] = include_bytes!("../../viscous.png");
+
+/// The logo decoded for the window to wear — its title bar, its taskbar
+/// button, and whatever else the desktop puts a window's own icon on.
+///
+/// Windows takes the icon of a program that *isn't* running from the
+/// executable's resources instead, which is `build.rs`'s job.
+fn window_icon() -> egui::IconData {
+    eframe::icon_data::from_png_bytes(LOGO).expect("the logo should be a readable PNG")
+}
+
 fn main() -> eframe::Result {
     // Born hidden, with no size of its own: the first frame measures the
     // layout, resizes the window to fit it and only then shows it, so nothing
     // here has to guess at a size the contents already know.
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_visible(false),
+        viewport: egui::ViewportBuilder::default()
+            .with_visible(false)
+            .with_icon(window_icon()),
         ..Default::default()
     };
     eframe::run_native(
@@ -1600,6 +1616,22 @@ mod tests {
         assert!(
             sent.try_iter().next().is_none(),
             "a field being typed into owns the keyboard"
+        );
+    }
+
+    #[test]
+    fn the_window_wears_the_logo() {
+        let icon = window_icon();
+
+        assert!(icon.width > 0 && icon.height == icon.width, "a square logo");
+        assert_eq!(
+            icon.rgba.len(),
+            (icon.width * icon.height * 4) as usize,
+            "four bytes a pixel, so the window has something to draw"
+        );
+        assert!(
+            icon.rgba.chunks(4).any(|pixel| pixel[3] > 0),
+            "a logo of nothing but transparency would be no logo at all"
         );
     }
 

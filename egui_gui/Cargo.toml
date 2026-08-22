@@ -26,5 +26,10 @@ gilrs = "0.11.2"
 grafton-visca = { version = "1.0.0", features = ["transport-serial"] }
 viscous = { version = "0.1.0", path = ".." }
 
+[build-dependencies]
+ico = "0.5.0"
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+winresource = "0.1.31"
+
 [dev-dependencies]
 egui_kittest = "0.35.0"
