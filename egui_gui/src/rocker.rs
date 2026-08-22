@@ -114,7 +114,10 @@ fn track(ui: &mut Ui, label: &str, live: bool, why: &str, stick: f32) -> f32 {
     // what it is; a slider is exactly what this behaves like, so it says so —
     // and that is also how a test finds it.
     response.widget_info(|| egui::WidgetInfo::slider(live, f64::from(shown), label));
-    response.on_hover_text(why);
+    // Only while it is dead: `why` says what is stopping this rocker working,
+    // which is no answer at all on one that is working. The ends are what say
+    // which way to push it.
+    response.on_disabled_hover_text(why);
     deflection
 }
 
@@ -224,6 +227,40 @@ mod tests {
         .run();
 
         assert_eq!(asked.get(), 0.0);
+    }
+
+    /// Whether "not just now" — the reason a dead rocker gives — is on screen
+    /// after the pointer has rested on the track of a rocker that is `live`.
+    fn hovering_the_track_explains_itself(live: bool) -> bool {
+        let mut harness = Harness::new_ui(move |ui| {
+            rocker(ui, &zoom_marks(), live, "not just now", 0.0);
+        });
+        harness.run();
+
+        harness
+            .get_all_by_role(egui::accesskit::Role::Slider)
+            .next()
+            .expect("the rocker should offer a track")
+            .hover();
+        harness.run();
+
+        harness.query_by_label("not just now").is_some()
+    }
+
+    #[test]
+    fn a_working_rocker_does_not_give_a_reason_it_is_not_working() {
+        assert!(
+            !hovering_the_track_explains_itself(true),
+            "a rocker that drives the camera shouldn't say why it can't"
+        );
+    }
+
+    #[test]
+    fn a_dead_rocker_says_why_where_the_hand_lands() {
+        assert!(
+            hovering_the_track_explains_itself(false),
+            "the track is the part you reach for, so it has to be the part that explains"
+        );
     }
 
     #[test]

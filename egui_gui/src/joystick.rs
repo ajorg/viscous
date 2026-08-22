@@ -143,7 +143,13 @@ pub fn pan_tilt_pad(ui: &mut Ui, size: f32, live: bool, why: &str, stick: Vec2) 
     // what it is — and this is also how a test finds it.
     response
         .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Other, live, "Pan and tilt"));
-    response.on_hover_text(why);
+    // Only while it is dead: `why` says what is stopping this pad working, and
+    // one that is working has no such thing to report. (Said here rather than
+    // through egui's own disabled-hover text because the pad is painted by
+    // hand — nothing above it has been told it is disabled.)
+    if !live {
+        response.on_hover_text(why);
+    }
 
     // Only the pointer's own drag is asked for here; what the stick asks for
     // reaches the camera by its own path, and returning it too would have the
@@ -155,7 +161,7 @@ pub fn pan_tilt_pad(ui: &mut Ui, size: f32, live: bool, why: &str, stick: Vec2) 
 mod tests {
     use super::*;
     use egui::FontId;
-    use egui_kittest::Harness;
+    use egui_kittest::{Harness, kittest::Queryable};
     use grafton_visca::command::PanTiltDirection;
     use std::cell::Cell;
 
@@ -271,6 +277,40 @@ mod tests {
         assert!(
             (corner.length() - RADIUS).abs() < 0.001,
             "the corner should sit on the edge, not past it: {corner:?}"
+        );
+    }
+
+    /// Whether "not just now" — the reason a dead pad gives — is on screen
+    /// after the pointer has come to rest on a pad that is `live`.
+    fn hovering_the_pad_explains_itself(live: bool) -> bool {
+        let mut harness = Harness::new_ui(move |ui| {
+            pan_tilt_pad(ui, 200.0, live, "not just now", Vec2::ZERO);
+        });
+        harness.run();
+
+        harness
+            .get_all_by_label("Pan and tilt")
+            .next()
+            .expect("the pad should say what it is")
+            .hover();
+        harness.run();
+
+        harness.query_by_label("not just now").is_some()
+    }
+
+    #[test]
+    fn a_working_pad_does_not_give_a_reason_it_is_not_working() {
+        assert!(
+            !hovering_the_pad_explains_itself(true),
+            "a pad that drives the camera shouldn't say why it can't"
+        );
+    }
+
+    #[test]
+    fn a_dead_pad_says_why_when_the_pointer_lands_on_it() {
+        assert!(
+            hovering_the_pad_explains_itself(false),
+            "the pad is the first thing reached for, so it has to explain itself"
         );
     }
 
