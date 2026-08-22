@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 use egui::{Key, TextWrapMode, Ui, Vec2, vec2};
+use grafton_visca::Error;
 use pad::Controller;
 use viscous::{
     config,
@@ -145,6 +146,10 @@ struct App {
     /// them the camera was last told to show.
     titles: BTreeMap<u8, String>,
     shown_title: Option<u8>,
+    /// Whether the camera has a title command at all, until it says otherwise
+    /// by refusing one. Assumed rather than looked up: a model table would
+    /// have to be kept, and the camera already knows.
+    titles_supported: bool,
     /// The camera that last connected, remembered so the next run opens on it
     /// instead of on whatever this platform's ports are usually called.
     camera: Option<String>,
@@ -206,6 +211,7 @@ impl Default for App {
             preset_labels: BTreeMap::new(),
             titles: BTreeMap::new(),
             shown_title: None,
+            titles_supported: true,
             camera: None,
             config_path: None,
             requested_size: None,
@@ -384,6 +390,21 @@ impl App {
             Outcome::State(Err(_)) => {
                 self.next_query_at = Some(Instant::now() + RETRY_INTERVAL);
                 self.status = Some(Status::ok(session::NO_ANSWER_HINT.to_string()));
+                return;
+            }
+            // A camera that answers a syntax error to a title command hasn't
+            // been sent a bad one — it has no such command. `CAM_Title` was
+            // the EVI-D70 generation's; the cameras after it dropped the
+            // feature and refuse both halves of it. So stop offering what
+            // this camera can't do, and say that rather than quoting the
+            // protocol at whoever ticked the box.
+            Outcome::Done(intent, Err(Error::SyntaxError)) if worker::is_title(*intent) => {
+                self.titles_supported = false;
+                self.shown_title = None;
+                self.status = Some(Status {
+                    text: NO_TITLES_HINT.to_string(),
+                    failed: true,
+                });
                 return;
             }
             // A drive that worked was already visible before its completion
@@ -766,10 +787,14 @@ impl App {
         space(ui, 1.5);
         ui.label("Titles");
         self.draw_titles(ui, live);
-        ui.small(format!(
-            "Up to {} uppercase characters, drawn over the picture",
-            title::LENGTH
-        ));
+        ui.small(if self.titles_supported {
+            format!(
+                "Up to {} uppercase characters, drawn over the picture",
+                title::LENGTH
+            )
+        } else {
+            NO_TITLES_HINT.to_string()
+        });
     }
 
     fn draw_presets(&mut self, ui: &mut Ui, live: bool) {
@@ -815,14 +840,23 @@ impl App {
     /// operator — a name under a speaker, which hymn is being sung — so what
     /// goes out is what the camera can actually draw: twenty characters,
     /// uppercase, from its own character set.
+    ///
+    /// A camera that turns out to have no title command at all leaves the
+    /// boxes drawn but dead, in place, for the same reason standby does: the
+    /// rows the window is sized around shouldn't come and go.
     fn draw_titles(&mut self, ui: &mut Ui, live: bool) {
+        let offered = live && self.titles_supported;
         for number in 1..=TITLES {
             ui.horizontal(|ui| {
                 let mut shown = self.shown_title == Some(number);
                 if ui
-                    .add_enabled(live, egui::Checkbox::new(&mut shown, "Show"))
+                    .add_enabled(offered, egui::Checkbox::new(&mut shown, "Show"))
                     .on_hover_text("Burn this title into the video output")
-                    .on_disabled_hover_text(STANDBY_HINT)
+                    .on_disabled_hover_text(if self.titles_supported {
+                        STANDBY_HINT
+                    } else {
+                        NO_TITLES_HINT
+                    })
                     .changed()
                 {
                     self.show_title(shown.then_some(number));
@@ -992,6 +1026,13 @@ const AUTO_FOCUS_HINT: &str = "Turn off Auto focus to focus by hand";
 /// What to say about any control a sleeping camera would refuse. Points at the
 /// switch rather than at the key, since the switch is right there on screen.
 const STANDBY_HINT: &str = "The camera is in standby \u{2014} switch it on first";
+
+/// What to say once the camera has refused a title.
+///
+/// Names the camera's limit rather than the operator's mistake, because there
+/// was none: `CAM_Title` is an EVI-D70-era command, and a camera made after
+/// it has nothing to draw a caption with.
+const NO_TITLES_HINT: &str = "This camera has no title command";
 
 /// What the button for preset `number` promises, named by what the operator
 /// called the shot rather than only by the number the camera knows it as.
@@ -1602,6 +1643,54 @@ mod tests {
         assert_eq!(
             sent.try_iter().collect::<Vec<_>>(),
             vec![Intent::ShowTitle(false)]
+        );
+    }
+
+    #[test]
+    fn a_camera_that_refuses_a_title_stops_being_offered_one() {
+        let (mut app, sent) = connected_app(Some(camera_state(true, false)));
+        app.titles.insert(1, "Podium".to_string());
+        let mut harness = ui_harness(app);
+
+        show_checkbox(&harness, 1).click();
+        harness.run();
+        let _ = sent.try_iter().count();
+        // Both halves are already on their way when the first is refused.
+        for intent in [
+            Intent::SetTitle(Title::new("Podium")),
+            Intent::ShowTitle(true),
+        ] {
+            harness
+                .state_mut()
+                .apply_outcome(Outcome::Done(intent, Err(Error::SyntaxError)));
+        }
+        harness.run();
+
+        let status = harness.state().status.as_ref().expect("a refusal is news");
+        assert!(status.failed);
+        assert_eq!(status.text, NO_TITLES_HINT);
+        assert_eq!(
+            harness.state().shown_title,
+            None,
+            "nothing is on screen, so no box should be ticked"
+        );
+        show_checkbox(&harness, 1).click();
+        harness.run();
+        assert!(
+            sent.try_iter().next().is_none(),
+            "a camera without the command shouldn't be sent it again"
+        );
+    }
+
+    #[test]
+    fn the_titles_a_camera_cannot_draw_say_so_where_the_length_would_be() {
+        let (mut app, _sent) = connected_app(Some(camera_state(true, false)));
+        app.titles_supported = false;
+        let harness = ui_harness(app);
+
+        assert!(
+            harness.get_all_by_label(NO_TITLES_HINT).next().is_some(),
+            "the reason should be on screen, not only in a hover"
         );
     }
 

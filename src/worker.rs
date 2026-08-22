@@ -107,6 +107,17 @@ pub fn is_drive(intent: Intent) -> bool {
     control(intent).is_some()
 }
 
+/// Whether this intent is one of the title commands, which are the one thing
+/// here that a camera may not have at all.
+///
+/// `CAM_Title` belongs to the EVI-D70 generation and was dropped from the
+/// ones that followed — an EVI-D80 answers a syntax error rather than
+/// ignoring it — so a front end offering titles has to be able to tell that
+/// refusal from any other failure and stop offering them.
+pub fn is_title(intent: Intent) -> bool {
+    matches!(intent, Intent::SetTitle(_) | Intent::ShowTitle(_))
+}
+
 /// Drops every queued drive command that a later one for the same control
 /// has already superseded, leaving everything else in order.
 ///
@@ -458,6 +469,14 @@ mod tests {
     fn coalescing_keeps_a_drive_that_nothing_supersedes_in_place() {
         let batch = [drive_right(), Intent::RecallPreset(1)];
         assert_eq!(coalesced(&batch), batch.to_vec());
+    }
+
+    #[test]
+    fn the_title_commands_are_the_ones_a_camera_may_not_have() {
+        assert!(is_title(Intent::SetTitle(title::Title::new("PODIUM"))));
+        assert!(is_title(Intent::ShowTitle(true)));
+        assert!(!is_title(Intent::RecallPreset(1)));
+        assert!(!is_title(drive_right()));
     }
 
     #[test]
