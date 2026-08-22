@@ -95,9 +95,14 @@ struct Preset {
 }
 
 /// How long a woken camera takes to come up, during which it answers for its
-/// power and nothing else. Real cameras take several seconds; long enough here
-/// to be visible in a client, short enough not to be tedious to sit through.
-const WAKE_TIME: Duration = Duration::from_secs(3);
+/// power and nothing else — and how long its power-on command takes to
+/// complete, since the camera answers that one once it is actually up.
+///
+/// The real EVI-D80 takes about nine seconds, and this used to be three: long
+/// enough to see, short enough not to sit through, and short enough that a
+/// client giving up after five seconds looked like it worked. That is exactly
+/// the bug it was meant to catch, so it is the camera's figure now.
+const WAKE_TIME: Duration = Duration::from_secs(9);
 
 struct CameraSim {
     power_on: bool,
@@ -400,8 +405,9 @@ impl CameraSim {
                 sweep + home
             }
             // Power on / off (standby). Waking is not instant: the camera
-            // acknowledges at once and then spends a few seconds coming up,
-            // answering for its power alone in the meantime.
+            // acknowledges at once, spends a few seconds coming up — answering
+            // for its power alone in the meantime — and only then completes
+            // the command that woke it. Going to sleep is immediate.
             [0x04, 0x00, on @ (0x02 | 0x03)] => {
                 let waking = *on == 0x02 && !self.power_on;
                 self.power_on = *on == 0x02;
@@ -414,7 +420,7 @@ impl CameraSim {
                     self.zoom_rate = 0.0;
                     self.focus_rate = 0.0;
                 }
-                Duration::ZERO
+                if waking { WAKE_TIME } else { Duration::ZERO }
             }
             // Title set: 73 pp <10 bytes>. Part 00 is where the title goes,
             // 01 and 02 are its characters, ten at a time.
