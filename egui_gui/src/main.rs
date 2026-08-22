@@ -1226,7 +1226,10 @@ impl eframe::App for App {
         });
     }
 
-    fn on_exit(&mut self) {
+    // The graphics context comes with the OpenGL backend's version of this
+    // callback, for an app with GPU resources of its own to release. This one
+    // paints through egui and has none.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.stop_all_drives();
         // A description still being typed when the window closes never lost
         // focus, so it would otherwise go unsaved.

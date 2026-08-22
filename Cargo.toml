@@ -8,6 +8,23 @@ edition = "2024"
 description = "A keyboard-driven TUI for controlling a VISCA PTZ camera over serial or TCP"
 license = "0BSD"
 
+# What gets shipped is a single file copied onto a Windows machine by hand, so
+# its size is something the user carries. None of this costs anything the app
+# can feel: a frame of the GUI is laid out and tessellated in about 80µs, which
+# `opt-level = "s"` moves by 4µs against a 16ms budget — the work per frame is
+# a few hundred shapes, and no amount of vectorising them matters.
+#
+# `panic = "abort"` is the one with a behavioural edge: a panic anywhere, the
+# camera worker thread included, now takes the process down instead of quietly
+# leaving a front end talking to a thread that has gone. That is the better of
+# the two, and it happens to be worth ~900KB of unwinding tables.
+[profile.release]
+opt-level = "s"
+strip = true
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
 [dependencies]
 crossterm = "0.29.0"
 directories = "6.0.0"

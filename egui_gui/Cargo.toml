@@ -4,7 +4,23 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-eframe = "0.35.0"
+# eframe's default renderer is wgpu, which brings a whole graphics stack with
+# it — Vulkan, D3D12, Metal and the naga shader compiler — to draw what this
+# window draws: flat triangles and text. `glow` talks to OpenGL directly and
+# costs about a quarter of the binary less. What it asks of the machine is
+# OpenGL 3.3, which any Windows box with its graphics driver installed has;
+# wgpu is the fallback if one ever turns out not to (restore the default
+# features, and drop the parameter from `App::on_exit`).
+#
+# `accesskit` stays: the hand-painted pad and rockers are built to report
+# themselves to a screen reader, and that is what carries it.
+eframe = { version = "0.35.0", default-features = false, features = [
+    "accesskit",
+    "default_fonts",
+    "glow",
+    "wayland",
+    "x11",
+] }
 egui = "0.35.0"
 gilrs = "0.11.2"
 grafton-visca = { version = "1.0.0", features = ["transport-serial"] }
