@@ -9,11 +9,14 @@
 //! `8x 01 04 74 pp FF` shows, hides or clears it.
 
 use std::fmt;
+use std::time::Duration;
 
 use grafton_visca::{
     BlockingClient, CameraId, Error,
     camera::profiles::GenericVisca,
-    command::ViscaCommand,
+    command::{CommandBehavior, InquiryResponseSpec, ViscaCommand},
+    mode::BlockingFutureExt,
+    timeout::{CommandCategory, Deadline},
     transport::{BlockingTransport, HasTransportConfig},
 };
 
@@ -158,6 +161,71 @@ impl ViscaCommand for TitleDisplay {
     }
 }
 
+/// How long to wait for the camera to say whether it has titles.
+///
+/// Deliberately short: this is asked as part of connecting, with the operator
+/// watching, and the camera has just answered a version inquiry over the same
+/// link — one that has nothing to say about titles within two seconds isn't
+/// going to say it in sixty. Running out of time here is not an answer either
+/// way, and costs nothing but a title command sent to a camera that may refuse
+/// it once.
+const ANSWER_TIME: Duration = Duration::from_secs(2);
+
+/// `CAM_TitleDisplayModeInq`, which asks whether the title is currently
+/// showing — and, in doing so, whether there is such a thing as a title here
+/// at all.
+///
+/// What it replies with is of no interest: the front end doesn't show the
+/// camera's title, it sends its own. It is the inquiry rather than one of the
+/// commands because an inquiry changes nothing — a camera that does have the
+/// feature comes through this with whatever title it was holding intact,
+/// where clearing one to find out would have thrown it away.
+struct TitleDisplayInquiry;
+
+impl ViscaCommand for TitleDisplayInquiry {
+    const MAX_SIZE: usize = 5;
+
+    /// The library's shortest category, though [`ANSWER_TIME`] cuts this
+    /// shorter still: nothing about this inquiry is slow, and the sixty
+    /// seconds a hand-written command is given by default are for commands
+    /// that move something.
+    const TIMEOUT_CATEGORY: CommandCategory = CommandCategory::Quick;
+
+    fn write_into(&self, camera_id: CameraId, buffer: &mut [u8]) -> Result<usize, Error> {
+        if buffer.len() < Self::MAX_SIZE {
+            return Err(Error::BufferTooSmall {
+                required: Self::MAX_SIZE,
+                actual: buffer.len(),
+            });
+        }
+        buffer[..5].copy_from_slice(&[camera_id.to_address_byte(), 0x09, 0x04, 0x74, 0xFF]);
+        Ok(Self::MAX_SIZE)
+    }
+
+    fn behavior(&self) -> CommandBehavior {
+        CommandBehavior::Inquiry(InquiryResponseSpec::Raw)
+    }
+}
+
+/// Whether this camera has titles at all, asked of the camera itself.
+///
+/// `CAM_Title` belongs to the EVI-D70 generation; the cameras that followed
+/// dropped the feature, and an EVI-D80 answers a syntax error to every part of
+/// it. A syntax error is the whole of the evidence — it is the protocol's way
+/// of saying it doesn't know the command, and the only refusal that means the
+/// feature is absent rather than momentarily unavailable. Anything else, a
+/// camera that is asleep or busy or silent included, counts as having titles,
+/// because none of those are the camera saying it hasn't.
+pub fn supported<T>(camera: &BlockingClient<GenericVisca, T>) -> bool
+where
+    T: BlockingTransport + HasTransportConfig + 'static,
+{
+    let answer = camera
+        .send_command_with_deadline(&TitleDisplayInquiry, Deadline::from_timeout(ANSWER_TIME))
+        .block();
+    !matches!(answer, Err(Error::SyntaxError))
+}
+
 /// Gives the camera a title to hold, without showing it.
 ///
 /// Three messages, because that's how the camera takes one: its appearance,
@@ -194,7 +262,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use grafton_visca::testing::testkit::{ScriptedBlockingTransport, helpers};
+    use grafton_visca::testing::testkit::{ScriptedBlockingTransport, Step, helpers};
 
     fn scripted_camera(
         acks: usize,
@@ -289,6 +357,49 @@ mod tests {
                 vec![0x81, 0x01, 0x04, 0x74, 0x03, 0xFF],
             ]
         );
+    }
+
+    #[test]
+    fn a_camera_that_answers_the_title_inquiry_has_titles() {
+        let transport = ScriptedBlockingTransport::new(vec![helpers::inquiry_response(
+            vec![0x81, 0x09, 0x04, 0x74, 0xFF],
+            1,
+            // "showing", which is as much as this camera has to say about it.
+            vec![0x90, 0x50, 0x02, 0xFF],
+        )]);
+        let camera = grafton_visca::CameraBuilder::new()
+            .build_blocking::<GenericVisca, _>(transport.clone())
+            .expect("camera should build from a scripted transport");
+
+        assert!(supported(&camera));
+        assert_eq!(transport.sent(), vec![vec![0x81, 0x09, 0x04, 0x74, 0xFF]]);
+    }
+
+    #[test]
+    fn a_camera_that_calls_the_title_inquiry_a_syntax_error_has_no_titles() {
+        let transport = ScriptedBlockingTransport::new(vec![helpers::errors::syntax_error(1)]);
+        let camera = grafton_visca::CameraBuilder::new()
+            .build_blocking::<GenericVisca, _>(transport)
+            .expect("camera should build from a scripted transport");
+
+        assert!(!supported(&camera));
+    }
+
+    #[test]
+    fn a_camera_that_cannot_answer_the_title_inquiry_yet_keeps_its_titles() {
+        // "Not executable" is what a camera in standby says to almost
+        // anything, and it is not the camera saying it has no titles — nor is
+        // silence, or a link that dropped a byte. Only a syntax error means
+        // the command isn't there.
+        let transport = ScriptedBlockingTransport::new(vec![Step::OnSend {
+            matches: None,
+            responses: vec![helpers::not_executable(1)],
+        }]);
+        let camera = grafton_visca::CameraBuilder::new()
+            .build_blocking::<GenericVisca, _>(transport)
+            .expect("camera should build from a scripted transport");
+
+        assert!(supported(&camera));
     }
 
     #[test]

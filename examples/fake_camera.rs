@@ -42,6 +42,10 @@
 //! camera sends the same raw bytes over IP as over RS-232 — right down to the
 //! `0x81` address, since VISCA over IP is fixed at device 1 — so everything
 //! below the transport is shared.
+//!
+//! Passing `--no-titles` as well makes it an EVI-D80 rather than an EVI-D70:
+//! same camera in every other respect, but with no title feature, refusing
+//! every title message with a syntax error the way the real one does.
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
@@ -104,6 +108,10 @@ struct Preset {
 /// the bug it was meant to catch, so it is the camera's figure now.
 const WAKE_TIME: Duration = Duration::from_secs(9);
 
+/// Turns this camera into one of the generation that dropped titles: pass it
+/// alongside the target (`--no-titles tcp://5678`).
+const NO_TITLES_FLAG: &str = "--no-titles";
+
 struct CameraSim {
     power_on: bool,
     /// When the camera will have finished waking, if it is still doing so.
@@ -113,6 +121,11 @@ struct CameraSim {
     /// whether it's currently burned into the video output.
     title: [u8; TITLE_LENGTH],
     title_shown: bool,
+    /// Whether this camera has titles at all. An EVI-D70 does; the EVI-D80
+    /// that followed it dropped the feature and answers a syntax error to
+    /// every part of it, which is a thing a client has to cope with and so a
+    /// thing this camera can be asked to be.
+    titles: bool,
     zoom: u16,
     focus: u16,
     pan: i16,
@@ -185,13 +198,14 @@ fn drive_rate(direction: u8, positive: u8, speed: u8, max_speed: u8) -> f64 {
 }
 
 impl CameraSim {
-    fn new() -> Self {
+    fn new(titles: bool) -> Self {
         Self {
             power_on: true,
             awake_at: None,
             auto_focus: false,
             title: [SPACE; TITLE_LENGTH],
             title_shown: false,
+            titles,
             zoom: 0x0000,
             focus: 0x1000,
             pan: 0,
@@ -279,6 +293,14 @@ impl CameraSim {
         if !self.is_awake_enough_for(body) {
             println!("      (refused: the camera is not awake)");
             return Reply::Immediate(not_executable_reply());
+        }
+        // Not "won't", but "doesn't know what that is": a camera without the
+        // feature can't tell a title message from any other run of bytes, and
+        // says so the same way whether it was asked to set one or merely
+        // asked whether one is showing.
+        if !self.titles && is_title(body) {
+            println!("      (refused: this camera has no title command)");
+            return Reply::Immediate(syntax_error_reply());
         }
 
         match message[1] {
@@ -587,6 +609,18 @@ fn not_executable_reply() -> Vec<u8> {
     vec![0x90, 0x60, 0x41, TERMINATOR]
 }
 
+/// What a camera says to a message it doesn't recognise: VISCA error 0x02,
+/// "syntax error".
+fn syntax_error_reply() -> Vec<u8> {
+    vec![0x90, 0x60, 0x02, TERMINATOR]
+}
+
+/// Whether a message body is one of the title messages — either half of
+/// `CAM_Title`, or the inquiry that asks whether one is showing.
+fn is_title(body: &[u8]) -> bool {
+    matches!(body, [0x04, 0x73 | 0x74, ..])
+}
+
 fn ack_reply(socket: u8) -> Vec<u8> {
     vec![0x90, 0x40 | socket, TERMINATOR]
 }
@@ -846,10 +880,14 @@ fn open_transport(target: Option<&str>) -> io::Result<Box<dyn Transport>> {
 }
 
 fn main() -> io::Result<()> {
-    let target = std::env::args().nth(1);
+    let arguments: Vec<String> = std::env::args().skip(1).collect();
+    let target = arguments
+        .iter()
+        .find(|argument| !argument.starts_with("--"))
+        .cloned();
     let mut transport = open_transport(target.as_deref())?;
 
-    let mut camera = CameraSim::new();
+    let mut camera = CameraSim::new(!arguments.iter().any(|argument| argument == NO_TITLES_FLAG));
     let mut message = Vec::new();
     let mut byte = [0u8; 1];
 

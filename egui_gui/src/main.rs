@@ -104,6 +104,10 @@ struct Worker {
     link: String,
     summary: String,
     details: String,
+    /// Whether this camera answered for its title feature — asked once here,
+    /// while the camera is still ours and before the worker thread has any
+    /// commands of its own to get through.
+    titles: bool,
     intents: Sender<Intent>,
     results: Receiver<Outcome>,
 }
@@ -117,12 +121,17 @@ fn connect(target: &str) -> Result<Worker, String> {
     let (worker_tx, worker_rx) = mpsc::channel::<Intent>();
     let (result_tx, result_rx) = mpsc::channel::<Outcome>();
     let camera = connected.camera;
+    // Asked here rather than through the worker: this is the one question
+    // whose answer decides what the window offers, and it is worth having
+    // before the first frame is drawn rather than a round trip afterwards.
+    let titles = title::supported(&camera);
     thread::spawn(move || worker::run(&camera, &worker_rx, &result_tx));
 
     Ok(Worker {
         link: connected.link,
         summary: format_camera(&connected.version),
         details: format_version(&connected.version),
+        titles,
         intents: worker_tx,
         results: result_rx,
     })
@@ -146,8 +155,10 @@ struct App {
     /// them the camera was last told to show.
     titles: BTreeMap<u8, String>,
     shown_title: Option<u8>,
-    /// Whether the camera has a title command at all, until it says otherwise
-    /// by refusing one. Assumed rather than looked up: a model table would
+    /// Whether the camera has a title command at all. Asked of the camera as
+    /// part of connecting, and asked again by implication every time a title
+    /// is sent: a refusal turns it off too, for the camera that had nothing to
+    /// say the first time. Never looked up from a model table — that would
     /// have to be kept, and the camera already knows.
     titles_supported: bool,
     /// The camera that last connected, remembered so the next run opens on it
@@ -346,6 +357,10 @@ impl App {
                     summary: worker.summary,
                     details: worker.details,
                 };
+                // Per camera, not per run: connecting to a different one is
+                // asking the question again, and its answer replaces the last
+                // camera's.
+                self.titles_supported = worker.titles;
                 self.intents = Some(worker.intents);
                 self.results = Some(worker.results);
                 // Query once up front so the info panel doesn't sit empty
@@ -398,6 +413,10 @@ impl App {
             // feature and refuse both halves of it. So stop offering what
             // this camera can't do, and say that rather than quoting the
             // protocol at whoever ticked the box.
+            //
+            // Connecting asks the same question up front, and this is what
+            // catches the camera that didn't answer it — one that was still
+            // waking, or on a link that dropped the reply.
             Outcome::Done(intent, Err(Error::SyntaxError)) if worker::is_title(*intent) => {
                 self.titles_supported = false;
                 self.shown_title = None;
@@ -1275,6 +1294,7 @@ mod tests {
             link: "COM3 at 9600 baud".to_string(),
             summary: "Sony".to_string(),
             details: "vendor=Sony (0x0020) model=0x040F".to_string(),
+            titles: true,
             intents,
             results,
         }
@@ -1580,6 +1600,15 @@ mod tests {
         );
     }
 
+    /// What the app actually asked the camera to do, leaving out the state
+    /// query that connecting arms — it goes out on the first frame whatever
+    /// else is happening, and says nothing about what was clicked.
+    fn commands(sent: &Receiver<Intent>) -> Vec<Intent> {
+        sent.try_iter()
+            .filter(|intent| *intent != Intent::QueryState)
+            .collect()
+    }
+
     /// The Show checkbox for title `number`, found by position for the same
     /// reason the description fields are: the rows are drawn in order.
     fn show_checkbox<'a>(harness: &'a Harness<'_, App>, number: u8) -> egui_kittest::Node<'a> {
@@ -1679,6 +1708,56 @@ mod tests {
         assert!(
             sent.try_iter().next().is_none(),
             "a camera without the command shouldn't be sent it again"
+        );
+    }
+
+    #[test]
+    fn a_camera_that_says_at_connect_it_has_no_titles_is_never_offered_one() {
+        let (mut app, _sent) = connected_app(Some(camera_state(true, false)));
+        app.titles.insert(1, "Podium".to_string());
+
+        // What connecting to an EVI-D80 comes back with: the camera was asked
+        // and said it has no such command.
+        let (intents, sent) = mpsc::channel();
+        app.poll_connect_result(Ok(Worker {
+            titles: false,
+            intents,
+            ..test_worker()
+        }));
+        let mut harness = ui_harness(app);
+
+        assert!(
+            harness.get_all_by_label(NO_TITLES_HINT).next().is_some(),
+            "the window should say so from the first frame, not after a refusal"
+        );
+        show_checkbox(&harness, 1).click();
+        harness.run();
+        assert!(
+            commands(&sent).is_empty(),
+            "a camera that has already said no shouldn't be asked once for real"
+        );
+    }
+
+    #[test]
+    fn a_camera_that_has_titles_is_offered_them_from_the_start() {
+        let (mut app, _sent) = connected_app(Some(camera_state(true, false)));
+        app.titles.insert(1, "Podium".to_string());
+
+        let (intents, sent) = mpsc::channel();
+        app.poll_connect_result(Ok(Worker {
+            intents,
+            ..test_worker()
+        }));
+        let mut harness = ui_harness(app);
+
+        show_checkbox(&harness, 1).click();
+        harness.run();
+        assert_eq!(
+            commands(&sent),
+            vec![
+                Intent::SetTitle(Title::new("Podium")),
+                Intent::ShowTitle(true)
+            ]
         );
     }
 
