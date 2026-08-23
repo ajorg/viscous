@@ -10,7 +10,7 @@ use viscous::{
     worker,
 };
 
-/// Parses `viscous [--cli] <target>`, returning whether bare CLI mode was
+/// Parses `viscous-tui [--cli] <target>`, returning whether bare CLI mode was
 /// explicitly requested and what to connect to.
 fn parse_args(args: impl Iterator<Item = String>) -> Option<(bool, String)> {
     let mut cli_requested = false;
@@ -27,7 +27,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Option<(bool, String)> {
 
 fn main() -> ExitCode {
     let Some((cli_requested, target)) = parse_args(std::env::args().skip(1)) else {
-        eprintln!("usage: viscous [--cli] <serial-port|tcp://host[:port]>");
+        eprintln!("usage: viscous-tui [--cli] <serial-port|tcp://host[:port]>");
         return ExitCode::FAILURE;
     };
 

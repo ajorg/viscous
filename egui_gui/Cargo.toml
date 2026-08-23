@@ -3,6 +3,19 @@ name = "egui_gui"
 version = "0.1.0"
 edition = "2024"
 
+# The program, under the name it is known by. The package is still named for
+# the toolkit it happens to be built with, which is a fact about this directory
+# and not about what gets copied onto a machine.
+#
+# Its terminal counterpart is `viscous-tui`, built from the crate above. Two
+# files rather than one flag, because a Windows executable chooses its
+# subsystem when it is linked and the two front ends want opposite answers: the
+# GUI is linked for the windows subsystem so that no console box trails it
+# around, and the TUI needs a real console to read keys from in raw mode.
+[[bin]]
+name = "viscous"
+path = "src/main.rs"
+
 [dependencies]
 # eframe's default renderer is wgpu, which brings a whole graphics stack with
 # it — Vulkan, D3D12, Metal and the naga shader compiler — to draw what this

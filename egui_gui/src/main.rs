@@ -1397,7 +1397,16 @@ fn window_icon() -> egui::IconData {
     eframe::icon_data::from_png_bytes(LOGO).expect("the logo should be a readable PNG")
 }
 
-fn main() -> eframe::Result {
+/// What to say when there turns out to be no window to be had: no display, no
+/// OpenGL, an ssh session, a container.
+///
+/// Worth saying rather than leaving the toolkit's own error to speak for
+/// itself, because the answer is a program that is sitting right there — the
+/// same camera control, drawn in the terminal the message is being read in.
+const NO_WINDOW_HINT: &str = "viscous needs a display. Where there isn't one, viscous-tui is the same \
+     program in a terminal.";
+
+fn main() -> std::process::ExitCode {
     // Born hidden, with no size of its own: the first frame measures the
     // layout, resizes the window to fit it and only then shows it, so nothing
     // here has to guess at a size the contents already know.
@@ -1407,7 +1416,7 @@ fn main() -> eframe::Result {
             .with_icon(window_icon()),
         ..Default::default()
     };
-    eframe::run_native(
+    let run = eframe::run_native(
         "Viscous",
         options,
         Box::new(|_cc| {
@@ -1415,7 +1424,15 @@ fn main() -> eframe::Result {
             app.controller = pad::Attached::open().map(|attached| Box::new(attached) as Box<_>);
             Ok(Box::new(app))
         }),
-    )
+    );
+    match run {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("{error}");
+            eprintln!("{NO_WINDOW_HINT}");
+            std::process::ExitCode::FAILURE
+        }
+    }
 }
 
 #[cfg(test)]

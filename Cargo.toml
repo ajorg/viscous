@@ -25,6 +25,14 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 
+# The terminal front end. `viscous` itself is the GUI, built from `egui_gui/`
+# and named there; this is the one to reach for where there is no display —
+# over ssh, on a headless box, or beside a camera on a machine that never grew
+# a desktop.
+[[bin]]
+name = "viscous-tui"
+path = "src/main.rs"
+
 [dependencies]
 crossterm = "0.29.0"
 directories = "6.0.0"
