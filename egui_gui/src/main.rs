@@ -50,6 +50,19 @@ const FIRST_GUESS: &str = "/dev/ttyUSB0";
 /// How many preset slots to offer — the same six the TUI's number keys reach.
 const PRESETS: u8 = 6;
 
+/// How big a numbered recall button is drawn, and how tall the description
+/// field and the Mark button beside it are, both as multiples of the height of
+/// a line of body text.
+///
+/// The recall buttons get much the largest target on the window after the pad
+/// itself, because of when they're used: mid-service, in a hurry, by someone
+/// watching the picture rather than the screen. A miss there puts the wrong
+/// shot on air. Fixed multiples of the text rather than a share of the window,
+/// so they follow the interface scale and leave the window's spare room to the
+/// pad and the rockers, which are the controls that get better for having it.
+const RECALL_BUTTON: Vec2 = vec2(2.4, 2.6);
+const FIELD: f32 = 1.7;
+
 /// How many titles to keep on hand. The camera holds one at a time; these are
 /// the ones an operator switches between during a session.
 const TITLES: u8 = 3;
@@ -152,6 +165,14 @@ struct App {
     /// What each preset is of, in the operator's own words, keyed by the same
     /// 1-based number as the buttons.
     preset_labels: BTreeMap<u8, String>,
+    /// Whether the Mark buttons are locked off.
+    ///
+    /// Locked at every start, and never written to the config file: a preset is
+    /// slow to set up and instant to destroy, and the destroying button sits in
+    /// the row you reach into to fix a typo. Marking is a thing done once, on
+    /// purpose, so it costs one click to arm; recall — the thing done under
+    /// pressure, mid-service — costs nothing and is never locked.
+    marking_locked: bool,
     /// The titles kept on hand to burn into the video output, and which of
     /// them the camera was last told to show.
     titles: BTreeMap<u8, String>,
@@ -221,6 +242,7 @@ impl Default for App {
             camera_state: None,
             status: None,
             preset_labels: BTreeMap::new(),
+            marking_locked: true,
             titles: BTreeMap::new(),
             shown_title: None,
             titles_supported: true,
@@ -606,7 +628,7 @@ impl App {
 
                     space(ui, 2.0);
                     (pointed.zoom, pointed.focus) =
-                        drive_rockers(ui, live, self.auto_focusing(), &stick);
+                        drive_rockers(ui, self.pad_size, live, self.auto_focusing(), &stick);
 
                     space(ui, 1.0);
                     ui.add_enabled_ui(live, |ui| self.draw_camera_buttons(ui));
@@ -819,7 +841,10 @@ impl App {
     /// operator's own words, kept in this program's config file, and there is
     /// no reason a sleeping camera should stop anyone writing them down.
     fn draw_shots(&mut self, ui: &mut Ui, live: bool) {
-        ui.label("Presets");
+        ui.horizontal(|ui| {
+            ui.label("Presets");
+            self.draw_marking_lock(ui);
+        });
         self.draw_presets(ui, live);
         space(ui, 1.5);
         ui.label("Titles");
@@ -834,12 +859,45 @@ impl App {
         });
     }
 
+    /// The switch that arms the Mark column.
+    ///
+    /// Named for the mode rather than for the lock, and drawn pressed in when
+    /// the Mark buttons work: what's on screen then matches what the column
+    /// does, which a button reading "Locked" while nothing is locked would not.
+    fn draw_marking_lock(&mut self, ui: &mut Ui) {
+        let locked = self.marking_locked;
+        let mut unlocked = !locked;
+        if ui
+            .toggle_value(&mut unlocked, "Marking")
+            .on_hover_text(if locked {
+                "Off, so a preset can't be overwritten by a mis-click. \
+                 Turn it on to store new shots."
+            } else {
+                "On: the Mark buttons will overwrite presets. \
+                 Turn it off once the shots are set."
+            })
+            .clicked()
+        {
+            self.marking_locked = !unlocked;
+        }
+    }
+
     fn draw_presets(&mut self, ui: &mut Ui, live: bool) {
+        let text = ui.text_style_height(&egui::TextStyle::Body);
+        // Taller than a line of text: this is a field to read back at a glance
+        // rather than only to type into, and it sets the height the Mark button
+        // beside it is drawn at.
+        let field = egui::Margin::symmetric(4, ((text * (FIELD - 1.0)) / 2.0) as i8);
+        let marking = live && !self.marking_locked;
+
         for number in 1..=PRESETS {
             ui.horizontal(|ui| {
                 let description = self.preset_labels.get(&number).map(String::as_str);
                 if ui
-                    .add_enabled(live, egui::Button::new(number.to_string()))
+                    .add_enabled(
+                        live,
+                        egui::Button::new(number.to_string()).min_size(RECALL_BUTTON * text),
+                    )
                     .on_hover_text(recall_tooltip(number, description))
                     .on_disabled_hover_text(STANDBY_HINT)
                     .clicked()
@@ -848,7 +906,10 @@ impl App {
                 }
 
                 let description = self.preset_labels.entry(number).or_default();
-                if ui.text_edit_singleline(description).lost_focus() {
+                if ui
+                    .add(egui::TextEdit::singleline(description).margin(field))
+                    .lost_focus()
+                {
                     self.save_config();
                 }
 
@@ -857,11 +918,14 @@ impl App {
                 // looks like it saves the description, when what it stores is
                 // where the camera is pointing.
                 if ui
-                    .add_enabled(live, egui::Button::new("Mark"))
+                    .add_enabled(
+                        marking,
+                        egui::Button::new("Mark").min_size(vec2(0.0, text * FIELD)),
+                    )
                     .on_hover_text(format!(
                         "Store where the camera is pointing now as preset {number}"
                     ))
-                    .on_disabled_hover_text(STANDBY_HINT)
+                    .on_disabled_hover_text(if live { LOCKED_HINT } else { STANDBY_HINT })
                     .clicked()
                 {
                     self.send_intent(Intent::SavePreset(number));
@@ -1013,22 +1077,38 @@ impl App {
 /// and the macro flower and infinity sign for the near and far ends of focus,
 /// as printed on a lens barrel. The tooltips say it in words for anyone who
 /// hasn't met them.
+/// Drawn `width` wide — the pad's own width, since they sit directly under it
+/// and drive the same camera: room that makes the pad a finer aim should make
+/// these a finer zoom.
 fn drive_rockers(
     ui: &mut Ui,
+    width: f32,
     live: bool,
     auto_focusing: bool,
     stick: &Pad,
 ) -> (Option<ZoomDrive>, Option<FocusDrive>) {
+    let zoom_marks = rocker::Marks {
+        label: "Zoom",
+        ends: ("W", "T"),
+        tooltips: (
+            "Wide \u{2014} push further to widen faster",
+            "Telephoto \u{2014} push further to tighten faster",
+        ),
+    };
+    let focus_marks = rocker::Marks {
+        label: "Focus",
+        ends: ("\u{273F}", "\u{221E}"),
+        tooltips: (
+            "Near \u{2014} push further to focus closer faster",
+            "Far \u{2014} push further to focus further off faster",
+        ),
+    };
+    let row = rocker::Row::fitting(ui, width, &[zoom_marks, focus_marks]);
+
     let zoom = rocker::rocker(
         ui,
-        &rocker::Marks {
-            label: "Zoom",
-            ends: ("W", "T"),
-            tooltips: (
-                "Wide \u{2014} push further to widen faster",
-                "Telephoto \u{2014} push further to tighten faster",
-            ),
-        },
+        &zoom_marks,
+        row,
         live,
         STANDBY_HINT,
         stick.right_stick.1,
@@ -1039,14 +1119,8 @@ fn drive_rockers(
     // turning off auto focus wouldn't help.
     let focus = rocker::rocker(
         ui,
-        &rocker::Marks {
-            label: "Focus",
-            ends: ("\u{273F}", "\u{221E}"),
-            tooltips: (
-                "Near \u{2014} push further to focus closer faster",
-                "Far \u{2014} push further to focus further off faster",
-            ),
-        },
+        &focus_marks,
+        row,
         live && !auto_focusing,
         if live { AUTO_FOCUS_HINT } else { STANDBY_HINT },
         stick.focus_deflection(),
@@ -1063,6 +1137,10 @@ const AUTO_FOCUS_HINT: &str = "Turn off Auto focus to focus by hand";
 /// What to say about any control a sleeping camera would refuse. Points at the
 /// switch rather than at the key, since the switch is right there on screen.
 const STANDBY_HINT: &str = "The camera is in standby \u{2014} switch it on first";
+
+/// What to say about a Mark button the lock is holding off. Points at the
+/// switch that arms it, which is at the head of the column it disarms.
+const LOCKED_HINT: &str = "Turn on Marking, above, to store presets";
 
 /// What to say once the camera has refused a title.
 ///
@@ -1999,9 +2077,17 @@ mod tests {
         assert_eq!(click(app, &sent, "3"), vec![Intent::RecallPreset(3)]);
     }
 
+    /// An app whose Mark column has been armed, as the operator arms it: by
+    /// clicking the switch at the head of the column.
+    fn marking_app(camera_state: Option<CameraState>) -> (App, Receiver<Intent>) {
+        let (mut app, sent) = connected_app(camera_state);
+        app.marking_locked = false;
+        (app, sent)
+    }
+
     #[test]
     fn each_preset_row_stores_its_own_slot() {
-        let (app, sent) = connected_app(None);
+        let (app, sent) = marking_app(None);
         let mut harness = ui_harness(app);
 
         harness
@@ -2014,6 +2100,88 @@ mod tests {
         assert_eq!(
             sent.try_iter().collect::<Vec<_>>(),
             vec![Intent::SavePreset(3)]
+        );
+    }
+
+    #[test]
+    fn a_preset_is_a_bigger_target_than_the_controls_around_it() {
+        let (app, _sent) = marking_app(None);
+        let harness = ui_harness(app);
+
+        let recall = harness.get_by_label("1").rect();
+        let ordinary = harness.get_by_label("Marking").rect().height();
+        let mark = harness
+            .get_all_by_label("Mark")
+            .next()
+            .expect("there should be a Mark button for every preset")
+            .rect();
+        let field = description_field(&harness, 1).rect();
+
+        assert!(
+            recall.height() > ordinary * 1.8 && recall.width() > ordinary * 1.4,
+            "a preset is reached for in a hurry and needs the room: {recall:?} \
+             against an ordinary {ordinary}"
+        );
+        assert!(
+            (mark.height() - field.height()).abs() < 1.0,
+            "Mark should sit level with the field it belongs to: {mark:?} and {field:?}"
+        );
+        assert!(
+            field.height() < recall.height(),
+            "the row should grow, but the button it is named by should grow more"
+        );
+    }
+
+    #[test]
+    fn marking_starts_locked_so_a_stray_click_costs_nothing() {
+        let (app, sent) = connected_app(None);
+        let mut harness = ui_harness(app);
+
+        harness
+            .get_all_by_label("Mark")
+            .next()
+            .expect("the Mark buttons are drawn whether or not they are armed")
+            .click();
+        harness.run();
+
+        assert_eq!(
+            commands(&sent),
+            vec![],
+            "a locked Mark button should not reach the camera"
+        );
+    }
+
+    #[test]
+    fn the_switch_at_the_head_of_the_column_arms_it() {
+        let (app, sent) = connected_app(None);
+        let mut harness = ui_harness(app);
+
+        harness.get_by_label("Marking").click();
+        harness.run();
+        harness
+            .get_all_by_label("Mark")
+            .next()
+            .expect("there should be a Mark button for every preset")
+            .click();
+        harness.run();
+
+        assert_eq!(commands(&sent), vec![Intent::SavePreset(1)]);
+    }
+
+    #[test]
+    fn the_lock_holds_off_marking_alone() {
+        let (app, sent) = connected_app(None);
+        let mut harness = ui_harness(app);
+
+        harness.get_by_label("1").click();
+        harness.run();
+        description_field(&harness, 1).type_text("Lectern");
+        harness.run();
+
+        assert_eq!(
+            commands(&sent),
+            vec![Intent::RecallPreset(1)],
+            "a locked column should still recall shots and take descriptions"
         );
     }
 
@@ -2588,6 +2756,37 @@ mod tests {
             app.pad_size > natural,
             "the pad should take the room the window has spare ({natural} then {})",
             app.pad_size
+        );
+    }
+
+    /// Settles the app on a screen of the given size and reports how big the
+    /// pad ended up and how much width everything beside it took.
+    ///
+    /// Several frames, because the pad is measured from what was left over last
+    /// time: the layout converges on a size rather than jumping to it.
+    fn settled_on(app: &mut App, ctx: &egui::Context, screen: Vec2) -> (f32, f32) {
+        for _ in 0..8 {
+            frame_on_screen(app, ctx, screen);
+        }
+        (app.pad_size, app.around_pad.x)
+    }
+
+    #[test]
+    fn a_wider_window_goes_to_the_pad_rather_than_to_the_columns_beside_it() {
+        let ctx = egui::Context::default();
+        let (mut app, _sent) = connected_app(None);
+
+        let (narrow, beside) = settled_on(&mut app, &ctx, vec2(1000.0, 1400.0));
+        let (wide, still_beside) = settled_on(&mut app, &ctx, vec2(1400.0, 1400.0));
+
+        assert!(
+            wide > narrow + 300.0,
+            "the extra width should reach the pad ({narrow} then {wide})"
+        );
+        assert!(
+            (still_beside - beside).abs() < 1.0,
+            "the presets are a fixed width and should not take any of it \
+             ({beside} then {still_beside})"
         );
     }
 

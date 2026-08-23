@@ -5,17 +5,19 @@
 //! already has under their thumb: a zoom rocker springs back to the middle
 //! when you let go, which is exactly when the camera should stop.
 
-use egui::{Sense, Stroke, Ui, pos2, vec2};
+use egui::{Sense, Stroke, TextStyle, Ui, pos2, vec2};
 
-/// How long the track is, as a multiple of the height of a line of body text,
-/// and how thick — measured in the text beside it like everything else here.
-const TRACK_LENGTHS: f32 = 8.0;
+/// The shortest the track is drawn, as a multiple of the height of a line of
+/// body text, and how thick — measured in the text beside it like everything
+/// else here.
+const LEAST_TRACK_LENGTHS: f32 = 8.0;
 const TRACK_THICKNESS: f32 = 0.45;
 
 /// The knob's diameter, as a multiple of the track's thickness.
 const KNOB: f32 = 1.6;
 
 /// What one rocker is marked with.
+#[derive(Debug, Clone, Copy)]
 pub struct Marks<'a> {
     /// What this rocker drives, in a word.
     pub label: &'a str,
@@ -23,6 +25,57 @@ pub struct Marks<'a> {
     pub ends: (&'a str, &'a str),
     /// What each end does, spelled out for whoever hasn't met the marks.
     pub tooltips: (&'a str, &'a str),
+}
+
+/// The widths a set of rockers drawn one under the other shares, so that their
+/// tracks start and finish in the same place however differently the rows are
+/// lettered.
+#[derive(Debug, Clone, Copy)]
+pub struct Row {
+    /// How wide the whole row is — the width of the pad above it, so that a
+    /// window given more room buys finer control on these too and not only on
+    /// the pan and tilt.
+    width: f32,
+    /// The label column, and each of the two mark columns.
+    label: f32,
+    mark: f32,
+}
+
+impl Row {
+    /// A row `width` wide with a column wide enough for the widest of `rows`.
+    pub fn fitting(ui: &Ui, width: f32, rows: &[Marks<'_>]) -> Self {
+        let mut label: f32 = 0.0;
+        let mut mark: f32 = 0.0;
+        for marks in rows {
+            label = label.max(text_width(ui, marks.label));
+            mark = mark.max(text_width(ui, marks.ends.0).max(text_width(ui, marks.ends.1)));
+        }
+        Self { width, label, mark }
+    }
+
+    /// How long the track is, once the label and the two marks have had their
+    /// columns and the gaps between the four have been taken out.
+    ///
+    /// Never shorter than [`LEAST_TRACK_LENGTHS`] lines of text: a window too
+    /// narrow to give the pad much is still a window these have to be usable
+    /// in, and a track is no use once it's a few pixels long.
+    fn track(&self, ui: &Ui) -> f32 {
+        let gaps = ui.spacing().item_spacing.x * 3.0;
+        let least = ui.text_style_height(&TextStyle::Body) * LEAST_TRACK_LENGTHS;
+        (self.width - self.label - self.mark * 2.0 - gaps).max(least)
+    }
+}
+
+/// How wide `text` comes out in the body style, which is what the columns are
+/// measured against.
+fn text_width(ui: &Ui, text: &str) -> f32 {
+    let font = TextStyle::Body.resolve(ui.style());
+    ui.ctx().fonts_mut(|fonts| {
+        fonts
+            .layout_no_wrap(text.to_owned(), font, egui::Color32::PLACEHOLDER)
+            .size()
+            .x
+    })
 }
 
 /// Draws a rocker and returns how far it's being pushed, from -1 at the left
@@ -36,13 +89,14 @@ pub struct Marks<'a> {
 /// With no pointer on it the knob shows `stick` instead — how far a game
 /// controller's own control for this is being pushed — so that this is the one
 /// place to see what the camera is being asked for, whichever hand is asking.
-pub fn rocker(ui: &mut Ui, marks: &Marks<'_>, live: bool, why: &str, stick: f32) -> f32 {
+pub fn rocker(ui: &mut Ui, marks: &Marks<'_>, row: Row, live: bool, why: &str, stick: f32) -> f32 {
     ui.add_enabled_ui(live, |ui| {
         ui.horizontal(|ui| {
-            ui.label(marks.label);
-            end(ui, marks.ends.0, marks.tooltips.0, why);
-            let deflection = track(ui, marks.label, live, why, stick);
-            end(ui, marks.ends.1, marks.tooltips.1, why);
+            let height = ui.text_style_height(&TextStyle::Body);
+            ui.add_sized(vec2(row.label, height), egui::Label::new(marks.label));
+            end(ui, marks.ends.0, row.mark, marks.tooltips.0, why);
+            let deflection = track(ui, marks.label, row.track(ui), live, why, stick);
+            end(ui, marks.ends.1, row.mark, marks.tooltips.1, why);
             deflection
         })
         .inner
@@ -52,22 +106,23 @@ pub fn rocker(ui: &mut Ui, marks: &Marks<'_>, live: bool, why: &str, stick: f32)
 
 /// One end mark, which says what that end does — or why it currently does
 /// nothing.
-fn end(ui: &mut Ui, mark: &str, tooltip: &str, why: &str) {
-    ui.label(mark)
+fn end(ui: &mut Ui, mark: &str, width: f32, tooltip: &str, why: &str) {
+    let height = ui.text_style_height(&TextStyle::Body);
+    ui.add_sized(vec2(width, height), egui::Label::new(mark))
         .on_hover_text(tooltip)
         .on_disabled_hover_text(why);
 }
 
 /// The track and its knob, without the marks around them.
-fn track(ui: &mut Ui, label: &str, live: bool, why: &str, stick: f32) -> f32 {
-    let text = ui.text_style_height(&egui::TextStyle::Body);
+fn track(ui: &mut Ui, label: &str, length: f32, live: bool, why: &str, stick: f32) -> f32 {
+    let text = ui.text_style_height(&TextStyle::Body);
     let thickness = text * TRACK_THICKNESS;
     let sense = if live {
         Sense::click_and_drag()
     } else {
         Sense::hover()
     };
-    let (rect, response) = ui.allocate_exact_size(vec2(text * TRACK_LENGTHS, text), sense);
+    let (rect, response) = ui.allocate_exact_size(vec2(length, text), sense);
 
     let center = rect.center();
     let reach = rect.width() / 2.0;
@@ -138,12 +193,29 @@ mod tests {
         }
     }
 
+    fn focus_marks() -> Marks<'static> {
+        Marks {
+            label: "Focus",
+            ends: ("\u{273F}", "\u{221E}"),
+            tooltips: ("Nearer", "Further"),
+        }
+    }
+
+    /// A row wide enough that the track is being sized by the row rather than
+    /// held up by its own floor.
+    const WIDE: f32 = 400.0;
+
+    fn one_row(ui: &Ui, width: f32) -> Row {
+        Row::fitting(ui, width, &[zoom_marks()])
+    }
+
     /// What a rocker reports after a frame in which the pointer does whatever
     /// `push` does to it.
     fn deflection_after(live: bool, push: impl Fn(&mut Harness<'_, ()>, egui::Rect)) -> f32 {
         let reported = Cell::new(f32::NAN);
         let mut harness = Harness::new_ui(|ui| {
-            reported.set(rocker(ui, &zoom_marks(), live, "not just now", 0.0));
+            let row = one_row(ui, WIDE);
+            reported.set(rocker(ui, &zoom_marks(), row, live, "not just now", 0.0));
         });
         harness.run();
 
@@ -197,7 +269,8 @@ mod tests {
     /// eye sees and what a screen reader would read out.
     fn knob_showing(stick: f32) -> f64 {
         let mut harness = Harness::new_ui(move |ui| {
-            rocker(ui, &zoom_marks(), true, "not just now", stick);
+            let row = one_row(ui, WIDE);
+            rocker(ui, &zoom_marks(), row, true, "not just now", stick);
         });
         harness.run();
         harness
@@ -222,7 +295,8 @@ mod tests {
         // asked for what it is only showing would be asking twice.
         let asked = Cell::new(f32::NAN);
         Harness::new_ui(|ui| {
-            asked.set(rocker(ui, &zoom_marks(), true, "not just now", 1.0));
+            let row = one_row(ui, WIDE);
+            asked.set(rocker(ui, &zoom_marks(), row, true, "not just now", 1.0));
         })
         .run();
 
@@ -233,7 +307,8 @@ mod tests {
     /// after the pointer has rested on the track of a rocker that is `live`.
     fn hovering_the_track_explains_itself(live: bool) -> bool {
         let mut harness = Harness::new_ui(move |ui| {
-            rocker(ui, &zoom_marks(), live, "not just now", 0.0);
+            let row = one_row(ui, WIDE);
+            rocker(ui, &zoom_marks(), row, live, "not just now", 0.0);
         });
         harness.run();
 
@@ -270,5 +345,55 @@ mod tests {
         });
 
         assert_eq!(pushed, 0.0);
+    }
+
+    /// Where the tracks of a whole set of rockers end up on screen.
+    fn tracks(width: f32, rows: &[Marks<'static>]) -> Vec<egui::Rect> {
+        let rows = rows.to_vec();
+        let mut harness = Harness::new_ui(move |ui| {
+            let row = Row::fitting(ui, width, &rows);
+            for marks in &rows {
+                rocker(ui, marks, row, true, "not just now", 0.0);
+            }
+        });
+        harness.run();
+
+        harness
+            .get_all_by_role(egui::accesskit::Role::Slider)
+            .map(|track| track.rect())
+            .collect()
+    }
+
+    #[test]
+    fn a_wider_row_is_a_longer_track_to_push_along() {
+        let narrow = tracks(300.0, &[zoom_marks()])[0].width();
+        let wide = tracks(600.0, &[zoom_marks()])[0].width();
+
+        assert!(
+            wide - narrow > 250.0,
+            "the extra width should reach the track ({narrow} then {wide})"
+        );
+    }
+
+    #[test]
+    fn a_row_too_narrow_to_share_out_still_leaves_a_track_worth_pushing() {
+        let squeezed = tracks(1.0, &[zoom_marks()])[0].width();
+
+        assert!(
+            squeezed > 50.0,
+            "a track has to stay usable however little room there is: {squeezed}"
+        );
+    }
+
+    #[test]
+    fn rockers_lettered_differently_still_line_their_tracks_up() {
+        let tracks = tracks(WIDE, &[zoom_marks(), focus_marks()]);
+
+        assert_eq!(tracks.len(), 2, "both rockers should offer a track");
+        assert!(
+            (tracks[0].left() - tracks[1].left()).abs() < 0.5
+                && (tracks[0].right() - tracks[1].right()).abs() < 0.5,
+            "the tracks should start and finish together: {tracks:?}"
+        );
     }
 }
