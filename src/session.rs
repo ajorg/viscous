@@ -141,7 +141,7 @@ impl<'a, R: Report> Session<'a, R> {
         self.next_query_at = Some(Instant::now() + QUIESCENCE_INTERVAL);
         // A drive is its own progress report — the picture moves — so it says
         // nothing, and the key legend stays up while the key is held.
-        if worker::is_drive(intent) {
+        if worker::is_movement(intent) {
             return Ok(());
         }
         self.report.status(&worker::describe_busy(intent))
@@ -300,7 +300,7 @@ impl<'a, R: Report> Session<'a, R> {
                     // A drive that worked was already visible before its
                     // completion arrived; one that failed is the only kind
                     // worth interrupting the legend for.
-                    Outcome::Done(intent, Ok(())) if worker::is_drive(*intent) => {}
+                    Outcome::Done(intent, Ok(())) if worker::is_movement(*intent) => {}
                     _ => self.report.status(&worker::describe_outcome(&outcome))?,
                 },
                 Err(TryRecvError::Empty) => return Ok(true),
@@ -837,7 +837,7 @@ mod tests {
             !harness
                 .sent()
                 .iter()
-                .any(|intent| worker::is_drive(*intent)),
+                .any(|intent| worker::is_movement(*intent)),
             "a camera in standby would only refuse the drive"
         );
         assert!(harness.report.statuses.contains(&STANDBY_HINT.to_string()));

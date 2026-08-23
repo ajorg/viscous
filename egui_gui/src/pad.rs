@@ -106,6 +106,10 @@ fn read(controls: &impl Controls) -> Pad {
             back: controls.pressed(Button::Select),
             left_stick: controls.pressed(Button::LeftThumb),
             right_stick: controls.pressed(Button::RightThumb),
+            dpad_up: controls.pressed(Button::DPadUp),
+            dpad_down: controls.pressed(Button::DPadDown),
+            dpad_left: controls.pressed(Button::DPadLeft),
+            dpad_right: controls.pressed(Button::DPadRight),
         },
     }
 }
@@ -184,7 +188,7 @@ mod tests {
 
     #[test]
     fn each_button_reads_as_its_own_button() {
-        let buttons: [(Button, Down); 10] = [
+        let buttons: [(Button, Down); 14] = [
             (Button::South, |buttons| buttons.south),
             (Button::East, |buttons| buttons.east),
             (Button::West, |buttons| buttons.west),
@@ -195,6 +199,10 @@ mod tests {
             (Button::Select, |buttons| buttons.back),
             (Button::LeftThumb, |buttons| buttons.left_stick),
             (Button::RightThumb, |buttons| buttons.right_stick),
+            (Button::DPadUp, |buttons| buttons.dpad_up),
+            (Button::DPadDown, |buttons| buttons.dpad_down),
+            (Button::DPadLeft, |buttons| buttons.dpad_left),
+            (Button::DPadRight, |buttons| buttons.dpad_right),
         ];
 
         for (button, down) in buttons {

@@ -10,6 +10,8 @@
 //! deadzone as the pointer and the keys, so a hand that has learned the
 //! on-screen pad has learned the stick.
 
+use grafton_visca::command::PanTiltDirection;
+
 use crate::{drives::Drives, focus::FocusDrive, pan_tilt::velocity_from_axes, zoom::ZoomDrive};
 
 /// Which buttons are down. Named the way the layout is, not the way one
@@ -29,6 +31,12 @@ pub struct Buttons {
     /// The sticks themselves, which click.
     pub left_stick: bool,
     pub right_stick: bool,
+    /// The directional pad, which steps the camera rather than driving it —
+    /// the one control here that moves a fixed distance.
+    pub dpad_up: bool,
+    pub dpad_down: bool,
+    pub dpad_left: bool,
+    pub dpad_right: bool,
 }
 
 /// Where every control on the controller is.
@@ -74,10 +82,29 @@ pub enum Press {
     ToggleAutoFocus,
     /// Wake the camera, or put it back into standby.
     TogglePower,
+    /// Move one step this way and stop there.
+    Nudge(PanTiltDirection),
 }
 
 /// Whether one particular button is down.
 type Down = fn(&Buttons) -> bool;
+
+/// The directional pad, and the way each of its four points.
+///
+/// A press is a step rather than a drive, which is what a D-pad is for: it has
+/// no travel to ask a speed with, so holding one would only be a slower way of
+/// asking for the same thing the stick beside it already asks for better. What
+/// the stick can't do is move a known distance and stop — and that is the aim
+/// nobody has by hand.
+///
+/// Two pressed together come back as two steps, one per axis, which arrive one
+/// after the other and land where the diagonal would have.
+const DPAD: [(Down, PanTiltDirection); 4] = [
+    (|buttons| buttons.dpad_up, PanTiltDirection::Up),
+    (|buttons| buttons.dpad_down, PanTiltDirection::Down),
+    (|buttons| buttons.dpad_left, PanTiltDirection::Left),
+    (|buttons| buttons.dpad_right, PanTiltDirection::Right),
+];
 
 /// The preset each button stands for: the four face buttons in the order their
 /// labels are usually read, then the two bumpers for the rest.
@@ -141,6 +168,11 @@ impl Gamepad {
         }
         if newly(|buttons| buttons.right_stick) {
             presses.push(Press::ToggleAutoFocus);
+        }
+        for (down, direction) in DPAD {
+            if newly(down) {
+                presses.push(Press::Nudge(direction));
+            }
         }
         presses
     }
@@ -315,6 +347,53 @@ mod tests {
         assert_eq!(recalled(|b| b.north = true), vec![Press::Recall(4)]);
         assert_eq!(recalled(|b| b.left_bumper = true), vec![Press::Recall(5)]);
         assert_eq!(recalled(|b| b.right_bumper = true), vec![Press::Recall(6)]);
+    }
+
+    #[test]
+    fn each_way_of_the_dpad_steps_that_way() {
+        let stepped = |set: fn(&mut Buttons)| asked_for(pressing(set)).1;
+
+        assert_eq!(
+            stepped(|b| b.dpad_up = true),
+            vec![Press::Nudge(PanTiltDirection::Up)]
+        );
+        assert_eq!(
+            stepped(|b| b.dpad_down = true),
+            vec![Press::Nudge(PanTiltDirection::Down)]
+        );
+        assert_eq!(
+            stepped(|b| b.dpad_left = true),
+            vec![Press::Nudge(PanTiltDirection::Left)]
+        );
+        assert_eq!(
+            stepped(|b| b.dpad_right = true),
+            vec![Press::Nudge(PanTiltDirection::Right)]
+        );
+    }
+
+    #[test]
+    fn a_held_dpad_steps_once_rather_than_running_away() {
+        // The whole difference between the D-pad and the stick beside it: a
+        // thumb left resting on it moves the camera exactly one step, where
+        // the same thumb on the stick drives for as long as it stays there.
+        let mut gamepad = Gamepad::default();
+        let held = pressing(|buttons| buttons.dpad_left = true);
+
+        assert_eq!(
+            gamepad.update(held).1,
+            vec![Press::Nudge(PanTiltDirection::Left)]
+        );
+        assert!(gamepad.update(held).1.is_empty());
+        assert!(gamepad.update(held).1.is_empty());
+    }
+
+    #[test]
+    fn the_dpad_does_not_drive_the_camera_as_well_as_stepping_it() {
+        // It asks for a distance; the stick asks for a speed. A D-pad that
+        // also drove would be asking for both at once.
+        let pad = pressing(|buttons| buttons.dpad_right = true);
+
+        assert!(asked_for(pad).0.pan_tilt.is_stop());
     }
 
     #[test]

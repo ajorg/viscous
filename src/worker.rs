@@ -14,6 +14,7 @@ use grafton_visca::{
 
 use crate::{
     focus::{self, FocusDirection, FocusDrive},
+    nudge::{self, Step},
     pan_tilt::{self, Velocity},
     power, preset,
     state::{self, CameraState},
@@ -31,6 +32,8 @@ const STOP_CONFIRM_TIMEOUT: Duration = Duration::from_millis(500);
 pub enum Intent {
     /// Set the continuous pan/tilt drive, or stop it.
     DrivePanTilt(Velocity),
+    /// Move a fixed distance from wherever the camera is now, and stop there.
+    Nudge(Step),
     /// Start driving zoom, or stop it with `None`.
     DriveZoom(Option<ZoomDrive>),
     /// Start driving focus, or stop it with `None`.
@@ -85,7 +88,11 @@ fn control(intent: Intent) -> Option<Control> {
         Intent::DrivePanTilt(_) => Some(Control::PanTilt),
         Intent::DriveZoom(_) => Some(Control::Zoom),
         Intent::DriveFocus(_) => Some(Control::Focus),
-        Intent::SetAutoFocus(_)
+        // A step is deliberately not a control: two drives in the queue
+        // together mean the later one won, but two steps mean two steps.
+        // `coalesced` adds them together instead of dropping either.
+        Intent::Nudge(_)
+        | Intent::SetAutoFocus(_)
         | Intent::RecallPreset(_)
         | Intent::SavePreset(_)
         | Intent::Home
@@ -97,14 +104,15 @@ fn control(intent: Intent) -> Option<Control> {
     }
 }
 
-/// Whether this intent drives one of the camera's continuous controls rather
-/// than being a command that happens once.
+/// Whether this intent moves the picture, rather than being a command whose
+/// result the operator can only learn from the status line.
 ///
-/// Both front ends use it to keep drives out of the status line: a move
-/// announces itself in the picture, and saying "pan/tilt right..." for every
-/// one of them would bury the messages that only the status line can carry.
-pub fn is_drive(intent: Intent) -> bool {
-    control(intent).is_some()
+/// Both front ends use it to keep movement out of that line: a move announces
+/// itself in the picture, and saying "pan/tilt right..." for every one of them
+/// would bury the messages nothing else carries. Steps count for the same
+/// reason and more so — they are meant to be tapped out several at a time.
+pub fn is_movement(intent: Intent) -> bool {
+    control(intent).is_some() || matches!(intent, Intent::Nudge(_))
 }
 
 /// Whether this intent is one of the title commands, which are the one thing
@@ -118,28 +126,55 @@ pub fn is_title(intent: Intent) -> bool {
     matches!(intent, Intent::SetTitle(_) | Intent::ShowTitle(_))
 }
 
-/// Drops every queued drive command that a later one for the same control
-/// has already superseded, leaving everything else in order.
+/// Collapses a queued batch into the least work that means the same thing:
+/// drives that a later one has superseded are dropped, and steps are added
+/// together into one move.
 ///
-/// Without this, a control held down while the camera is slow to answer
-/// builds a backlog of velocities the user has already moved on from, and
-/// releasing it stops nothing until that backlog has played out.
+/// Without this, a control held down while the camera is slow to answer builds
+/// a backlog of velocities the user has already moved on from, and releasing it
+/// stops nothing until that backlog has played out.
+///
+/// Steps need the same protection and can't take the same medicine. A drive
+/// says what the camera should be doing *now*, so the last one is the only one
+/// that still means anything; a step says how far to go from here, so every one
+/// of them means something and dropping any would make a tap something you
+/// can't count on. What saves them is that distances add: three taps to the
+/// right while the camera is answering the first become one move of three
+/// units, which lands in exactly the same place for one round trip instead of
+/// three. So a queue of steps can't build up no matter how fast they are
+/// tapped out, and none of them is lost.
 fn coalesced(batch: &[Intent]) -> Vec<Intent> {
     let mut superseded = Vec::new();
+    let mut total = Step::STILL;
+    let mut stepped = false;
     let mut kept: Vec<Intent> = batch
         .iter()
         .rev()
         .copied()
-        .filter(|intent| match control(*intent) {
-            None => true,
-            Some(control) if superseded.contains(&control) => false,
-            Some(control) => {
-                superseded.push(control);
-                true
+        .filter(|intent| match intent {
+            Intent::Nudge(step) => {
+                total = total + *step;
+                // Keeping the last of them — the others have been added into
+                // it — so the sum lands where the most recent tap did among
+                // whatever else is in the batch.
+                !std::mem::replace(&mut stepped, true)
             }
+            _ => match control(*intent) {
+                None => true,
+                Some(control) if superseded.contains(&control) => false,
+                Some(control) => {
+                    superseded.push(control);
+                    true
+                }
+            },
         })
         .collect();
     kept.reverse();
+    for intent in &mut kept {
+        if matches!(intent, Intent::Nudge(_)) {
+            *intent = Intent::Nudge(total);
+        }
+    }
     kept
 }
 
@@ -149,6 +184,7 @@ pub fn describe(intent: Intent) -> String {
         Intent::DrivePanTilt(velocity) => {
             format!("pan/tilt {}", direction_label(velocity.direction))
         }
+        Intent::Nudge(step) => format!("step {}", direction_label(step.direction())),
         Intent::DriveZoom(None) => "zoom stop".to_string(),
         Intent::DriveZoom(Some(drive)) => match drive.direction {
             ZoomDirection::In => "zoom in".to_string(),
@@ -214,6 +250,7 @@ where
 {
     match intent {
         Intent::DrivePanTilt(velocity) => Outcome::Done(intent, pan_tilt::drive(camera, velocity)),
+        Intent::Nudge(step) => Outcome::Done(intent, nudge::nudge(camera, step)),
         Intent::DriveZoom(direction) => Outcome::Done(intent, zoom::drive_zoom(camera, direction)),
         Intent::DriveFocus(direction) => {
             Outcome::Done(intent, focus::drive_focus(camera, direction))
@@ -363,6 +400,72 @@ mod tests {
     }
 
     #[test]
+    fn a_queued_run_of_steps_becomes_one_move_of_their_whole_distance() {
+        // The opposite of what happens to a queued run of drives, and why a
+        // step isn't one: five taps are five units of travel, not four thrown
+        // away. They cost the camera a single command all the same, which is
+        // what keeps a fast hand from ever building the backlog that took
+        // relative moves out of this program the first time.
+        let taps = [Intent::Nudge(Step::towards(PanTiltDirection::Right)); 5];
+        let camera = scripted_camera(vec![helpers::standard_command_response(1)]);
+
+        let (intent_tx, intent_rx) = channel();
+        let (result_tx, result_rx) = channel();
+        for tap in taps {
+            intent_tx.send(tap).unwrap();
+        }
+        drop(intent_tx);
+
+        run(&camera, &intent_rx, &result_tx);
+        drop(result_tx);
+
+        let reported: Vec<_> = result_rx.iter().collect();
+        assert_eq!(reported.len(), 1, "five taps should cost one round trip");
+        assert!(matches!(
+            reported[0],
+            Outcome::Done(Intent::Nudge(step), Ok(()))
+                if step.pan == 5 * nudge::STEP_UNITS
+        ));
+    }
+
+    #[test]
+    fn steps_that_undo_each_other_leave_the_camera_where_it_was() {
+        let batch = [
+            Intent::Nudge(Step::towards(PanTiltDirection::Right)),
+            Intent::Nudge(Step::towards(PanTiltDirection::Left)),
+        ];
+
+        assert_eq!(coalesced(&batch), vec![Intent::Nudge(Step::STILL)]);
+    }
+
+    #[test]
+    fn a_step_does_not_swallow_the_drive_queued_beside_it() {
+        // Steps collapse among themselves and leave everything else alone.
+        let batch = [
+            Intent::Nudge(Step::towards(PanTiltDirection::Up)),
+            Intent::RecallPreset(2),
+        ];
+
+        assert_eq!(coalesced(&batch).len(), 2);
+    }
+
+    #[test]
+    fn a_step_is_movement_so_it_keeps_out_of_the_status_line() {
+        assert!(is_movement(Intent::Nudge(Step::towards(
+            PanTiltDirection::Up
+        ))));
+        assert!(!is_movement(Intent::RecallPreset(1)));
+    }
+
+    #[test]
+    fn describe_says_which_way_a_step_went() {
+        assert_eq!(
+            describe(Intent::Nudge(Step::towards(PanTiltDirection::UpLeft))),
+            "step up-left"
+        );
+    }
+
+    #[test]
     fn run_sends_only_the_last_of_a_queued_run_of_drive_commands() {
         // A single scripted reply, so a second drive command reaching the
         // camera would fail rather than silently pass.
@@ -429,6 +532,7 @@ mod tests {
             Intent::ResetPanTilt,
             Intent::SetPower(false),
             Intent::SetAutoFocus(true),
+            Intent::Nudge(Step::towards(PanTiltDirection::Left)),
         ];
         let camera = scripted_camera(
             intents

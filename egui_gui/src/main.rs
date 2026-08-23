@@ -12,6 +12,7 @@
 mod joystick;
 mod pad;
 mod rocker;
+mod taps;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -23,6 +24,7 @@ use eframe::egui;
 use egui::{Key, TextWrapMode, Ui, Vec2, vec2};
 use grafton_visca::Error;
 use pad::Controller;
+use taps::Arrows;
 use viscous::{
     config,
     connection::{self, Target, format_camera, format_version},
@@ -30,6 +32,7 @@ use viscous::{
     focus::FocusDrive,
     gamepad::{Gamepad, Pad, Press},
     keymap::{FAST_KEY_DEFLECTION, KEY_DEFLECTION},
+    nudge::Step,
     pan_tilt::{self, Velocity},
     session::{self, POLL_INTERVAL, QUIESCENCE_INTERVAL, RETRY_INTERVAL},
     state::{self, CameraState},
@@ -207,6 +210,9 @@ struct App {
     /// Whether there was a controller to read last frame, which decides how
     /// soon the next frame is asked for.
     in_hand: bool,
+    /// The arrow keys, which are two gestures rather than one: tapped they
+    /// step the camera, held they drive it.
+    arrows: Arrows,
 }
 
 impl Default for App {
@@ -238,6 +244,7 @@ impl Default for App {
             gamepad: Gamepad::default(),
             stick: Pad::default(),
             in_hand: false,
+            arrows: Arrows::default(),
         }
     }
 }
@@ -279,7 +286,7 @@ impl App {
         }
         // A drive is its own progress report — the picture moves — and a drag
         // sends one of them per frame, which would leave nothing else legible.
-        if !worker::is_drive(intent) {
+        if !worker::is_movement(intent) {
             self.status = Some(Status::ok(worker::describe_busy(intent)));
         }
         self.next_query_at = Some(Instant::now() + QUIESCENCE_INTERVAL);
@@ -428,7 +435,7 @@ impl App {
             }
             // A drive that worked was already visible before its completion
             // arrived; one that failed is the only kind still worth saying.
-            Outcome::Done(intent, Ok(())) if worker::is_drive(*intent) => return,
+            Outcome::Done(intent, Ok(())) if worker::is_movement(*intent) => return,
             Outcome::Done(_, result) => result.is_err(),
         };
         self.status = Some(Status {
@@ -627,7 +634,8 @@ impl App {
         // The pointer wins where both are asking at once: a hand on the mouse
         // is aiming at a particular shot, and a key that was never released
         // (a window that lost focus mid-drive, say) shouldn't override it.
-        self.apply_drives(pointed.or(self.keyboard_drives(ui)).or(held));
+        let typed = self.keyboard_drives(ui);
+        self.apply_drives(pointed.or(typed).or(held));
         self.apply_presses(&pressed);
         if let Some(preset) = keyboard_preset(ui).filter(|_| live) {
             self.send_intent(Intent::RecallPreset(preset));
@@ -710,15 +718,42 @@ impl App {
         }
     }
 
-    /// What the keys currently held down are asking for.
+    /// What the keys currently held down are asking for, having first sent a
+    /// step for every arrow that was tapped rather than held.
     ///
     /// Nothing, while a description field has the keyboard: a "1" typed there
     /// is a digit, not a preset, and an arrow key is a cursor.
-    fn keyboard_drives(&self, ui: &Ui) -> Drives {
+    fn keyboard_drives(&mut self, ui: &Ui) -> Drives {
         if typing(ui) {
+            self.arrows.forget();
             return Drives::STOPPED;
         }
-        let held = ui.input(|input| held_drives(|key| input.key_down(key), input.modifiers.shift));
+        let (steps, held) = ui.input(|input| {
+            let steps = self
+                .arrows
+                .update(|key| input.key_down(key), Instant::now());
+            // An arrow is read through `driving` rather than straight from the
+            // keyboard, so that a press still deciding whether it is a tap asks
+            // the camera for nothing. Every other key means what it always did.
+            let held = held_drives(
+                |key| {
+                    if Arrows::owns(key) {
+                        self.arrows.driving(key)
+                    } else {
+                        input.key_down(key)
+                    }
+                },
+                input.modifiers.shift,
+            );
+            (steps, held)
+        });
+        // A step is a movement like any other, so a camera that won't take a
+        // drive won't take one of these either.
+        if !self.asleep() {
+            for direction in steps {
+                self.send_intent(Intent::Nudge(Step::towards(direction)));
+            }
+        }
         self.drivable(held)
     }
 
@@ -778,6 +813,9 @@ impl App {
                 Press::Home => self.send_intent(Intent::Home),
                 Press::ToggleAutoFocus => {
                     self.send_intent(Intent::SetAutoFocus(!self.auto_focusing()));
+                }
+                Press::Nudge(direction) => {
+                    self.send_intent(Intent::Nudge(Step::towards(*direction)));
                 }
             }
         }
@@ -1299,8 +1337,19 @@ mod tests {
             },
             intents: Some(intents),
             camera_state,
+            // Arrows that drive from the frame they go down on, which is what
+            // every test about driving is about. The tap window is its own
+            // subject, tested where it lives and in `taps_step_the_camera`.
+            arrows: Arrows::new(Duration::ZERO),
             ..App::default()
         };
+        (app, sent)
+    }
+
+    /// A connected app whose arrows tell a tap from a hold, as a real one's do.
+    fn tapping_app() -> (App, Receiver<Intent>) {
+        let (mut app, sent) = connected_app(None);
+        app.arrows = Arrows::default();
         (app, sent)
     }
 
@@ -1518,6 +1567,57 @@ mod tests {
             ))]
         );
         assert_eq!(released, vec![Intent::DrivePanTilt(Velocity::STOP)]);
+    }
+
+    #[test]
+    fn tapping_an_arrow_key_steps_the_camera_without_driving_it() {
+        let (app, sent) = tapping_app();
+        let mut harness = ui_harness(app);
+
+        // Down and back up inside the tap window, which is what a tap is: the
+        // frames a test runs take microseconds, not the fifth of a second an
+        // arrow has to be held for to drive.
+        harness.key_down(Key::ArrowRight);
+        harness.run();
+        harness.key_up(Key::ArrowRight);
+        harness.run();
+
+        assert_eq!(
+            commands(&sent),
+            vec![Intent::Nudge(Step::towards(PanTiltDirection::Right))],
+            "a tap should be one step and no drive at all"
+        );
+    }
+
+    #[test]
+    fn tapping_an_arrow_key_at_a_sleeping_camera_asks_it_for_nothing() {
+        let (mut app, sent) = tapping_app();
+        app.camera_state = Some(CameraState {
+            power_on: false,
+            lens: None,
+        });
+        let mut harness = ui_harness(app);
+
+        harness.key_down(Key::ArrowRight);
+        harness.run();
+        harness.key_up(Key::ArrowRight);
+        harness.run();
+
+        assert!(
+            commands(&sent).is_empty(),
+            "a camera drawn as asleep shouldn't be stepped either"
+        );
+    }
+
+    #[test]
+    fn a_step_is_movement_and_so_says_nothing_in_the_status_line() {
+        // Taps come several at a time by design; each one announcing itself
+        // would bury whatever the line was carrying.
+        let (mut app, _sent) = tapping_app();
+
+        app.send_intent(Intent::Nudge(Step::towards(PanTiltDirection::Right)));
+
+        assert!(app.status.is_none());
     }
 
     #[test]

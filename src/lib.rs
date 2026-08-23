@@ -9,6 +9,7 @@ pub mod drives;
 pub mod focus;
 pub mod gamepad;
 pub mod keymap;
+pub mod nudge;
 pub mod pan_tilt;
 pub mod power;
 pub mod preset;
