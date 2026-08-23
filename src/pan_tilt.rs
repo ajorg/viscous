@@ -285,16 +285,16 @@ mod tests {
     }
 
     #[test]
-    fn the_middle_of_the_travel_is_where_the_middle_speeds_are() {
-        // What a hand reaches for most: a push it can hold somewhere short of
-        // the stops should come out somewhere near the middle of the range,
-        // not pinned to either end of it.
-        let top = *PAN_SPEEDS.end();
-        let middle = velocity_from_axes(0.65, 0.0).pan_speed;
-
+    fn the_middle_of_the_travel_is_where_the_slowest_speeds_are() {
+        // What a hand reaches for most, and what the pad is mostly for: a push
+        // held somewhere short of the stops frames a shot, so the middle of
+        // the travel belongs to the bottom of the range rather than the middle
+        // of it. Getting somewhere in a hurry is the far end's job.
+        assert_eq!(velocity_from_axes(0.5, 0.0).pan_speed, MIN_SPEED);
         assert!(
-            (top / 3..=top * 2 / 3).contains(&middle),
-            "two thirds of a push asked for {middle} of {}",
+            velocity_from_axes(0.65, 0.0).pan_speed * 4 <= *PAN_SPEEDS.end(),
+            "two thirds of a push asked for {} of {}",
+            velocity_from_axes(0.65, 0.0).pan_speed,
             *PAN_SPEEDS.end()
         );
     }

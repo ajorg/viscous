@@ -25,8 +25,9 @@ use crate::{
 /// lands on 5 of the 12 pan speeds a control asks for, which is the pace a held
 /// arrow key wants. Since a key has no travel to feel its way along, it doesn't
 /// benefit from [`deflection`](crate::deflection)'s curve — it only has to
-/// land in the same place the curve puts that speed.
-pub const KEY_DEFLECTION: f32 = 0.55;
+/// land in the same place the curve puts that speed, which is why steepening
+/// the curve moved this number without changing what the key does.
+pub const KEY_DEFLECTION: f32 = 0.8;
 pub const FAST_KEY_DEFLECTION: f32 = 1.0;
 
 /// A camera drive that runs for as long as its key is held down.

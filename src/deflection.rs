@@ -22,18 +22,21 @@ pub const DEADZONE: f32 = 0.1;
 /// A straight mapping gives the fast end more of the travel than it is worth:
 /// half a push asks for half the speed, and the slow speeds a shot is framed
 /// with are crowded into the first part of the push, too small to hold steady.
-/// Bending it hands them more room — half a push now asks for about a third of
-/// the range — while full deflection still means the top of the range, so
-/// nothing is given up.
+/// Bending it hands them more room, while full deflection still means the top
+/// of the range, so nothing is given up.
 ///
-/// One and a half rather than two. Squaring it was picked while a control drove
-/// the camera's whole mechanical range, where the top was so fast that the only
-/// way to make the rest usable was to bury it in the last of the travel. Now
-/// that the range itself stops at a speed worth driving at
-/// ([`PAN_SPEEDS`](crate::pan_tilt::PAN_SPEEDS)), that much curve only pushes
-/// every speed towards the far end and leaves the middle of the travel — where
-/// a hand naturally sits — asking for barely any speed at all.
-const EXPO: f32 = 1.5;
+/// Steep, because framing is nearly all of what these controls do. **Half the
+/// travel asks for the slowest speed the camera has**, and it takes about two
+/// thirds of a push before the second speed arrives; the rest of the range
+/// lives in the last third, where a hand that has decided to go somewhere
+/// pushes anyway. What that is worth is easiest to see in how much travel the
+/// slowest speed gets: a fifth of it under the gentler curve this replaced,
+/// which is a band too narrow to find on a sprung stick and hold, against half
+/// of it now.
+///
+/// The camera's own slowest speed is the floor here and no curve can go under
+/// it — this only decides how much of a hand's travel is spent up against it.
+const EXPO: f32 = 4.0;
 
 /// What share of a control's speed range a push of `magnitude` (`0.0..=1.0`)
 /// asks for, or `None` while it's still inside the deadzone.
@@ -53,16 +56,6 @@ pub fn fraction(magnitude: f32) -> Option<f32> {
 pub fn speed(magnitude: f32, speeds: RangeInclusive<u8>) -> Option<u8> {
     let span = f32::from(speeds.end() - speeds.start());
     fraction(magnitude).map(|fraction| speeds.start() + (fraction * span).round() as u8)
-}
-
-/// The one of `options` that a push of `magnitude` asks for, slowest first, or
-/// `None` while the control is at rest.
-///
-/// For the controls whose speeds the camera only takes as a handful of named
-/// levels rather than as a number.
-pub fn choose<T: Copy>(magnitude: f32, options: &[T]) -> Option<T> {
-    let last = options.len() - 1;
-    fraction(magnitude).map(|fraction| options[(fraction * last as f32).round() as usize])
 }
 
 #[cfg(test)]
@@ -96,22 +89,39 @@ mod tests {
     }
 
     #[test]
-    fn half_a_push_asks_for_well_under_half_the_speed() {
-        // The whole point of the curve, and what a straight mapping does not
-        // do: the middle of the travel is worth about a third of the range.
-        let half = speed(0.5, SPEEDS).expect("half a push drives");
+    fn a_control_at_the_middle_of_its_travel_asks_for_the_slowest_speed() {
+        // The point of the curve, in the words it was asked for in: the
+        // minimum speed should be what a control held near its middle drives
+        // at. Camera-sized ranges rather than the wide one the other tests
+        // use, since "the slowest speed" is a real number of steps down.
+        assert_eq!(speed(0.5, 1..=12), Some(1));
+        assert_eq!(speed(0.5, 0..=7), Some(0));
+    }
+
+    #[test]
+    fn the_slowest_speed_gets_the_lion_s_share_of_the_travel() {
+        // Counted rather than reasoned about, because this is the thing being
+        // bought: a slowest speed reachable only in a narrow band by the
+        // deadzone is one a sprung stick cannot be held at. Two fifths of the
+        // travel that drives at all, which counting the deadzone is half the
+        // distance from the middle of a control to its stop.
+        let steps = 11..=100;
+        let total = steps.clone().count();
+        let slowest = steps
+            .filter(|step| speed(*step as f32 / 100.0, 1..=12).expect("past the deadzone") == 1)
+            .count();
 
         assert!(
-            (25..40).contains(&half),
-            "half the travel should ask for around a third of the speed, got {half}"
+            slowest * 5 >= total * 2,
+            "the slowest speed got only {slowest} of {total} steps of travel"
         );
     }
 
     #[test]
     fn the_slow_speeds_get_more_of_the_travel_than_their_share() {
-        // Counted rather than reasoned about. A straight mapping would spend
-        // exactly a third of the travel on the slowest third of the speeds;
-        // framing happens down there, so the curve owes it more room.
+        // A straight mapping would spend exactly a third of the travel on the
+        // slowest third of the speeds; framing happens down there, so the
+        // curve owes it more room.
         let steps = 11..=100;
         let total = steps.clone().count();
         let slow = steps
@@ -143,25 +153,5 @@ mod tests {
     fn a_speed_range_that_does_not_start_at_zero_starts_where_it_says() {
         assert_eq!(speed(DEADZONE + 0.001, 1..=24), Some(1));
         assert_eq!(speed(1.0, 1..=24), Some(24));
-    }
-
-    #[test]
-    fn choosing_from_named_levels_runs_slowest_to_fastest() {
-        let levels = ["slowest", "slow", "medium", "fast", "fastest"];
-
-        assert_eq!(choose(0.0, &levels), None);
-        assert_eq!(choose(DEADZONE + 0.001, &levels), Some("slowest"));
-        assert_eq!(choose(1.0, &levels), Some("fastest"));
-    }
-
-    #[test]
-    fn choosing_from_named_levels_favours_the_slow_ones_too() {
-        let levels = ["slowest", "slow", "medium", "fast", "fastest"];
-
-        assert_eq!(
-            choose(0.5, &levels),
-            Some("slow"),
-            "half a push should still be near the slow end"
-        );
     }
 }
