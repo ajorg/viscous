@@ -157,7 +157,16 @@ impl<'a, R: Report> Session<'a, R> {
             // reporting repeats would otherwise recall a preset over and over
             // for as long as its key was held.
             Action::Quit => return Ok(key.kind == KeyEventKind::Press),
-            Action::Camera(intent) if key.kind == KeyEventKind::Press => self.send(intent)?,
+            Action::Camera(intent) if key.kind == KeyEventKind::Press => {
+                // A camera in standby has parked its lens and will refuse a
+                // step just as it refuses a drive, so say so rather than
+                // spending a round trip to be told.
+                if worker::is_movement(intent) && self.power_on == Some(false) {
+                    self.report.status(STANDBY_HINT)?;
+                } else {
+                    self.send(intent)?;
+                }
+            }
             Action::Camera(_) => {}
             Action::ToggleAutoFocus if key.kind == KeyEventKind::Press => {
                 // Offer the mode that does something when the camera hasn't
@@ -470,10 +479,31 @@ mod tests {
         }
     }
 
+    /// A key event for the drive tests below, which are about the lifetime of
+    /// a held drive rather than about which key starts one.
+    ///
+    /// Arrows carry shift, because that is what a pan/tilt drive is now: an
+    /// arrow on its own steps the camera once and holds nothing. Every other
+    /// key means what it always did.
     fn key(code: KeyCode, kind: KeyEventKind) -> KeyEvent {
+        let modifiers = match code {
+            KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right => KeyModifiers::SHIFT,
+            _ => KeyModifiers::NONE,
+        };
+        let mut event = KeyEvent::new(code, modifiers);
+        event.kind = kind;
+        event
+    }
+
+    /// An arrow key with nothing on it, which steps rather than driving.
+    fn unshifted(code: KeyCode, kind: KeyEventKind) -> KeyEvent {
         let mut event = KeyEvent::new(code, KeyModifiers::NONE);
         event.kind = kind;
         event
+    }
+
+    fn tap(code: KeyCode) -> KeyEvent {
+        unshifted(code, KeyEventKind::Press)
     }
 
     fn press(code: KeyCode) -> KeyEvent {
@@ -534,6 +564,55 @@ mod tests {
             Intent::DrivePanTilt(velocity) => velocity.direction,
             other => panic!("expected a pan/tilt drive, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn tapping_an_arrow_key_steps_the_camera_and_holds_nothing() {
+        let mut harness = Harness::new();
+        let held = {
+            let mut session = harness.session();
+            session.handle_key(tap(KeyCode::Right)).unwrap();
+            session.held.is_some()
+        };
+
+        assert_eq!(
+            harness.sent(),
+            vec![Intent::Nudge(crate::nudge::Step::towards(
+                PanTiltDirection::Right
+            ))]
+        );
+        assert!(!held, "a step is over the moment it is asked for");
+    }
+
+    #[test]
+    fn a_repeated_arrow_key_steps_once_rather_than_walking_away() {
+        // Terminals without the enhancement protocol report a held key as
+        // repeats, and a step per repeat would send the shot off across the
+        // room. One press is one step, as it is for a preset.
+        let mut harness = Harness::new();
+        let mut session = harness.session();
+
+        session.handle_key(tap(KeyCode::Right)).unwrap();
+        for _ in 0..5 {
+            session
+                .handle_key(unshifted(KeyCode::Right, KeyEventKind::Repeat))
+                .unwrap();
+        }
+
+        assert_eq!(harness.sent().len(), 1);
+    }
+
+    #[test]
+    fn a_step_at_a_sleeping_camera_says_so_instead_of_being_sent() {
+        let mut harness = Harness::new();
+        harness.outcomes.send(Outcome::State(Ok(asleep()))).unwrap();
+        let mut session = harness.session();
+        session.drain().unwrap();
+
+        session.handle_key(tap(KeyCode::Right)).unwrap();
+
+        assert!(harness.sent().is_empty(), "a sleeping camera won't move");
+        assert!(harness.report.statuses.contains(&STANDBY_HINT.to_string()));
     }
 
     #[test]

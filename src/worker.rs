@@ -126,55 +126,35 @@ pub fn is_title(intent: Intent) -> bool {
     matches!(intent, Intent::SetTitle(_) | Intent::ShowTitle(_))
 }
 
-/// Collapses a queued batch into the least work that means the same thing:
-/// drives that a later one has superseded are dropped, and steps are added
-/// together into one move.
+/// Drops every queued drive command that a later one for the same control
+/// has already superseded, leaving everything else in order.
 ///
-/// Without this, a control held down while the camera is slow to answer builds
-/// a backlog of velocities the user has already moved on from, and releasing it
-/// stops nothing until that backlog has played out.
+/// Without this, a control held down while the camera is slow to answer
+/// builds a backlog of velocities the user has already moved on from, and
+/// releasing it stops nothing until that backlog has played out.
 ///
-/// Steps need the same protection and can't take the same medicine. A drive
-/// says what the camera should be doing *now*, so the last one is the only one
-/// that still means anything; a step says how far to go from here, so every one
-/// of them means something and dropping any would make a tap something you
-/// can't count on. What saves them is that distances add: three taps to the
-/// right while the camera is answering the first become one move of three
-/// units, which lands in exactly the same place for one round trip instead of
-/// three. So a queue of steps can't build up no matter how fast they are
-/// tapped out, and none of them is lost.
+/// Steps are deliberately left alone, and are safe to leave alone. Nothing
+/// generates them but a press — one per press, never one per frame — so they
+/// arrive no faster than a hand can produce them and no backlog can form. And
+/// they must not be touched: a drive says what the camera should be doing
+/// *now*, so only the last one still means anything, but a step says how far
+/// to go from here, and every one of them is something the operator asked for.
 fn coalesced(batch: &[Intent]) -> Vec<Intent> {
     let mut superseded = Vec::new();
-    let mut total = Step::STILL;
-    let mut stepped = false;
     let mut kept: Vec<Intent> = batch
         .iter()
         .rev()
         .copied()
-        .filter(|intent| match intent {
-            Intent::Nudge(step) => {
-                total = total + *step;
-                // Keeping the last of them — the others have been added into
-                // it — so the sum lands where the most recent tap did among
-                // whatever else is in the batch.
-                !std::mem::replace(&mut stepped, true)
+        .filter(|intent| match control(*intent) {
+            None => true,
+            Some(control) if superseded.contains(&control) => false,
+            Some(control) => {
+                superseded.push(control);
+                true
             }
-            _ => match control(*intent) {
-                None => true,
-                Some(control) if superseded.contains(&control) => false,
-                Some(control) => {
-                    superseded.push(control);
-                    true
-                }
-            },
         })
         .collect();
     kept.reverse();
-    for intent in &mut kept {
-        if matches!(intent, Intent::Nudge(_)) {
-            *intent = Intent::Nudge(total);
-        }
-    }
     kept
 }
 
@@ -400,53 +380,15 @@ mod tests {
     }
 
     #[test]
-    fn a_queued_run_of_steps_becomes_one_move_of_their_whole_distance() {
-        // The opposite of what happens to a queued run of drives, and why a
-        // step isn't one: five taps are five units of travel, not four thrown
-        // away. They cost the camera a single command all the same, which is
-        // what keeps a fast hand from ever building the backlog that took
-        // relative moves out of this program the first time.
+    fn every_step_asked_for_is_a_step_taken() {
+        // The opposite of what happens to a queued run of drives, and the
+        // whole reason a step isn't one: five presses are five steps. Dropping
+        // any of them — which is what the drive rule would do — would make a
+        // tap something you can't count on, and a tap you can't count on is
+        // the short drive this replaced.
         let taps = [Intent::Nudge(Step::towards(PanTiltDirection::Right)); 5];
-        let camera = scripted_camera(vec![helpers::standard_command_response(1)]);
 
-        let (intent_tx, intent_rx) = channel();
-        let (result_tx, result_rx) = channel();
-        for tap in taps {
-            intent_tx.send(tap).unwrap();
-        }
-        drop(intent_tx);
-
-        run(&camera, &intent_rx, &result_tx);
-        drop(result_tx);
-
-        let reported: Vec<_> = result_rx.iter().collect();
-        assert_eq!(reported.len(), 1, "five taps should cost one round trip");
-        assert!(matches!(
-            reported[0],
-            Outcome::Done(Intent::Nudge(step), Ok(()))
-                if step.pan == 5 * nudge::STEP_UNITS
-        ));
-    }
-
-    #[test]
-    fn steps_that_undo_each_other_leave_the_camera_where_it_was() {
-        let batch = [
-            Intent::Nudge(Step::towards(PanTiltDirection::Right)),
-            Intent::Nudge(Step::towards(PanTiltDirection::Left)),
-        ];
-
-        assert_eq!(coalesced(&batch), vec![Intent::Nudge(Step::STILL)]);
-    }
-
-    #[test]
-    fn a_step_does_not_swallow_the_drive_queued_beside_it() {
-        // Steps collapse among themselves and leave everything else alone.
-        let batch = [
-            Intent::Nudge(Step::towards(PanTiltDirection::Up)),
-            Intent::RecallPreset(2),
-        ];
-
-        assert_eq!(coalesced(&batch).len(), 2);
+        assert_eq!(coalesced(&taps), taps);
     }
 
     #[test]

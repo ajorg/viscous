@@ -10,16 +10,19 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+use grafton_visca::command::PanTiltDirection;
+
 use crate::{
     focus::FocusDrive,
+    nudge::Step,
     pan_tilt::{Velocity, velocity_from_axes},
     worker::Intent,
     zoom::ZoomDrive,
 };
 
 /// How far a movement key deflects its axis, as a fraction of full travel. A
-/// keyboard can only really express a couple of speeds, so the plain key is
-/// slow enough to frame a shot with, and shift is the fastest a control drives.
+/// keyboard can only really express a couple of speeds, so this is the one to
+/// frame a shot at, and [`FAST_KEY_DEFLECTION`] is the fastest a control drives.
 ///
 /// Chosen for the speed it comes out at rather than for the number itself: it
 /// lands on 5 of the 12 pan speeds a control asks for, which is the pace a held
@@ -28,6 +31,12 @@ use crate::{
 /// land in the same place the curve puts that speed, which is why steepening
 /// the curve moved this number without changing what the key does.
 pub const KEY_DEFLECTION: f32 = 0.8;
+
+/// The fastest a key drives, which zoom and focus reach by holding shift.
+///
+/// Pan and tilt no longer have a second speed to reach: shift is what tells
+/// an arrow to drive at all rather than to step, so it has no room left to
+/// also mean "faster". The pad and the stick still cover the whole range.
 pub const FAST_KEY_DEFLECTION: f32 = 1.0;
 
 /// A camera drive that runs for as long as its key is held down.
@@ -104,10 +113,13 @@ pub fn map_key(key: KeyEvent) -> Option<Action> {
     } else {
         KEY_DEFLECTION
     };
+    // Always the framing pace: shift is spent telling the arrow to drive
+    // instead of stepping, so there is no second pan/tilt speed for it to
+    // also ask for.
     let pan_tilt = |pan: f32, tilt: f32| {
         Action::Hold(Hold::PanTilt(velocity_from_axes(
-            pan * deflection,
-            tilt * deflection,
+            pan * KEY_DEFLECTION,
+            tilt * KEY_DEFLECTION,
         )))
     };
     // Both key deflections are well past the rocker's deadzone, so there is
@@ -124,11 +136,24 @@ pub fn map_key(key: KeyEvent) -> Option<Action> {
         ))
     };
 
+    let step = |direction| Action::Camera(Intent::Nudge(Step::towards(direction)));
+    let shifted = key.modifiers.contains(KeyModifiers::SHIFT);
+
     let action = match key.code {
-        KeyCode::Up => pan_tilt(0.0, 1.0),
-        KeyCode::Down => pan_tilt(0.0, -1.0),
-        KeyCode::Left => pan_tilt(-1.0, 0.0),
-        KeyCode::Right => pan_tilt(1.0, 0.0),
+        // Tapped, an arrow steps the camera one unit; held with shift it
+        // drives. Two gestures on one key, kept apart by the modifier rather
+        // than by how long the key was down: a control that has to be timed
+        // right is the wrong one to put precision on, and the pad and the
+        // stick already drive without needing the keyboard's help.
+        KeyCode::Up if shifted => pan_tilt(0.0, 1.0),
+        KeyCode::Down if shifted => pan_tilt(0.0, -1.0),
+        KeyCode::Left if shifted => pan_tilt(-1.0, 0.0),
+        KeyCode::Right if shifted => pan_tilt(1.0, 0.0),
+
+        KeyCode::Up => step(PanTiltDirection::Up),
+        KeyCode::Down => step(PanTiltDirection::Down),
+        KeyCode::Left => step(PanTiltDirection::Left),
+        KeyCode::Right => step(PanTiltDirection::Right),
 
         KeyCode::Char('[') | KeyCode::Char('-') => zoom(-1.0, deflection),
         KeyCode::Char(']') | KeyCode::Char('=') => zoom(1.0, deflection),
@@ -185,56 +210,64 @@ mod tests {
         }
     }
 
+    /// The step an arrow key asks for on its own.
+    fn stepped(code: KeyCode) -> Step {
+        match map_key(press(code, KeyModifiers::NONE)) {
+            Some(Action::Camera(Intent::Nudge(step))) => step,
+            other => panic!("expected a step, got {other:?}"),
+        }
+    }
+
     #[test]
-    fn arrows_hold_a_drive_in_their_own_direction() {
+    fn an_arrow_on_its_own_steps_the_way_it_points() {
+        assert_eq!(stepped(KeyCode::Up), Step::towards(PanTiltDirection::Up));
         assert_eq!(
-            held_velocity(KeyCode::Up, KeyModifiers::NONE).direction,
+            stepped(KeyCode::Down),
+            Step::towards(PanTiltDirection::Down)
+        );
+        assert_eq!(
+            stepped(KeyCode::Left),
+            Step::towards(PanTiltDirection::Left)
+        );
+        assert_eq!(
+            stepped(KeyCode::Right),
+            Step::towards(PanTiltDirection::Right)
+        );
+    }
+
+    #[test]
+    fn shift_and_an_arrow_hold_a_drive_in_their_own_direction() {
+        assert_eq!(
+            held_velocity(KeyCode::Up, KeyModifiers::SHIFT).direction,
             PanTiltDirection::Up
         );
         assert_eq!(
-            held_velocity(KeyCode::Down, KeyModifiers::NONE).direction,
+            held_velocity(KeyCode::Down, KeyModifiers::SHIFT).direction,
             PanTiltDirection::Down
         );
         assert_eq!(
-            held_velocity(KeyCode::Left, KeyModifiers::NONE).direction,
+            held_velocity(KeyCode::Left, KeyModifiers::SHIFT).direction,
             PanTiltDirection::Left
         );
         assert_eq!(
-            held_velocity(KeyCode::Right, KeyModifiers::NONE).direction,
+            held_velocity(KeyCode::Right, KeyModifiers::SHIFT).direction,
             PanTiltDirection::Right
         );
     }
 
     #[test]
-    fn shift_drives_the_same_direction_faster() {
-        let normal = held_velocity(KeyCode::Right, KeyModifiers::NONE);
-        let fast = held_velocity(KeyCode::Right, KeyModifiers::SHIFT);
-        assert_eq!(normal.direction, fast.direction);
-        assert!(
-            fast.pan_speed > normal.pan_speed,
-            "shift should ask for a faster pan ({} vs {})",
-            fast.pan_speed,
-            normal.pan_speed
-        );
-    }
+    fn a_shifted_arrow_drives_slowly_enough_to_frame_with() {
+        // A key has no travel to feel its way along, so it has to land on a
+        // usable pace by itself: fast enough to get somewhere, slow enough to
+        // follow something with. The response curve moved where a given
+        // deflection comes out, and this keeps `KEY_DEFLECTION` honest about
+        // the speed it was picked for.
+        let top = *crate::pan_tilt::PAN_SPEEDS.end();
+        let driven = held_velocity(KeyCode::Right, KeyModifiers::SHIFT).pan_speed;
 
-    #[test]
-    fn an_unmodified_arrow_drives_slowly_enough_to_frame_with() {
-        let normal = held_velocity(KeyCode::Right, KeyModifiers::NONE);
-        let fast = held_velocity(KeyCode::Right, KeyModifiers::SHIFT);
         assert!(
-            normal.pan_speed < fast.pan_speed / 2,
-            "the plain key should be well under half speed, not a notch off the top"
-        );
-        // And not so slow it can't get anywhere: a key has no travel to feel
-        // its way along, so it has to land on a usable pace by itself. The
-        // response curve moved where a given deflection comes out, and this
-        // is what keeps the constant honest about the speed it was picked for.
-        assert!(
-            normal.pan_speed > *crate::pan_tilt::PAN_SPEEDS.end() / 4,
-            "the plain key should still move the shot, got {} of {}",
-            normal.pan_speed,
-            *crate::pan_tilt::PAN_SPEEDS.end()
+            (top / 4..top / 2).contains(&driven),
+            "a driving arrow should be a framing pace, got {driven} of {top}"
         );
     }
 

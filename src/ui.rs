@@ -44,7 +44,7 @@ pub struct AppState {
 /// shares the footer with the status line and has to fit a narrow terminal
 /// whole, so it names one way to reach each control and leaves the synonyms
 /// (`-=` for zoom, `<>` for focus, ctrl-D for quit) to be discovered.
-pub const KEY_LEGEND: &str = "hold: arrows  []zoom  ,.focus  shift=fast  \
+pub const KEY_LEGEND: &str = "arrows step  shift=drive  []zoom  ,.focus  \
      1-6 preset  f auto  p power  q quit";
 
 /// The narrowest terminal [`KEY_LEGEND`] is expected to fit in.

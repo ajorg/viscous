@@ -12,7 +12,6 @@
 mod joystick;
 mod pad;
 mod rocker;
-mod taps;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -22,9 +21,8 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 use egui::{Key, TextWrapMode, Ui, Vec2, vec2};
-use grafton_visca::Error;
+use grafton_visca::{Error, command::PanTiltDirection};
 use pad::Controller;
-use taps::Arrows;
 use viscous::{
     config,
     connection::{self, Target, format_camera, format_version},
@@ -210,9 +208,6 @@ struct App {
     /// Whether there was a controller to read last frame, which decides how
     /// soon the next frame is asked for.
     in_hand: bool,
-    /// The arrow keys, which are two gestures rather than one: tapped they
-    /// step the camera, held they drive it.
-    arrows: Arrows,
 }
 
 impl Default for App {
@@ -244,7 +239,6 @@ impl Default for App {
             gamepad: Gamepad::default(),
             stick: Pad::default(),
             in_hand: false,
-            arrows: Arrows::default(),
         }
     }
 }
@@ -725,33 +719,19 @@ impl App {
     /// is a digit, not a preset, and an arrow key is a cursor.
     fn keyboard_drives(&mut self, ui: &Ui) -> Drives {
         if typing(ui) {
-            self.arrows.forget();
             return Drives::STOPPED;
         }
         let (steps, held) = ui.input(|input| {
-            let steps = self
-                .arrows
-                .update(|key| input.key_down(key), Instant::now());
-            // An arrow is read through `driving` rather than straight from the
-            // keyboard, so that a press still deciding whether it is a tap asks
-            // the camera for nothing. Every other key means what it always did.
-            let held = held_drives(
-                |key| {
-                    if Arrows::owns(key) {
-                        self.arrows.driving(key)
-                    } else {
-                        input.key_down(key)
-                    }
-                },
-                input.modifiers.shift,
-            );
-            (steps, held)
+            (
+                keyboard_steps(input),
+                held_drives(|key| input.key_down(key), input.modifiers.shift),
+            )
         });
         // A step is a movement like any other, so a camera that won't take a
         // drive won't take one of these either.
         if !self.asleep() {
-            for direction in steps {
-                self.send_intent(Intent::Nudge(Step::towards(direction)));
+            for step in steps {
+                self.send_intent(Intent::Nudge(step));
             }
         }
         self.drivable(held)
@@ -1110,9 +1090,9 @@ fn typing(ui: &Ui) -> bool {
 /// is down.
 ///
 /// The bindings are the TUI's, so the same fingers work in either front end:
-/// arrows pan and tilt, `[`/`]` or `-`/`=` zoom, `,`/`.` focus, and shift
-/// means full speed rather than the slower speed a shot is framed at. Page
-/// up/down zoom as well, which is what the camera's older Windows control
+/// shift and the arrows pan and tilt, `[`/`]` or `-`/`=` zoom, `,`/`.` focus,
+/// and shift means full speed on the two controls it hasn't been spent on.
+/// Page up/down zoom as well, which is what the camera's older Windows control
 /// panel used.
 fn held_drives(down: impl Fn(Key) -> bool, shift: bool) -> Drives {
     let deflection = if shift {
@@ -1120,9 +1100,12 @@ fn held_drives(down: impl Fn(Key) -> bool, shift: bool) -> Drives {
     } else {
         KEY_DEFLECTION
     };
+    // The framing pace whatever the modifiers say, unlike zoom and focus:
+    // shift is what tells an arrow to drive rather than step, so it is already
+    // spoken for and can't also mean "faster".
     let axis = |negative: Key, positive: Key| match (down(negative), down(positive)) {
-        (true, false) => -deflection,
-        (false, true) => deflection,
+        (true, false) => -KEY_DEFLECTION,
+        (false, true) => KEY_DEFLECTION,
         _ => 0.0,
     };
 
@@ -1134,13 +1117,60 @@ fn held_drives(down: impl Fn(Key) -> bool, shift: bool) -> Drives {
     let focus = opposed(down(Key::Comma), down(Key::Period), deflection);
 
     Drives {
-        pan_tilt: pan_tilt::velocity_from_axes(
-            axis(Key::ArrowLeft, Key::ArrowRight),
-            axis(Key::ArrowDown, Key::ArrowUp),
-        ),
+        // Only with shift, and always at the framing pace. Unmodified, an
+        // arrow steps the camera instead — see `keyboard_steps` — so shift is
+        // spent saying "drive" and has none left over to also say "faster".
+        pan_tilt: if shift {
+            pan_tilt::velocity_from_axes(
+                axis(Key::ArrowLeft, Key::ArrowRight),
+                axis(Key::ArrowDown, Key::ArrowUp),
+            )
+        } else {
+            Velocity::STOP
+        },
         zoom: ZoomDrive::from_deflection(zoom),
         focus: FocusDrive::from_deflection(focus),
     }
+}
+
+/// The steps the arrow keys were just pressed for.
+///
+/// Read from the frame's key events rather than from what is held down, so
+/// that one press is one step however long the key stays there. Repeats are
+/// skipped for the same reason: a finger resting on an arrow is not asking
+/// the camera to walk away, and there is no other way to say "no, just the
+/// one" once the terminal or the window has started repeating.
+///
+/// Nothing here needs to time how long a key was down, which is the point.
+/// The pad and the stick drive; the arrows step; neither has to guess which
+/// of the two the hand meant.
+fn keyboard_steps(input: &egui::InputState) -> Vec<Step> {
+    input
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            egui::Event::Key {
+                key,
+                pressed: true,
+                repeat: false,
+                modifiers,
+                ..
+            } if !modifiers.shift => step_for(*key),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The step an arrow key asks for, if it is one.
+fn step_for(key: Key) -> Option<Step> {
+    let direction = match key {
+        Key::ArrowUp => PanTiltDirection::Up,
+        Key::ArrowDown => PanTiltDirection::Down,
+        Key::ArrowLeft => PanTiltDirection::Left,
+        Key::ArrowRight => PanTiltDirection::Right,
+        _ => return None,
+    };
+    Some(Step::towards(direction))
 }
 
 /// How far two opposed keys push the rocker they share, which is nowhere when
@@ -1337,19 +1367,8 @@ mod tests {
             },
             intents: Some(intents),
             camera_state,
-            // Arrows that drive from the frame they go down on, which is what
-            // every test about driving is about. The tap window is its own
-            // subject, tested where it lives and in `taps_step_the_camera`.
-            arrows: Arrows::new(Duration::ZERO),
             ..App::default()
         };
-        (app, sent)
-    }
-
-    /// A connected app whose arrows tell a tap from a hold, as a real one's do.
-    fn tapping_app() -> (App, Receiver<Intent>) {
-        let (mut app, sent) = connected_app(None);
-        app.arrows = Arrows::default();
         (app, sent)
     }
 
@@ -1456,27 +1475,41 @@ mod tests {
         held_drives(|key| keys.contains(&key), false)
     }
 
+    /// The drives asked for while exactly `held` is down with shift.
+    fn shifted(keys: &[Key]) -> Drives {
+        held_drives(|key| keys.contains(&key), true)
+    }
+
     #[test]
-    fn the_arrow_keys_drive_pan_and_tilt() {
+    fn shift_and_the_arrow_keys_drive_pan_and_tilt() {
         assert_eq!(
-            held(&[Key::ArrowUp]).pan_tilt,
+            shifted(&[Key::ArrowUp]).pan_tilt,
             pan_tilt::velocity_from_axes(0.0, KEY_DEFLECTION)
         );
         assert_eq!(
-            held(&[Key::ArrowLeft, Key::ArrowDown]).pan_tilt,
+            shifted(&[Key::ArrowLeft, Key::ArrowDown]).pan_tilt,
             pan_tilt::velocity_from_axes(-KEY_DEFLECTION, -KEY_DEFLECTION)
         );
     }
 
     #[test]
-    fn shift_drives_at_the_speed_the_camera_is_capable_of() {
-        let fast = held_drives(|key| key == Key::ArrowRight, true);
+    fn an_arrow_key_on_its_own_drives_nothing() {
+        // It steps instead, which is `keyboard_steps`' business — and if it
+        // drove as well, one press would both step and start a slew.
+        assert!(held(&[Key::ArrowUp]).pan_tilt.is_stop());
+        assert!(held(&[Key::ArrowLeft, Key::ArrowDown]).pan_tilt.is_stop());
+    }
 
-        assert_eq!(
-            fast.pan_tilt,
-            pan_tilt::velocity_from_axes(FAST_KEY_DEFLECTION, 0.0)
+    #[test]
+    fn shift_drives_zoom_and_focus_at_the_speed_the_camera_is_capable_of() {
+        // Shift still means "faster" on the controls it hasn't been spent on.
+        let fast = held_drives(|key| key == Key::CloseBracket, true);
+
+        assert_eq!(fast.zoom, ZoomDrive::from_deflection(FAST_KEY_DEFLECTION));
+        assert!(
+            fast.zoom.unwrap().speed.value()
+                > held(&[Key::CloseBracket]).zoom.unwrap().speed.value()
         );
-        assert!(fast.pan_tilt.pan_speed > held(&[Key::ArrowRight]).pan_tilt.pan_speed);
     }
 
     #[test]
@@ -1547,36 +1580,45 @@ mod tests {
     }
 
     #[test]
-    fn a_held_arrow_key_drives_the_camera_and_releasing_it_stops() {
+    fn a_held_shifted_arrow_key_drives_the_camera_and_releasing_it_stops() {
         let (app, sent) = connected_app(None);
         let mut harness = ui_harness(app);
 
-        harness.key_down(Key::ArrowRight);
+        harness.key_down_modifiers(egui::Modifiers::SHIFT, Key::ArrowRight);
         harness.run();
-        let driving = sent.try_iter().collect::<Vec<_>>();
-
-        harness.key_up(Key::ArrowRight);
-        harness.run();
-        let released = sent.try_iter().collect::<Vec<_>>();
+        let driving = commands(&sent);
 
         assert_eq!(
-            driving,
-            vec![Intent::DrivePanTilt(pan_tilt::velocity_from_axes(
+            driving.first(),
+            Some(&Intent::DrivePanTilt(pan_tilt::velocity_from_axes(
                 KEY_DEFLECTION,
                 0.0
-            ))]
+            ))),
+            "shift and an arrow should drive"
         );
-        assert_eq!(released, vec![Intent::DrivePanTilt(Velocity::STOP)]);
+        assert!(
+            !driving
+                .iter()
+                .any(|intent| matches!(intent, Intent::Nudge(_))),
+            "and should not also step: one press is one gesture"
+        );
+        // The stop that follows in the same batch is the harness rather than
+        // the app: kittest puts the modifiers back to none right after the
+        // event it decorated, since it is built for chords like ctrl+C rather
+        // than for a modifier somebody is leaning on. A window gets the real
+        // modifier state with every frame.
+        assert_eq!(
+            driving.last(),
+            Some(&Intent::DrivePanTilt(Velocity::STOP)),
+            "letting go of shift should stop the camera, as letting go does"
+        );
     }
 
     #[test]
-    fn tapping_an_arrow_key_steps_the_camera_without_driving_it() {
-        let (app, sent) = tapping_app();
+    fn pressing_an_arrow_key_steps_the_camera_without_driving_it() {
+        let (app, sent) = connected_app(None);
         let mut harness = ui_harness(app);
 
-        // Down and back up inside the tap window, which is what a tap is: the
-        // frames a test runs take microseconds, not the fifth of a second an
-        // arrow has to be held for to drive.
         harness.key_down(Key::ArrowRight);
         harness.run();
         harness.key_up(Key::ArrowRight);
@@ -1585,13 +1627,31 @@ mod tests {
         assert_eq!(
             commands(&sent),
             vec![Intent::Nudge(Step::towards(PanTiltDirection::Right))],
-            "a tap should be one step and no drive at all"
+            "an arrow on its own should be one step and no drive at all"
         );
     }
 
     #[test]
-    fn tapping_an_arrow_key_at_a_sleeping_camera_asks_it_for_nothing() {
-        let (mut app, sent) = tapping_app();
+    fn holding_an_arrow_key_down_steps_once_rather_than_walking_away() {
+        // The property that replaced the timing window: a finger left resting
+        // on an arrow has asked for one step, and asking again is a new press.
+        let (app, sent) = connected_app(None);
+        let mut harness = ui_harness(app);
+
+        harness.key_down(Key::ArrowRight);
+        for _ in 0..5 {
+            harness.run();
+        }
+
+        assert_eq!(
+            commands(&sent),
+            vec![Intent::Nudge(Step::towards(PanTiltDirection::Right))]
+        );
+    }
+
+    #[test]
+    fn pressing_an_arrow_key_at_a_sleeping_camera_asks_it_for_nothing() {
+        let (mut app, sent) = connected_app(None);
         app.camera_state = Some(CameraState {
             power_on: false,
             lens: None,
@@ -1611,9 +1671,9 @@ mod tests {
 
     #[test]
     fn a_step_is_movement_and_so_says_nothing_in_the_status_line() {
-        // Taps come several at a time by design; each one announcing itself
+        // Steps come several at a time by design; each one announcing itself
         // would bury whatever the line was carrying.
-        let (mut app, _sent) = tapping_app();
+        let (mut app, _sent) = connected_app(None);
 
         app.send_intent(Intent::Nudge(Step::towards(PanTiltDirection::Right)));
 
@@ -1679,11 +1739,8 @@ mod tests {
         harness.run();
 
         assert_eq!(
-            sent.try_iter().collect::<Vec<_>>(),
-            vec![Intent::DrivePanTilt(pan_tilt::velocity_from_axes(
-                KEY_DEFLECTION,
-                0.0
-            ))],
+            commands(&sent),
+            vec![Intent::Nudge(Step::towards(PanTiltDirection::Right))],
             "a description field should let go of the keyboard on escape"
         );
     }
