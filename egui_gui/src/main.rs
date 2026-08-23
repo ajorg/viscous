@@ -1,7 +1,12 @@
-//! An eframe/egui GUI for viscous — a pure-Rust alternative to the
-//! Flutter+flutter_rust_bridge prototype kept on the `flutter-gui` branch.
-//! Being plain Rust, it needs no FFI/bridge/mirrored-type layer: it calls
-//! `viscous`'s existing worker/connection/state types directly.
+//! `viscous` — the window you point the camera from.
+//!
+//! The pad, the rockers and the preset column are here; everything they ask
+//! the camera for goes through the `viscous` library, the same way the
+//! terminal front end's keys do. Being plain Rust with the library as a path
+//! dependency, there is no FFI, bridge or mirrored-type layer between the two:
+//! this calls `viscous`'s own worker/connection/state types directly. (An
+//! earlier Flutter prototype needed all three, and is kept on the
+//! `flutter-gui` branch.)
 
 // Windows executables default to the console subsystem, which pops up a
 // terminal alongside the GUI window; switch to the windows subsystem in
@@ -656,8 +661,8 @@ impl App {
         if let Some(preset) = keyboard_preset(ui).filter(|_| live) {
             self.send_intent(Intent::RecallPreset(preset));
         }
-        // The same keys the TUI uses, so the fingers that learned them there
-        // reach the controls drawn just above.
+        // The same keys the terminal front end uses, so fingers that learned
+        // them there reach the controls drawn just above.
         if !typing(ui) {
             if live && ui.input(|input| input.key_pressed(Key::F)) {
                 self.send_intent(Intent::SetAutoFocus(!self.auto_focusing()));
@@ -1167,7 +1172,8 @@ fn typing(ui: &Ui) -> bool {
 /// The drives the held keys are asking for, given a way to ask whether a key
 /// is down.
 ///
-/// The bindings are the TUI's, so the same fingers work in either front end:
+/// The bindings are the shared ones, so the same fingers work in either front
+/// end — here and in the terminal:
 /// shift and the arrows pan and tilt, `[`/`]` or `-`/`=` zoom, `,`/`.` focus,
 /// and shift means full speed on the two controls it hasn't been spent on.
 /// Page up/down zoom as well, which is what the camera's older Windows control

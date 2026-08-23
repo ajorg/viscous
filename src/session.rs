@@ -1,10 +1,11 @@
-//! The interactive loop, shared by the TUI and the bare CLI: reads keys,
-//! turns held keys into continuous camera drives, and drains the worker
-//! thread's results.
+//! The interactive loop the two terminal front ends share — the full-screen
+//! one and the bare command mode: reads keys, turns held keys into continuous
+//! camera drives, and drains the worker thread's results.
 //!
-//! The two front ends differ only in where their output goes, which is what
-//! [`Report`] abstracts — so they can't drift apart on how movement actually
-//! behaves.
+//! The two differ only in where their output goes, which is what [`Report`]
+//! abstracts — so they can't drift apart on how movement actually behaves.
+//! (The window has its own loop, since egui owns the frame; what it shares
+//! with these is [`crate::keymap`] and the worker.)
 
 use std::io;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};

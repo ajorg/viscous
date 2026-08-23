@@ -33,7 +33,7 @@
 //! Windows). Everywhere else — including Windows, via a virtual null-modem
 //! pair from [com0com](https://com0com.sourceforge.net/) — pass an existing
 //! port name instead: `cargo run --example fake_camera -- COM10`, then point
-//! `viscous`/a GUI at the pair's other end (`COM11`).
+//! `viscous` or `viscous-tui` at the pair's other end (`COM11`).
 //!
 //! Passing `tcp://[host:]port` instead listens for VISCA over IP, which needs
 //! no virtual serial hardware on either side and reaches across machines: run
@@ -741,9 +741,9 @@ const DEFAULT_TCP_PORT: u16 = 5678;
 ///
 /// One at a time because a real camera is one camera: two clients driving it
 /// at once is the client's problem to avoid, not something to simulate away.
-/// But the connection itself has to be disposable — `viscous` reconnects
-/// during startup, and a GUI can disconnect and reconnect at any point — so
-/// the listener outlives any single client.
+/// But the connection itself has to be disposable — the client reconnects
+/// during startup, and the window can disconnect and reconnect at any point —
+/// so the listener outlives any single client.
 struct TcpPort {
     listener: TcpListener,
     client: Option<TcpStream>,
@@ -860,9 +860,9 @@ fn open_pty() -> io::Result<Box<dyn Transport>> {
         Err(io::Error::other(
             "no target given, and this platform can't provision a serial port automatically \
              (that's a Unix-only pty trick) — either run: cargo run --example fake_camera -- \
-             tcp://5678 (and point viscous/the GUI at tcp://localhost:5678), or install com0com \
+             tcp://5678 (and point viscous at tcp://localhost:5678), or install com0com \
              (https://com0com.sourceforge.net/), create a port pair (e.g. COM10 <-> COM11), then \
-             run: cargo run --example fake_camera -- COM10 (and point viscous/the GUI at COM11)",
+             run: cargo run --example fake_camera -- COM10 (and point viscous at COM11)",
         ))
     }
 }
@@ -895,7 +895,7 @@ fn main() -> io::Result<()> {
         // A pty master reads as EIO once every slave-side file descriptor is
         // closed (rather than blocking until a new one opens), a named port's
         // read simply times out while nothing's connected, and a TCP read
-        // ends at the moment the client hangs up. viscous itself disconnects
+        // ends at the moment the client hangs up. The client itself disconnects
         // and reconnects during serial startup (a short discovery probe, then
         // a fresh connection for the real session), so treat any read failure
         // as "no client right now" and wait for the next one instead of

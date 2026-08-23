@@ -1,11 +1,11 @@
-//! A bare command mode for when the TUI's full-screen redraws are more than
-//! you want to parse from a script (e.g. driving `viscous` over an
+//! A bare command mode for when the full-screen redraws are more than you want
+//! to parse from a script (e.g. driving `viscous-tui` over an
 //! `expect`-controlled pseudoterminal).
 //!
-//! This is the same interactive session as the TUI — same keys, same
+//! This is the same interactive session as the full-screen UI — same keys, same
 //! hold-to-drive movement, same debounced state query (see
 //! [`session`](crate::session)) — printing each result as a line of text
-//! instead of updating a rendered frame. Like the TUI it needs a real
+//! instead of updating a rendered frame. Like the full-screen UI it needs a real
 //! controlling terminal on stdin, since raw mode reads individual keystrokes
 //! without waiting for Enter; it's an alternative to the full-screen UI, not a
 //! way to drive the camera with no terminal at all.
