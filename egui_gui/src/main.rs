@@ -14,6 +14,7 @@
 
 mod joystick;
 mod pad;
+mod padlock;
 mod rocker;
 
 use std::collections::BTreeMap;
@@ -82,6 +83,19 @@ const TITLES: u8 = 3;
 /// often the sticks are noticed — and a hand that moves a stick expects the
 /// shot to move with it, not a tenth of a second later.
 const CONTROLLER_INTERVAL: Duration = Duration::from_millis(16);
+
+/// Where the Mark buttons are in their row and how big they are drawn, so the
+/// lock at the head of the column can be given the same.
+///
+/// Kept as a distance from the row's own left edge rather than as a position on
+/// screen: the whole column slides left and right as the pad beside it takes or
+/// gives up room, and a lock that aimed at last frame's screen position would
+/// chase the column across the window instead of standing over it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct MarkColumn {
+    offset: f32,
+    size: Vec2,
+}
 
 /// A line of feedback for the operator, and whether it reports a failure —
 /// the one kind that's worth colouring, since it's the one that needs looking
@@ -223,6 +237,9 @@ struct App {
     /// again at the new scale rather than the window keeping the size — and the
     /// minimum size — it was given at the old one.
     fitted_at_scale: Option<f32>,
+    /// Where the Mark buttons sat in their row when they were last drawn, which
+    /// is where the lock at the head of the column stands.
+    mark_column: Option<MarkColumn>,
     /// How much room the window offered the contents, and how much of it
     /// everything other than the pad took, when it was last drawn. The pad is
     /// given what's left over — measuring what the rest came to is steadier
@@ -273,6 +290,7 @@ impl Default for App {
             shown: false,
             fitted_at: None,
             fitted_at_scale: None,
+            mark_column: None,
             room: Vec2::ZERO,
             around_pad: Vec2::ZERO,
             pad_size: 0.0,
@@ -881,8 +899,9 @@ impl App {
     /// no reason a sleeping camera should stop anyone writing them down.
     fn draw_shots(&mut self, ui: &mut Ui, live: bool) {
         ui.horizontal(|ui| {
+            let left = ui.cursor().left();
             ui.label("Presets");
-            self.draw_marking_lock(ui);
+            self.draw_marking_lock(ui, left);
         });
         self.draw_presets(ui, live);
         space(ui, 1.5);
@@ -898,26 +917,30 @@ impl App {
         });
     }
 
-    /// The switch that arms the Mark column.
+    /// The switch that arms the Mark column: a padlock standing at the head of
+    /// it, the same width as the buttons it governs.
     ///
-    /// Named for the mode rather than for the lock, and drawn pressed in when
-    /// the Mark buttons work: what's on screen then matches what the column
-    /// does, which a button reading "Locked" while nothing is locked would not.
-    fn draw_marking_lock(&mut self, ui: &mut Ui) {
-        let locked = self.marking_locked;
-        let mut unlocked = !locked;
-        if ui
-            .toggle_value(&mut unlocked, "Marking")
-            .on_hover_text(if locked {
-                "Off, so a preset can't be overwritten by a mis-click. \
-                 Turn it on to store new shots."
-            } else {
-                "On: the Mark buttons will overwrite presets. \
-                 Turn it off once the shots are set."
-            })
-            .clicked()
-        {
-            self.marking_locked = !unlocked;
+    /// Placed and sized from where the Mark buttons were last drawn rather than
+    /// from adding up what they're made of. Their row is a fixed width, so the
+    /// measurement holds from one frame to the next; what it buys is that the
+    /// lock is over its column exactly, whatever egui decides a button is.
+    ///
+    /// Drawn pressed in while the Mark buttons work, which is the same thing
+    /// the open shackle says: two ways of reading one state, for a picture that
+    /// can be read either way on its own.
+    fn draw_marking_lock(&mut self, ui: &mut Ui, row_left: f32) {
+        let Some(column) = self.mark_column else {
+            // Nothing has been drawn to stand over yet. Better an empty header
+            // for one frame than a lock in a place the finished layout never
+            // puts it — this is also the frame the window is measured on.
+            return;
+        };
+        let gap = column.offset - (ui.cursor().left() - row_left);
+        if gap > 0.0 {
+            ui.add_space(gap);
+        }
+        if padlock::lock_button(ui, column.size, self.marking_locked) {
+            self.marking_locked = !self.marking_locked;
         }
     }
 
@@ -927,6 +950,7 @@ impl App {
 
         for number in 1..=PRESETS {
             ui.horizontal(|ui| {
+                let row_left = ui.cursor().left();
                 let description = self.preset_labels.get(&number).map(String::as_str);
                 if ui
                     .add_enabled(
@@ -950,14 +974,20 @@ impl App {
                 // it: next to a description field, a button reading "Save"
                 // looks like it saves the description, when what it stores is
                 // where the camera is pointing.
-                if ui
+                let mark = ui
                     .add_enabled(marking, egui::Button::new("Mark"))
                     .on_hover_text(format!(
                         "Store where the camera is pointing now as preset {number}"
                     ))
-                    .on_disabled_hover_text(if live { LOCKED_HINT } else { STANDBY_HINT })
-                    .clicked()
-                {
+                    .on_disabled_hover_text(if live { LOCKED_HINT } else { STANDBY_HINT });
+                // Where the lock will stand next frame. Taken from the button
+                // rather than worked out from the style, so the two are the
+                // same size by construction.
+                self.mark_column = Some(MarkColumn {
+                    offset: mark.rect.left() - row_left,
+                    size: mark.rect.size(),
+                });
+                if mark.clicked() {
                     self.send_intent(Intent::SavePreset(number));
                 }
             });
@@ -1191,7 +1221,7 @@ const STANDBY_HINT: &str = "The camera is in standby \u{2014} switch it on first
 
 /// What to say about a Mark button the lock is holding off. Points at the
 /// switch that arms it, which is at the head of the column it disarms.
-const LOCKED_HINT: &str = "Turn on Marking, above, to store presets";
+const LOCKED_HINT: &str = "Open the lock at the head of this column to store presets";
 
 /// What to say once the camera has refused a title.
 ///
@@ -2317,6 +2347,44 @@ mod tests {
         harness.run();
 
         assert_eq!(commands(&sent), vec![Intent::SavePreset(1)]);
+    }
+
+    #[test]
+    fn the_lock_stands_at_the_head_of_the_mark_column() {
+        let (app, _sent) = connected_app(None);
+        let mut harness = ui_harness(app);
+        harness.run();
+
+        let lock = harness.get_by_label("Marking").rect();
+        let mark = harness
+            .get_all_by_label("Mark")
+            .next()
+            .expect("there should be a Mark button for every preset")
+            .rect();
+
+        assert!(
+            (lock.width() - mark.width()).abs() < 0.5 && (lock.left() - mark.left()).abs() < 0.5,
+            "the lock should be the width of the column it governs and over it: \
+             {lock:?} against {mark:?}"
+        );
+        assert!(
+            lock.bottom() <= mark.top(),
+            "the lock heads the column rather than joining it: {lock:?} against {mark:?}"
+        );
+    }
+
+    #[test]
+    fn the_lock_says_which_way_it_is_to_a_screen_reader_too() {
+        let (app, _sent) = connected_app(None);
+        let mut harness = ui_harness(app);
+        harness.run();
+
+        let shut = harness.get_by_label("Marking").accesskit_node().toggled();
+        harness.get_by_label("Marking").click();
+        harness.run();
+        let open = harness.get_by_label("Marking").accesskit_node().toggled();
+
+        assert_ne!(shut, open, "the two states should read differently");
     }
 
     #[test]
