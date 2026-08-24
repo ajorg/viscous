@@ -950,6 +950,16 @@ impl App {
     /// rows the window is sized around shouldn't come and go.
     fn draw_titles(&mut self, ui: &mut Ui, live: bool) {
         let offered = live && self.titles_supported;
+        // A box the shape of the caption itself: fixed pitch, and exactly as
+        // many columns across as the camera has character cells. Measured in
+        // characters rather than in text height, since an em is as tall as the
+        // font rather than as wide as a letter — twenty of those would be half
+        // as wide again as anything that fits in twenty cells.
+        let font = egui::TextStyle::Monospace.resolve(ui.style());
+        let column = ui.ctx().fonts_mut(|fonts| fonts.glyph_width(&font, 'M'));
+        let margin = egui::Margin::symmetric(4, 2);
+        let width = column * title::LENGTH as f32 + margin.sum().x;
+
         for number in 1..=TITLES {
             ui.horizontal(|ui| {
                 let mut shown = self.shown_title == Some(number);
@@ -967,7 +977,16 @@ impl App {
                 }
 
                 let text = self.titles.entry(number).or_default();
-                if ui.text_edit_singleline(text).lost_focus() {
+                if ui
+                    .add(
+                        egui::TextEdit::singleline(text)
+                            .font(egui::TextStyle::Monospace)
+                            .char_limit(title::LENGTH)
+                            .margin(margin)
+                            .desired_width(width),
+                    )
+                    .lost_focus()
+                {
                     self.save_config();
                     // Editing the one on screen changes what is on screen.
                     if self.shown_title == Some(number) {
@@ -1907,6 +1926,56 @@ mod tests {
             .get_all_by_label("Show")
             .nth(usize::from(number) - 1)
             .expect("every title should have a Show checkbox")
+    }
+
+    /// The field for title `number`, found by position like the rest of the
+    /// column: the preset descriptions are drawn first, so the titles are the
+    /// text fields after them.
+    fn title_field<'a>(harness: &'a Harness<'_, App>, number: u8) -> egui_kittest::Node<'a> {
+        harness
+            .get_all_by_role(egui::accesskit::Role::TextInput)
+            .nth(usize::from(PRESETS + number) - 1)
+            .expect("every title should have a field")
+    }
+
+    #[test]
+    fn a_title_field_takes_what_the_camera_can_draw_and_no_more() {
+        let (app, _sent) = connected_app(None);
+        let mut harness = ui_harness(app);
+
+        title_field(&harness, 1).click();
+        harness.run();
+        title_field(&harness, 1).type_text("THE WHOLE CONGREGATION STANDING");
+        harness.run();
+
+        assert_eq!(
+            harness.state().titles.get(&1).map(String::as_str),
+            Some("THE WHOLE CONGREGATI"),
+            "the field should stop where the camera does, not silently drop the rest later"
+        );
+    }
+
+    #[test]
+    fn a_title_field_is_as_wide_as_the_caption_it_holds() {
+        let (app, _sent) = connected_app(None);
+        let mut harness = ui_harness(app);
+        harness.run();
+
+        let full = "M".repeat(title::LENGTH);
+        let style = harness.ctx.style_of(harness.ctx.theme());
+        let font = egui::TextStyle::Monospace.resolve(&style);
+        let caption = harness.ctx.fonts_mut(|fonts| {
+            fonts
+                .layout_no_wrap(full, font, egui::Color32::PLACEHOLDER)
+                .size()
+                .x
+        });
+        let box_width = title_field(&harness, 1).rect().width();
+
+        assert!(
+            (box_width - caption).abs() < 12.0,
+            "a {box_width}pt box for a {caption}pt caption is not the shape of what goes out"
+        );
     }
 
     #[test]
