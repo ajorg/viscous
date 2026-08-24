@@ -950,15 +950,18 @@ impl App {
     /// rows the window is sized around shouldn't come and go.
     fn draw_titles(&mut self, ui: &mut Ui, live: bool) {
         let offered = live && self.titles_supported;
-        // A box the shape of the caption itself: fixed pitch, and exactly as
-        // many columns across as the camera has character cells. Measured in
-        // characters rather than in text height, since an em is as tall as the
-        // font rather than as wide as a letter — twenty of those would be half
-        // as wide again as anything that fits in twenty cells.
-        let font = egui::TextStyle::Monospace.resolve(ui.style());
-        let column = ui.ctx().fonts_mut(|fonts| fonts.glyph_width(&font, 'M'));
+        // A box that holds a full title and no more of one. Twenty of the
+        // widest character the camera can draw, measured in the font this
+        // window draws in: proportional, so most titles leave room to spare,
+        // but none of them ever runs out of box before it runs out of camera.
+        let font = egui::TextStyle::Body.resolve(ui.style());
+        let widest = ui.ctx().fonts_mut(|fonts| {
+            title::drawable()
+                .map(|character| fonts.glyph_width(&font, character))
+                .fold(0.0, f32::max)
+        });
         let margin = egui::Margin::symmetric(4, 2);
-        let width = column * title::LENGTH as f32 + margin.sum().x;
+        let width = widest * title::LENGTH as f32 + margin.sum().x;
 
         for number in 1..=TITLES {
             ui.horizontal(|ui| {
@@ -980,7 +983,6 @@ impl App {
                 if ui
                     .add(
                         egui::TextEdit::singleline(text)
-                            .font(egui::TextStyle::Monospace)
                             .char_limit(title::LENGTH)
                             .margin(margin)
                             .desired_width(width),
@@ -1956,25 +1958,44 @@ mod tests {
     }
 
     #[test]
-    fn a_title_field_is_as_wide_as_the_caption_it_holds() {
+    fn a_title_field_holds_the_widest_title_the_camera_can_draw() {
+        // The field's own margins, which are chrome rather than caption.
+        const MARGIN: f32 = 8.0;
+
         let (app, _sent) = connected_app(None);
         let mut harness = ui_harness(app);
         harness.run();
 
-        let full = "M".repeat(title::LENGTH);
         let style = harness.ctx.style_of(harness.ctx.theme());
-        let font = egui::TextStyle::Monospace.resolve(&style);
-        let caption = harness.ctx.fonts_mut(|fonts| {
+        let font = egui::TextStyle::Body.resolve(&style);
+        // The worst a title can look: twenty of the widest character the
+        // camera has, laid out the way the window would draw them.
+        let worst = harness.ctx.fonts_mut(|fonts| {
+            let widest = title::drawable()
+                .max_by(|one, other| {
+                    fonts
+                        .glyph_width(&font, *one)
+                        .total_cmp(&fonts.glyph_width(&font, *other))
+                })
+                .expect("the camera draws something");
             fonts
-                .layout_no_wrap(full, font, egui::Color32::PLACEHOLDER)
+                .layout_no_wrap(
+                    widest.to_string().repeat(title::LENGTH),
+                    font,
+                    egui::Color32::PLACEHOLDER,
+                )
                 .size()
                 .x
         });
-        let box_width = title_field(&harness, 1).rect().width();
+        let room = title_field(&harness, 1).rect().width() - MARGIN;
 
         assert!(
-            (box_width - caption).abs() < 12.0,
-            "a {box_width}pt box for a {caption}pt caption is not the shape of what goes out"
+            room >= worst,
+            "a {worst}pt title in {room}pt of box would scroll out of sight while it was typed"
+        );
+        assert!(
+            room - worst < worst / title::LENGTH as f32,
+            "{room}pt leaves room for a character past the twenty the camera draws"
         );
     }
 

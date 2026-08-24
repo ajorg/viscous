@@ -88,6 +88,19 @@ impl fmt::Display for Title {
     }
 }
 
+/// Every character the camera can draw, for a front end sizing a box that has
+/// to hold [`LENGTH`] of them.
+///
+/// The widest of these is as wide as a title can get: anything else typed into
+/// a title becomes a space on the way out, so a box that fits twenty of the
+/// widest fits every title the camera will ever draw.
+pub fn drawable() -> impl Iterator<Item = char> {
+    CHARACTERS
+        .iter()
+        .copied()
+        .filter(|character| *character != char::REPLACEMENT_CHARACTER)
+}
+
 /// The camera's code for `character`, or a space if it can't draw it.
 fn encode(character: char) -> u8 {
     let code = |character| {
@@ -400,6 +413,21 @@ mod tests {
             .expect("camera should build from a scripted transport");
 
         assert!(supported(&camera));
+    }
+
+    #[test]
+    fn the_characters_offered_for_measuring_are_the_ones_the_camera_draws() {
+        for character in drawable() {
+            assert_eq!(
+                decode(&[encode(character)]),
+                character.to_string(),
+                "{character} is offered as one the camera draws"
+            );
+        }
+
+        // Every code but the Deutsche Mark sign, which stands for nothing that
+        // could be typed and so is nothing to measure.
+        assert_eq!(drawable().count(), CHARACTERS.len() - 1);
     }
 
     #[test]
