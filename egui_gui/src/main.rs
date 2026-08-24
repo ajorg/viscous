@@ -53,18 +53,24 @@ const FIRST_GUESS: &str = "/dev/ttyUSB0";
 /// How many preset slots to offer — the same six the TUI's number keys reach.
 const PRESETS: u8 = 6;
 
-/// How big a numbered recall button is drawn, and how tall the description
-/// field and the Mark button beside it are, both as multiples of the height of
-/// a line of body text.
+/// How much larger than egui's own default everything here is drawn.
 ///
-/// The recall buttons get much the largest target on the window after the pad
-/// itself, because of when they're used: mid-service, in a hurry, by someone
-/// watching the picture rather than the screen. A miss there puts the wrong
-/// shot on air. Fixed multiples of the text rather than a share of the window,
-/// so they follow the interface scale and leave the window's spare room to the
-/// pad and the rockers, which are the controls that get better for having it.
-const RECALL_BUTTON: Vec2 = vec2(2.4, 2.6);
-const FIELD: f32 = 1.7;
+/// The controls are reached for mid-service, in a hurry, by someone watching
+/// the picture rather than the screen, and default desktop text is smaller than
+/// that deserves. Scaling the interface rather than any one widget is what
+/// keeps a row a row: every button, field and gap grows by the same amount, so
+/// what lined up before still lines up. Ctrl+plus and Ctrl+minus go on working
+/// from here for anyone who wants it larger still.
+const INTERFACE_SCALE: f32 = 1.3;
+
+/// How wide a numbered recall button is drawn, as a multiple of the height of a
+/// line of body text.
+///
+/// The one place a widget is given more than its contents ask for: a digit is a
+/// narrow thing to aim at, and these are the buttons that put a shot on air.
+/// Width only — the height stays the row's, since a button standing taller than
+/// the field beside it is what pulled the column out of line.
+const RECALL_WIDTH: f32 = 2.0;
 
 /// How many titles to keep on hand. The camera holds one at a time; these are
 /// the ones an operator switches between during a session.
@@ -195,6 +201,10 @@ struct App {
     /// The window size most recently asked for, so the request only goes out
     /// when the size the contents need actually changes.
     requested_size: Option<Vec2>,
+    /// Whether the window has been let out of hiding yet. It opens invisible
+    /// and is shown by the first fit; every fit after that is a resize of a
+    /// window already on screen.
+    shown: bool,
     /// The frame on which the window was sized around the controls, if that
     /// has happened yet.
     ///
@@ -205,6 +215,14 @@ struct App {
     /// rather than kept as a flag because egui can lay a frame out more than
     /// once, and the two halves of that must not land in the same frame.
     fitted_at: Option<u64>,
+    /// The interface scale the window was last fitted at.
+    ///
+    /// A fit is in points, and a point is however many pixels the scale says,
+    /// so the same layout wants a different window after Ctrl+plus. Noticing
+    /// the change is what makes the built-in zoom work here: the fit is taken
+    /// again at the new scale rather than the window keeping the size — and the
+    /// minimum size — it was given at the old one.
+    fitted_at_scale: Option<f32>,
     /// How much room the window offered the contents, and how much of it
     /// everything other than the pad took, when it was last drawn. The pad is
     /// given what's left over — measuring what the rest came to is steadier
@@ -252,7 +270,9 @@ impl Default for App {
             camera: None,
             config_path: None,
             requested_size: None,
+            shown: false,
             fitted_at: None,
+            fitted_at_scale: None,
             room: Vec2::ZERO,
             around_pad: Vec2::ZERO,
             pad_size: 0.0,
@@ -476,6 +496,7 @@ impl App {
         self.poll_connect();
         self.drain_results();
         self.send_query_state_if_due();
+        self.note_scale(ui.ctx().zoom_factor());
 
         let frame = egui::Frame::central_panel(ui.style());
         let margin = frame.total_margin();
@@ -554,6 +575,21 @@ impl App {
         });
     }
 
+    /// Takes the fit again whenever the interface is drawn at a new scale.
+    ///
+    /// A window fitted at one scale is the wrong window at the next: the layout
+    /// asks for the same number of points either way, and it is the points that
+    /// changed size. Forgetting the fit rather than adjusting it lets the same
+    /// two frames that size the window at startup do it again here.
+    fn note_scale(&mut self, scale: f32) {
+        if self.fitted_at_scale == Some(scale) {
+            return;
+        }
+        self.fitted_at_scale = Some(scale);
+        self.fitted_at = None;
+        self.requested_size = None;
+    }
+
     /// Asks for a window of exactly `size`, and shows it once there's a size
     /// worth showing it at.
     ///
@@ -569,11 +605,11 @@ impl App {
         if self.fitted_at.is_some() || self.requested_size == Some(size) {
             return;
         }
-        let first_fit = self.requested_size.is_none();
         self.requested_size = Some(size);
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
-        if first_fit {
+        if !self.shown {
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            self.shown = true;
         }
         if matches!(self.connection, Connection::Connected { .. }) {
             ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(size));
@@ -887,10 +923,6 @@ impl App {
 
     fn draw_presets(&mut self, ui: &mut Ui, live: bool) {
         let text = ui.text_style_height(&egui::TextStyle::Body);
-        // Taller than a line of text: this is a field to read back at a glance
-        // rather than only to type into, and it sets the height the Mark button
-        // beside it is drawn at.
-        let field = egui::Margin::symmetric(4, ((text * (FIELD - 1.0)) / 2.0) as i8);
         let marking = live && !self.marking_locked;
 
         for number in 1..=PRESETS {
@@ -899,7 +931,8 @@ impl App {
                 if ui
                     .add_enabled(
                         live,
-                        egui::Button::new(number.to_string()).min_size(RECALL_BUTTON * text),
+                        egui::Button::new(number.to_string())
+                            .min_size(vec2(text * RECALL_WIDTH, 0.0)),
                     )
                     .on_hover_text(recall_tooltip(number, description))
                     .on_disabled_hover_text(STANDBY_HINT)
@@ -909,10 +942,7 @@ impl App {
                 }
 
                 let description = self.preset_labels.entry(number).or_default();
-                if ui
-                    .add(egui::TextEdit::singleline(description).margin(field))
-                    .lost_focus()
-                {
+                if ui.add(egui::TextEdit::singleline(description)).lost_focus() {
                     self.save_config();
                 }
 
@@ -921,10 +951,7 @@ impl App {
                 // looks like it saves the description, when what it stores is
                 // where the camera is pointing.
                 if ui
-                    .add_enabled(
-                        marking,
-                        egui::Button::new("Mark").min_size(vec2(0.0, text * FIELD)),
-                    )
+                    .add_enabled(marking, egui::Button::new("Mark"))
                     .on_hover_text(format!(
                         "Store where the camera is pointing now as preset {number}"
                     ))
@@ -1444,7 +1471,13 @@ fn main() -> std::process::ExitCode {
     let run = eframe::run_native(
         "Viscous",
         options,
-        Box::new(|_cc| {
+        Box::new(|cc| {
+            // Once, at startup, rather than every frame: this is where the
+            // interface starts, not where it is pinned. Ctrl+plus and
+            // Ctrl+minus move it from here, and a window that reasserted the
+            // scale each frame would take that away again.
+            cc.egui_ctx.set_zoom_factor(INTERFACE_SCALE);
+
             let mut app = App::with_config(config::default_path().ok());
             app.controller = pad::Attached::open().map(|attached| Box::new(attached) as Box<_>);
             Ok(Box::new(app))
@@ -2215,12 +2248,11 @@ mod tests {
     }
 
     #[test]
-    fn a_preset_is_a_bigger_target_than_the_controls_around_it() {
+    fn a_preset_row_is_one_line_of_controls_all_the_same_height() {
         let (app, _sent) = marking_app(None);
         let harness = ui_harness(app);
 
         let recall = harness.get_by_label("1").rect();
-        let ordinary = harness.get_by_label("Marking").rect().height();
         let mark = harness
             .get_all_by_label("Mark")
             .next()
@@ -2228,18 +2260,26 @@ mod tests {
             .rect();
         let field = description_field(&harness, 1).rect();
 
+        // Within a point: egui draws a text field a hair taller than a button,
+        // which is the difference the eye reads as level.
+        for (name, other) in [("Mark", mark), ("the description field", field)] {
+            assert!(
+                (recall.height() - other.height()).abs() <= 1.0,
+                "the number should sit level with {name}: {recall:?} against {other:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_preset_number_is_a_wider_target_than_its_digit() {
+        let (app, _sent) = marking_app(None);
+        let harness = ui_harness(app);
+
+        let recall = harness.get_by_label("1").rect();
+
         assert!(
-            recall.height() > ordinary * 1.8 && recall.width() > ordinary * 1.4,
-            "a preset is reached for in a hurry and needs the room: {recall:?} \
-             against an ordinary {ordinary}"
-        );
-        assert!(
-            (mark.height() - field.height()).abs() < 1.0,
-            "Mark should sit level with the field it belongs to: {mark:?} and {field:?}"
-        );
-        assert!(
-            field.height() < recall.height(),
-            "the row should grow, but the button it is named by should grow more"
+            recall.width() > recall.height() * 1.3,
+            "a digit alone would leave a button barely wider than it is tall: {recall:?}"
         );
     }
 
@@ -2867,6 +2907,29 @@ mod tests {
             app.pad_size > natural,
             "the pad should take the room the window has spare ({natural} then {})",
             app.pad_size
+        );
+    }
+
+    #[test]
+    fn a_window_drawn_at_a_new_scale_is_measured_again() {
+        let ctx = egui::Context::default();
+        let screen = vec2(1600.0, 1200.0);
+        let (mut app, _sent) = connected_app(None);
+
+        let fit = requested_size(&frame_on_screen(&mut app, &ctx, screen))
+            .expect("the first frame should size the window");
+        frame_on_screen(&mut app, &ctx, screen);
+        ctx.set_zoom_factor(ctx.zoom_factor() * 1.5);
+        let rescaled = requested_size(&frame_on_screen(&mut app, &ctx, screen))
+            .expect("a new scale should have the window sized again");
+
+        // The same layout wants the same points at either scale; what changed
+        // is how many pixels a point is, which is why the ask has to go out
+        // again at all.
+        assert!(
+            (rescaled - fit).length() < 2.0,
+            "the refit should be the same window, not a different one: \
+             {rescaled:?} against {fit:?}"
         );
     }
 
