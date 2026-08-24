@@ -5,10 +5,19 @@
 //! one costs less than carrying a font for two glyphs — the pad and the rockers
 //! are painted here for the same reason.
 //!
-//! The shackle says which way the lock is: closed and sitting in the body when
-//! marking is locked, swung open when it isn't. That is the state, not the
-//! action — see [`tooltip`], which is where the action is spelled out, since a
-//! padlock alone can be read either way.
+//! The shackle says which way the lock is: seated in the body when marking is
+//! locked, sprung open when it isn't. That is the state, not the action — see
+//! [`tooltip`], which is where the action is spelled out, since a padlock alone
+//! can be read either way.
+//!
+//! Drawn the way the mechanism actually works. A modern shackle has a long leg
+//! and a short one: the long leg — the heel — lives deep in a bore and is held
+//! there by a retaining groove, and the short one, the toe, is what the latch
+//! catches. Releasing the latch lets a spring drive the whole bar *straight up*
+//! until the toe is clear of the body while the heel is still buried. The
+//! swivel that follows turns about the heel's own axis, which is vertical, so
+//! it sweeps out of the plane this is drawn in and is left out: the lift is the
+//! part of the motion a front view can tell the truth about.
 
 use egui::{Rect, Sense, Shape, Stroke, StrokeKind, Ui, Vec2, pos2, vec2};
 
@@ -18,23 +27,29 @@ const FILL: f32 = 0.68;
 
 /// The padlock's parts, as fractions of that height: the body's width and
 /// height, the shackle's radius and the thickness of its wire, and how far the
-/// shackle's shoulders stand above the body.
+/// shackle's shoulders stand above the body when it is shut.
 ///
-/// The four heights add up to the whole — body, shoulder, shackle and half the
-/// wire it is stroked with — so the lock fills the height it is given rather
-/// than sitting somewhere inside it.
-const BODY: Vec2 = vec2(0.85, 0.58);
-const SHOULDER: f32 = 0.10;
-const SHACKLE: f32 = 0.26;
-const WIRE: f32 = 0.12;
+/// These and [`LIFT`] add up to the whole — lift, shoulder, shackle and half
+/// the wire it is stroked with, on top of the body — so an open lock fills the
+/// height it is given, and a shut one leaves exactly the headroom its shackle
+/// will rise into.
+const BODY: Vec2 = vec2(0.74, 0.45);
+const SHOULDER: f32 = 0.06;
+const SHACKLE: f32 = 0.24;
+const WIRE: f32 = 0.10;
 
-/// How far the shackle swings when the lock opens, about the heel of the leg
-/// that stays in the body.
+/// How far into the body each leg reaches when the lock is shut: the heel,
+/// which stays captive, and the toe, which the latch catches.
 ///
-/// Negative because screen y grows downward: this lifts the free leg up and
-/// away. Far enough that the gap it leaves is unmistakable at the size a line
-/// of text is, and not so far that the bar stands on end.
-const OPEN_TURN: f32 = -0.7;
+/// Hidden behind the body either way — the body is painted over them — but they
+/// are what makes the lift mean something. [`LIFT`] has to be longer than the
+/// toe, so the toe comes clear, and shorter than the heel, so the heel doesn't.
+const HEEL: f32 = 0.32;
+const TOE: f32 = 0.03;
+
+/// How far the shackle springs when the lock opens: straight up, the whole bar,
+/// far enough that the gap under the toe reads at the size a line of text is.
+const LIFT: f32 = 0.22;
 
 /// How many straight segments the shackle's arc is drawn with. Enough that the
 /// curve reads as one at the size a line of text is.
@@ -103,10 +118,10 @@ fn shapes(rect: Rect, locked: bool, color: egui::Color32) -> Vec<Shape> {
     let radius = unit(SHACKLE);
     let center = pos2(body.center().x, body.top() - unit(SHOULDER));
 
-    // One bent bar: a leg, the bend over the top, and the other leg. Built the
-    // same both ways, because a shackle is a piece of steel and steel does not
-    // get shorter when a lock opens.
-    let mut shackle = vec![pos2(center.x - radius, body.top())];
+    // One bent bar of unequal legs: the long heel, the bend over the top, the
+    // short toe. Built the same both ways, because a shackle is a piece of
+    // steel and steel neither shortens nor grows a leg when a lock opens.
+    let mut shackle = vec![pos2(center.x - radius, body.top() + unit(HEEL))];
     shackle.extend((0..=ARC_STEPS).map(|step| {
         let turn = std::f32::consts::PI * (1.0 + step as f32 / ARC_STEPS as f32);
         pos2(
@@ -114,17 +129,15 @@ fn shapes(rect: Rect, locked: bool, color: egui::Color32) -> Vec<Shape> {
             center.y + radius * turn.sin(),
         )
     }));
-    shackle.push(pos2(center.x + radius, body.top()));
+    shackle.push(pos2(center.x + radius, body.top() + unit(TOE)));
 
-    // Open, the whole bar swings about the heel of the leg that stays in the
-    // body — the one place it is held. Everything else follows rigidly, which
-    // is what lifts the far leg out of its hole and leaves the gap that says
-    // the lock is open.
+    // Open, the spring drives the whole bar straight up. Nothing turns: the
+    // swivel a padlock has is about the heel's own axis and sweeps out of this
+    // plane. The toe rises clear of the body and the heel stays in it, which is
+    // the whole of what the picture has to say.
     if !locked {
-        let heel = shackle[0];
-        let swing = egui::emath::Rot2::from_angle(OPEN_TURN);
         for point in &mut shackle {
-            *point = heel + swing * (*point - heel);
+            point.y -= unit(LIFT);
         }
     }
 
@@ -172,16 +185,26 @@ mod tests {
         );
     }
 
+    /// The two ends of the bar: the long heel and the short toe.
+    fn ends(locked: bool) -> (egui::Pos2, egui::Pos2) {
+        let bar = shackle(locked);
+        (bar[0], *bar.last().expect("the bar has two ends"))
+    }
+
     #[test]
-    fn a_shut_lock_has_both_legs_in_the_body() {
-        let shut = shackle(true);
+    fn a_shut_lock_has_both_legs_down_inside_the_body() {
+        let (heel, toe) = ends(true);
         let top = body(true).top();
 
-        let legs = shut
-            .iter()
-            .filter(|point| (point.y - top).abs() < 0.01)
-            .count();
-        assert_eq!(legs, 2, "both ends should reach the body: {shut:?}");
+        assert!(
+            heel.y > top && toe.y > top,
+            "shut, both legs are in their bores: heel {heel:?}, toe {toe:?}, top {top}"
+        );
+        assert!(
+            heel.y > toe.y,
+            "the heel is the long leg — it reaches deeper than the toe: \
+             {heel:?} against {toe:?}"
+        );
     }
 
     /// The length of every straight run of the bar, in order — the shackle's
@@ -211,48 +234,52 @@ mod tests {
     }
 
     #[test]
-    fn the_shackle_swings_about_the_leg_that_stays_in_the_body() {
+    fn opening_it_lifts_the_bar_straight_up_and_turns_nothing() {
         let (shut, open) = (shackle(true), shackle(false));
 
-        assert!(
-            shut[0].distance(open[0]) < 0.01,
-            "the heel is the one place it is held: {:?} moved to {:?}",
-            shut[0],
-            open[0]
-        );
-        assert!(
-            open[1].x > open[0].x || open[1].y != shut[1].y,
-            "the leg above the heel should have tilted with it: {open:?}"
-        );
+        for (shut, open) in shut.iter().zip(&open) {
+            assert!(
+                (shut.x - open.x).abs() < 0.01,
+                "a shackle rises in its bores; it does not swing in this plane: \
+                 {shut:?} became {open:?}"
+            );
+            assert!(
+                open.y < shut.y,
+                "and it rises rather than sinks: {shut:?} became {open:?}"
+            );
+        }
     }
 
     #[test]
-    fn an_open_lock_leaves_the_far_leg_clear_of_its_hole() {
-        let open = shackle(false);
-        let shut = shackle(true);
+    fn opening_it_frees_the_toe_and_keeps_the_heel() {
+        let (heel, toe) = ends(false);
         let top = body(false).top();
 
-        let free = *open.last().expect("the bar has two ends");
         assert!(
-            free.y < top - 0.5,
-            "the far leg should be out of the body, not resting on it: {free:?}"
+            toe.y < top - 1.0,
+            "the toe should stand clear of the body with a gap that reads: \
+             {toe:?} against a top at {top}"
         );
         assert!(
-            free.distance(*shut.last().expect("the bar has two ends")) > 1.0,
-            "and visibly moved from where it sat when shut: {free:?}"
+            heel.y > top,
+            "the heel stays captive, or the shackle would be in your hand: \
+             {heel:?} against a top at {top}"
         );
     }
 
     #[test]
-    fn the_lock_fills_the_height_it_is_given() {
+    fn the_open_lock_fills_the_height_it_is_given() {
+        // The open one, because that is the taller of the two: a shut lock
+        // leaves the headroom its shackle is about to rise into, rather than
+        // the whole lock shifting down the button when it opens.
         let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(40.0, 20.0));
-        let shut = shackle(true);
+        let open = shackle(false);
         let drawn = Rect::from_min_max(
             pos2(
                 0.0,
-                shut.iter().map(|point| point.y).fold(f32::MAX, f32::min),
+                open.iter().map(|point| point.y).fold(f32::MAX, f32::min),
             ),
-            pos2(0.0, body(true).bottom()),
+            pos2(0.0, body(false).bottom()),
         );
 
         assert!(
