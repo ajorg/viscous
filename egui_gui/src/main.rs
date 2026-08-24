@@ -2,11 +2,9 @@
 //!
 //! The pad, the rockers and the preset column are here; everything they ask
 //! the camera for goes through the `viscous` library, the same way the
-//! terminal front end's keys do. Being plain Rust with the library as a path
-//! dependency, there is no FFI, bridge or mirrored-type layer between the two:
-//! this calls `viscous`'s own worker/connection/state types directly. (An
-//! earlier Flutter prototype needed all three, and is kept on the
-//! `flutter-gui` branch.)
+//! terminal front end's keys do — a path dependency on it and nothing in
+//! between, so the intents this sends and the outcomes it draws are the
+//! library's own types rather than copies of them.
 
 // Windows executables default to the console subsystem, which pops up a
 // terminal alongside the GUI window; switch to the windows subsystem in
