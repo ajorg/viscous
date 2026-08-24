@@ -726,9 +726,6 @@ impl App {
             }
         }
 
-        space(ui, 1.0);
-        draw_key_help(ui);
-
         if let Some(lens) = self.camera_state.and_then(|state| state.lens) {
             space(ui, 1.0);
             // Power and focus mode are already shown by the lamp and the
@@ -1362,23 +1359,6 @@ fn keyboard_preset(ui: &Ui) -> Option<u8> {
             .position(|key| input.key_pressed(*key))
             .map(|index| index as u8 + 1)
     })
-}
-
-/// The keys, spelled out: they aren't discoverable from the buttons the way
-/// the pad and the drives are, and the camera's older Windows control panel
-/// listed its own the same way.
-fn draw_key_help(ui: &mut Ui) {
-    ui.small("Drag the pad and push the rockers \u{2014} further is faster");
-    ui.small("Arrows pan and tilt, [ ] or PgUp/PgDn zoom, , and . focus");
-    ui.small("Shift on any of those drives at full speed");
-    ui.small("Keys 1-6 go to presets, f switches auto focus, p switches power");
-    // Always said, whether or not one is plugged in: a controller that turns
-    // out to be silent is worth being able to tell from one nobody knew this
-    // window would take — and the pad and rockers follow the sticks, so what
-    // this promises can be checked at a glance.
-    ui.small("A controller drives too: sticks pan/tilt and zoom, triggers focus");
-    ui.small("A/B/X/Y and the bumpers are presets 1-6, Start and one marks it");
-    ui.small("Stick clicks are Home and auto focus, Start+Back switches power");
 }
 
 /// Opens a gap of `gaps` of the style's own spacing between widgets.
