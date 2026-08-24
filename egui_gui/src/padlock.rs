@@ -24,9 +24,17 @@ const FILL: f32 = 0.68;
 /// wire it is stroked with — so the lock fills the height it is given rather
 /// than sitting somewhere inside it.
 const BODY: Vec2 = vec2(0.85, 0.58);
-const SHOULDER: f32 = 0.06;
-const SHACKLE: f32 = 0.30;
+const SHOULDER: f32 = 0.10;
+const SHACKLE: f32 = 0.26;
 const WIRE: f32 = 0.12;
+
+/// How far the shackle swings when the lock opens, about the heel of the leg
+/// that stays in the body.
+///
+/// Negative because screen y grows downward: this lifts the free leg up and
+/// away. Far enough that the gap it leaves is unmistakable at the size a line
+/// of text is, and not so far that the bar stands on end.
+const OPEN_TURN: f32 = -0.7;
 
 /// How many straight segments the shackle's arc is drawn with. Enough that the
 /// curve reads as one at the size a line of text is.
@@ -93,27 +101,31 @@ fn shapes(rect: Rect, locked: bool, color: egui::Color32) -> Vec<Shape> {
     );
     let wire = Stroke::new(unit(WIRE), color);
     let radius = unit(SHACKLE);
-    // The closed shackle stands in the middle of the body; the open one has
-    // swung up and to the right, so its far leg no longer reaches.
-    let center = pos2(
-        body.center().x + if locked { 0.0 } else { radius },
-        body.top() - unit(SHOULDER),
-    );
+    let center = pos2(body.center().x, body.top() - unit(SHOULDER));
 
-    let mut shackle: Vec<_> = (0..=ARC_STEPS)
-        .map(|step| {
-            let turn = std::f32::consts::PI * (1.0 + step as f32 / ARC_STEPS as f32);
-            pos2(
-                center.x + radius * turn.cos(),
-                center.y + radius * turn.sin(),
-            )
-        })
-        .collect();
-    // The near leg drops into the body either way; the far one only when the
-    // lock is shut, which is the whole of the difference between the two.
-    shackle.insert(0, pos2(center.x - radius, body.top()));
-    if locked {
-        shackle.push(pos2(center.x + radius, body.top()));
+    // One bent bar: a leg, the bend over the top, and the other leg. Built the
+    // same both ways, because a shackle is a piece of steel and steel does not
+    // get shorter when a lock opens.
+    let mut shackle = vec![pos2(center.x - radius, body.top())];
+    shackle.extend((0..=ARC_STEPS).map(|step| {
+        let turn = std::f32::consts::PI * (1.0 + step as f32 / ARC_STEPS as f32);
+        pos2(
+            center.x + radius * turn.cos(),
+            center.y + radius * turn.sin(),
+        )
+    }));
+    shackle.push(pos2(center.x + radius, body.top()));
+
+    // Open, the whole bar swings about the heel of the leg that stays in the
+    // body — the one place it is held. Everything else follows rigidly, which
+    // is what lifts the far leg out of its hole and leaves the gap that says
+    // the lock is open.
+    if !locked {
+        let heel = shackle[0];
+        let swing = egui::emath::Rot2::from_angle(OPEN_TURN);
+        for point in &mut shackle {
+            *point = heel + swing * (*point - heel);
+        }
     }
 
     vec![
@@ -172,23 +184,62 @@ mod tests {
         assert_eq!(legs, 2, "both ends should reach the body: {shut:?}");
     }
 
-    #[test]
-    fn an_open_lock_has_one_leg_free_and_the_shackle_swung_aside() {
-        let open = shackle(false);
-        let top = body(false).top();
+    /// The length of every straight run of the bar, in order — the shackle's
+    /// dimensions, which are the thing that cannot change.
+    fn segments(locked: bool) -> Vec<f32> {
+        shackle(locked)
+            .windows(2)
+            .map(|pair| pair[0].distance(pair[1]))
+            .collect()
+    }
 
-        let legs = open
-            .iter()
-            .filter(|point| (point.y - top).abs() < 0.01)
-            .count();
-        assert_eq!(legs, 1, "only the near leg should reach the body: {open:?}");
+    #[test]
+    fn opening_the_lock_moves_the_shackle_without_resizing_it() {
+        let (shut, open) = (segments(true), segments(false));
+
+        assert_eq!(
+            shut.len(),
+            open.len(),
+            "the bar should not gain or lose parts"
+        );
+        for (shut, open) in shut.iter().zip(&open) {
+            assert!(
+                (shut - open).abs() < 0.01,
+                "a shackle is steel: {shut} became {open}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_shackle_swings_about_the_leg_that_stays_in_the_body() {
+        let (shut, open) = (shackle(true), shackle(false));
+
         assert!(
-            open.last().expect("the arc should have an end").y < top,
-            "the far end should hang above the body: {open:?}"
+            shut[0].distance(open[0]) < 0.01,
+            "the heel is the one place it is held: {:?} moved to {:?}",
+            shut[0],
+            open[0]
         );
         assert!(
-            open.iter().any(|point| point.x > body(false).right()),
-            "the shackle should have swung clear of the body: {open:?}"
+            open[1].x > open[0].x || open[1].y != shut[1].y,
+            "the leg above the heel should have tilted with it: {open:?}"
+        );
+    }
+
+    #[test]
+    fn an_open_lock_leaves_the_far_leg_clear_of_its_hole() {
+        let open = shackle(false);
+        let shut = shackle(true);
+        let top = body(false).top();
+
+        let free = *open.last().expect("the bar has two ends");
+        assert!(
+            free.y < top - 0.5,
+            "the far leg should be out of the body, not resting on it: {free:?}"
+        );
+        assert!(
+            free.distance(*shut.last().expect("the bar has two ends")) > 1.0,
+            "and visibly moved from where it sat when shut: {free:?}"
         );
     }
 
@@ -219,19 +270,11 @@ mod tests {
     }
 
     #[test]
-    fn both_locks_are_drawn_at_the_same_size_in_the_same_place() {
-        assert_eq!(body(true), body(false));
-
-        let (shut, open) = (shackle(true), shackle(false));
-        let highest = |points: &[egui::Pos2]| {
-            points
-                .iter()
-                .map(|point| point.y)
-                .fold(f32::INFINITY, f32::min)
-        };
-        assert!(
-            (highest(&shut) - highest(&open)).abs() < 0.01,
-            "the shackle should swing, not jump: {shut:?} against {open:?}"
+    fn the_body_stays_where_it_is_whichever_way_the_lock_is() {
+        assert_eq!(
+            body(true),
+            body(false),
+            "the shackle moves; the lock it hangs on does not"
         );
     }
 
