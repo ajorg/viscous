@@ -81,6 +81,44 @@ impl Velocity {
     pub fn is_stop(self) -> bool {
         self.direction == PanTiltDirection::Stop
     }
+
+    /// A velocity from a signed speed on each axis: the sign says which way,
+    /// the magnitude how fast, and zero says that axis isn't being driven.
+    ///
+    /// This is where VISCA's split between a direction and two magnitudes gets
+    /// made, and it is the only place that knows the eight-way table. Speeds
+    /// are clamped to what the camera accepts on each axis — the protocol's
+    /// ceiling, not the narrower one [`PAN_SPEEDS`] holds hand controls to,
+    /// since a caller computing a speed from a distance or a curve isn't a
+    /// hand and has its own reasons for the number it arrived at.
+    pub fn from_signed(pan: i32, tilt: i32) -> Self {
+        let clamped = |speed: i32, max: u8| speed.unsigned_abs().min(u32::from(max)) as u8;
+        let pan_speed = clamped(pan, MAX_PAN_SPEED);
+        let tilt_speed = clamped(tilt, MAX_TILT_SPEED);
+
+        let direction = match (
+            (pan_speed > 0).then_some(pan > 0),
+            (tilt_speed > 0).then_some(tilt > 0),
+        ) {
+            (None, None) => return Self::STOP,
+            (Some(true), None) => PanTiltDirection::Right,
+            (Some(false), None) => PanTiltDirection::Left,
+            (None, Some(true)) => PanTiltDirection::Up,
+            (None, Some(false)) => PanTiltDirection::Down,
+            (Some(true), Some(true)) => PanTiltDirection::UpRight,
+            (Some(true), Some(false)) => PanTiltDirection::DownRight,
+            (Some(false), Some(true)) => PanTiltDirection::UpLeft,
+            (Some(false), Some(false)) => PanTiltDirection::DownLeft,
+        };
+
+        Self {
+            direction,
+            // An axis the direction doesn't move still needs a speed on the
+            // wire for the camera to ignore, and zero isn't one it accepts.
+            pan_speed: pan_speed.max(MIN_SPEED),
+            tilt_speed: tilt_speed.max(MIN_SPEED),
+        }
+    }
 }
 
 /// Maps one axis's deflection onto that axis's speed range, or `None` if it's
@@ -96,26 +134,12 @@ fn axis_speed(deflection: f32, speeds: RangeInclusive<u8>) -> Option<u8> {
 /// little up pans fast while tilting slowly: the diagonals cover a whole
 /// range of arcs rather than a fixed 45 degrees.
 pub fn velocity_from_axes(pan: f32, tilt: f32) -> Velocity {
-    let pan_speed = axis_speed(pan, PAN_SPEEDS);
-    let tilt_speed = axis_speed(tilt, TILT_SPEEDS);
-
-    let direction = match (pan_speed.map(|_| pan > 0.0), tilt_speed.map(|_| tilt > 0.0)) {
-        (None, None) => return Velocity::STOP,
-        (Some(true), None) => PanTiltDirection::Right,
-        (Some(false), None) => PanTiltDirection::Left,
-        (None, Some(true)) => PanTiltDirection::Up,
-        (None, Some(false)) => PanTiltDirection::Down,
-        (Some(true), Some(true)) => PanTiltDirection::UpRight,
-        (Some(true), Some(false)) => PanTiltDirection::DownRight,
-        (Some(false), Some(true)) => PanTiltDirection::UpLeft,
-        (Some(false), Some(false)) => PanTiltDirection::DownLeft,
+    let signed = |deflection: f32, speeds| {
+        axis_speed(deflection, speeds).map_or(0, |speed| {
+            i32::from(speed) * if deflection > 0.0 { 1 } else { -1 }
+        })
     };
-
-    Velocity {
-        direction,
-        pan_speed: pan_speed.unwrap_or(MIN_SPEED),
-        tilt_speed: tilt_speed.unwrap_or(MIN_SPEED),
-    }
+    Velocity::from_signed(signed(pan, PAN_SPEEDS), signed(tilt, TILT_SPEEDS))
 }
 
 /// Sets the camera's continuous pan/tilt drive, or stops it.

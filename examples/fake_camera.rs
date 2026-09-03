@@ -402,6 +402,32 @@ impl CameraSim {
                 self.tilt_rate = drive_rate(*tilt_direction, 0x01, *tilt_speed, MAX_TILT_SPEED);
                 Duration::ZERO
             }
+            // Pan/tilt absolute move: 06 02 VV WW <4 nibbles pan> <4 nibbles tilt>
+            //
+            // The speeds are honoured rather than ignored, and that is the
+            // whole point of simulating this one: asking for a slow arrival is
+            // the only reason to send it instead of recalling a preset, so a
+            // simulator that arrived at a fixed rate would hide exactly the
+            // mistake worth catching.
+            [0x06, 0x02, pan_speed, tilt_speed, rest @ ..] if rest.len() == 8 => {
+                let pan = nibbles_to_i16(&rest[0..4]);
+                let tilt = nibbles_to_i16(&rest[4..8]);
+                let delay = pan_tilt_travel_time_at(
+                    (
+                        i32::from(pan) - i32::from(self.pan),
+                        *pan_speed,
+                        MAX_PAN_SPEED,
+                    ),
+                    (
+                        i32::from(tilt) - i32::from(self.tilt),
+                        *tilt_speed,
+                        MAX_TILT_SPEED,
+                    ),
+                );
+                self.pan = pan.clamp(PAN_LIMITS.0 as i16, PAN_LIMITS.1 as i16);
+                self.tilt = tilt.clamp(TILT_LIMITS.0 as i16, TILT_LIMITS.1 as i16);
+                delay
+            }
             // Pan/tilt relative move: 06 03 VV WW <4 nibbles pan> <4 nibbles tilt>
             [0x06, 0x03, _pan_speed, _tilt_speed, rest @ ..] if rest.len() == 8 => {
                 let pan_delta = nibbles_to_i16(&rest[0..4]).saturating_mul(PAN_TILT_SCALE);
@@ -560,6 +586,20 @@ fn pan_tilt_travel_time(pan_distance: i32, tilt_distance: i32) -> Duration {
         .max(travel_time(tilt_distance, PAN_TILT_UNITS_PER_SEC))
 }
 
+/// The same, for the one command that says how fast to travel: each axis is
+/// given as its distance, the speed asked for, and that axis's top speed.
+///
+/// A speed of zero would mean an arrival that never comes, so it is treated as
+/// the slowest the camera has — matching how the lens drives read their own
+/// speed nibble, where zero is a speed and stopping is a separate command.
+fn pan_tilt_travel_time_at(pan: (i32, u8, u8), tilt: (i32, u8, u8)) -> Duration {
+    let axis = |(distance, speed, max): (i32, u8, u8)| {
+        let fraction = f64::from(speed.clamp(1, max)) / f64::from(max);
+        travel_time(distance, PAN_TILT_UNITS_PER_SEC * fraction)
+    };
+    axis(pan).max(axis(tilt))
+}
+
 /// What to send back for one handled message.
 enum Reply {
     /// Nothing to send (an unaddressed or unrecognized message).
@@ -642,6 +682,9 @@ fn describe_message(message: &[u8]) -> String {
         }
         (Some(0x01), [0x06, 0x01, pan_speed, tilt_speed, ..]) => {
             format!("pan/tilt drive at {pan_speed}/{tilt_speed}")
+        }
+        (Some(0x01), [0x06, 0x02, pan_speed, tilt_speed, ..]) => {
+            format!("pan/tilt absolute move at {pan_speed}/{tilt_speed}")
         }
         (Some(0x01), [0x06, 0x03, ..]) => "pan/tilt relative move".to_string(),
         (Some(0x01), [0x06, 0x04]) => "pan/tilt home".to_string(),
