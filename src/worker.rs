@@ -17,7 +17,7 @@ use crate::{
     nudge::{self, Step},
     pan_tilt::{self, Velocity},
     power, preset,
-    state::{self, CameraState},
+    state::{self, CameraState, Position},
     title::{self, Title},
     zoom::{self, ZoomDirection, ZoomDrive},
 };
@@ -65,6 +65,13 @@ pub enum Intent {
 pub enum Outcome {
     /// A command intent completed (or failed) with no data to report.
     Done(Intent, Result<(), Error>),
+    /// A preset command completed, and with it the only chance to learn where
+    /// that preset points — see [`harvest`].
+    ///
+    /// `Ok(None)` is a preset command that worked against a camera that then
+    /// wouldn't say where it was standing: the command did what it was asked
+    /// and only the chance to learn from it was lost, so it is not a failure.
+    Preset(Intent, Result<Option<Position>, Error>),
     /// A `QueryState` intent completed (or failed).
     State(Result<CameraState, Error>),
 }
@@ -195,8 +202,15 @@ pub fn describe(intent: Intent) -> String {
 /// either the status line or the camera-state panel.
 pub fn describe_outcome(outcome: &Outcome) -> String {
     match outcome {
-        Outcome::Done(intent, Ok(())) => format!("OK: {}", describe(*intent)),
-        Outcome::Done(intent, Err(error)) => format!("error ({}): {error}", describe(*intent)),
+        // Whether a preset gave up its location is nothing the operator asked
+        // for and nothing they can act on, so it is left out: what they wanted
+        // was the camera to move, and it did.
+        Outcome::Done(intent, Ok(())) | Outcome::Preset(intent, Ok(_)) => {
+            format!("OK: {}", describe(*intent))
+        }
+        Outcome::Done(intent, Err(error)) | Outcome::Preset(intent, Err(error)) => {
+            format!("error ({}): {error}", describe(*intent))
+        }
         Outcome::State(Ok(camera_state)) => state::format_state(camera_state),
         Outcome::State(Err(error)) => format!("state query failed: {error}"),
     }
@@ -224,6 +238,31 @@ fn direction_label(direction: PanTiltDirection) -> &'static str {
     }
 }
 
+/// Reads where the camera is standing, after a preset command that left it
+/// there, so that a preset's location is learned rather than asked for.
+///
+/// VISCA has no inquiry that asks where a preset points — the protocol will
+/// store one and go to one, and that is all. But recalling a preset and saving
+/// one both end with the camera standing on it, and *then* the ordinary
+/// position inquiry answers the question. So the reading is taken here,
+/// against the same camera in the same turn of the worker's loop: nothing else
+/// holds the wire, so nothing can have moved the camera in between.
+///
+/// A camera that won't answer costs only the chance to learn. The preset
+/// command itself has already succeeded by that point, and reporting it as
+/// failed because a follow-up inquiry went unanswered would be a lie the
+/// operator can see out of the window.
+fn harvest<T>(
+    camera: &BlockingClient<GenericVisca, T>,
+    done: Result<(), Error>,
+) -> Result<Option<Position>, Error>
+where
+    T: BlockingTransport + HasTransportConfig + 'static,
+{
+    done?;
+    Ok(state::query_position(camera).ok())
+}
+
 fn dispatch<T>(camera: &BlockingClient<GenericVisca, T>, intent: Intent) -> Outcome
 where
     T: BlockingTransport + HasTransportConfig + 'static,
@@ -235,10 +274,13 @@ where
         Intent::DriveFocus(direction) => {
             Outcome::Done(intent, focus::drive_focus(camera, direction))
         }
-        Intent::RecallPreset(number) => {
-            Outcome::Done(intent, preset::recall_preset(camera, number))
+        Intent::RecallPreset(number) => Outcome::Preset(
+            intent,
+            harvest(camera, preset::recall_preset(camera, number)),
+        ),
+        Intent::SavePreset(number) => {
+            Outcome::Preset(intent, harvest(camera, preset::save_preset(camera, number)))
         }
-        Intent::SavePreset(number) => Outcome::Done(intent, preset::save_preset(camera, number)),
         Intent::SetAutoFocus(auto) => Outcome::Done(intent, focus::set_auto_focus(camera, auto)),
         Intent::Home => Outcome::Done(intent, pan_tilt::home(camera)),
         Intent::ResetPanTilt => Outcome::Done(intent, pan_tilt::reset(camera)),
@@ -329,14 +371,14 @@ mod tests {
     #[test]
     fn run_dispatches_each_intent_and_reports_its_result() {
         let camera = scripted_camera(vec![
-            helpers::standard_command_response(1), // preset recall
+            helpers::standard_command_response(1), // home
             helpers::standard_command_response(1), // zoom drive
         ]);
 
         let (intent_tx, intent_rx) = channel();
         let (result_tx, result_rx) = channel();
 
-        intent_tx.send(Intent::RecallPreset(1)).unwrap();
+        intent_tx.send(Intent::Home).unwrap();
         intent_tx.send(Intent::DriveZoom(Some(zoom_in()))).unwrap();
         drop(intent_tx);
 
@@ -344,13 +386,88 @@ mod tests {
 
         assert!(
             matches!(result_rx.recv().unwrap(), Outcome::Done(_, Ok(()))),
-            "preset recall should succeed"
+            "home should succeed"
         );
         assert!(
             matches!(result_rx.recv().unwrap(), Outcome::Done(_, Ok(()))),
             "zoom drive should succeed"
         );
         assert!(result_rx.try_recv().is_err(), "no further results expected");
+    }
+
+    /// Somewhere for a preset to have been pointing, distinct on every axis.
+    fn somewhere() -> Position {
+        Position {
+            pan: -120,
+            tilt: 45,
+            zoom: 0x1000,
+            focus: 0x2000,
+        }
+    }
+
+    fn preset_outcome(
+        replies: Vec<grafton_visca::testing::testkit::Step>,
+        intent: Intent,
+    ) -> Outcome {
+        let camera = scripted_camera(replies);
+        let (intent_tx, intent_rx) = channel();
+        let (result_tx, result_rx) = channel();
+
+        intent_tx.send(intent).unwrap();
+        drop(intent_tx);
+        run(&camera, &intent_rx, &result_tx);
+
+        result_rx
+            .recv()
+            .expect("a preset command reports an outcome")
+    }
+
+    #[test]
+    fn recalling_a_preset_reads_back_where_it_left_the_camera() {
+        // The whole point: VISCA can't be asked where a preset points, so
+        // arriving on one is the only chance to find out.
+        let mut replies = vec![helpers::standard_command_response(1)];
+        replies.extend(state::fixtures::reports(somewhere()));
+
+        let outcome = preset_outcome(replies, Intent::RecallPreset(1));
+
+        assert!(matches!(outcome, Outcome::Preset(_, Ok(Some(at))) if at == somewhere()));
+    }
+
+    #[test]
+    fn marking_a_preset_reads_back_where_it_was_marked() {
+        // Saving leaves the camera standing on the preset just as recalling
+        // does, and is the better witness of the two: it never has to travel.
+        let mut replies = vec![helpers::standard_command_response(1)];
+        replies.extend(state::fixtures::reports(somewhere()));
+
+        let outcome = preset_outcome(replies, Intent::SavePreset(3));
+
+        assert!(matches!(outcome, Outcome::Preset(_, Ok(Some(at))) if at == somewhere()));
+    }
+
+    #[test]
+    fn a_preset_command_still_succeeds_when_the_camera_will_not_say_where_it_is() {
+        // Only one reply: the command is answered, the inquiries after it are
+        // not. The move happened, and the operator can see that it did.
+        let outcome = preset_outcome(
+            vec![helpers::standard_command_response(1)],
+            Intent::RecallPreset(1),
+        );
+
+        assert!(matches!(outcome, Outcome::Preset(_, Ok(None))));
+    }
+
+    #[test]
+    fn a_preset_command_that_failed_leaves_the_camera_somewhere_unknown() {
+        // Nothing to learn from a recall that didn't happen: wherever the
+        // camera is standing, it isn't on that preset.
+        let outcome = preset_outcome(
+            vec![helpers::errors::syntax_error(1)],
+            Intent::RecallPreset(1),
+        );
+
+        assert!(matches!(outcome, Outcome::Preset(_, Err(_))));
     }
 
     #[test]
@@ -363,8 +480,8 @@ mod tests {
         let (intent_tx, intent_rx) = channel();
         let (result_tx, result_rx) = channel();
 
-        intent_tx.send(Intent::RecallPreset(1)).unwrap();
-        intent_tx.send(Intent::RecallPreset(2)).unwrap();
+        intent_tx.send(Intent::Home).unwrap();
+        intent_tx.send(Intent::Home).unwrap();
         drop(intent_tx);
 
         run(&camera, &intent_rx, &result_tx);
@@ -558,9 +675,7 @@ mod tests {
         CameraState {
             power_on: true,
             lens: Some(crate::state::Lens {
-                pan_tilt: grafton_visca::camera::PanTiltPosition::new(0, 0),
-                zoom: grafton_visca::types::ZoomPosition::try_from(0u16).unwrap(),
-                focus: grafton_visca::types::FocusPosition::new(0),
+                position: crate::state::Position::default(),
                 auto_focus: false,
             }),
         }

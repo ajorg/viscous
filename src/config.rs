@@ -8,6 +8,8 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+use crate::state::Position;
+
 /// What a front end remembers between runs: the operator's own words for
 /// each preset and title, and which camera to reach for.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -20,6 +22,15 @@ pub struct Config {
     /// Preset number -> label.
     #[serde(default)]
     pub presets: BTreeMap<u8, String>,
+    /// Preset number -> where that preset was last seen to point.
+    ///
+    /// Kept apart from [`Self::presets`] rather than folded into it because
+    /// the two come from opposite directions and neither implies the other: a
+    /// label is typed by the operator and can name a preset the camera has
+    /// never been sent to, while a position is read back from the camera and
+    /// exists for presets nobody has bothered to name.
+    #[serde(default)]
+    pub preset_positions: BTreeMap<u8, Position>,
     /// Title slot number -> the text to burn into the video output.
     #[serde(default)]
     pub titles: BTreeMap<u8, String>,
@@ -101,11 +112,23 @@ mod tests {
     }
 
     #[test]
-    fn save_then_load_round_trips_labels() {
+    fn save_then_load_round_trips_what_a_preset_is_and_where_it_points() {
         let path = test_path("round-trip");
         let mut config = Config::default();
         config.presets.insert(1, "wide shot".to_string());
         config.presets.insert(3, "podium".to_string());
+        // A harvested position for a preset that was never labelled, and a
+        // label for one that has never been travelled to: the two halves are
+        // kept for their own sake and neither waits on the other.
+        config.preset_positions.insert(
+            1,
+            Position {
+                pan: -120,
+                tilt: 45,
+                zoom: 0x1000,
+                focus: 0x2000,
+            },
+        );
 
         save(&config, &path).expect("save should succeed");
         let loaded = load(&path).expect("load should succeed");
@@ -127,6 +150,7 @@ mod tests {
             config.presets.get(&1).map(String::as_str),
             Some("wide shot")
         );
+        assert!(config.preset_positions.is_empty());
     }
 
     #[test]

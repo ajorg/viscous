@@ -37,7 +37,7 @@ use viscous::{
     nudge::Step,
     pan_tilt::{self, Velocity},
     session::{self, POLL_INTERVAL, QUIESCENCE_INTERVAL, RETRY_INTERVAL},
-    state::{self, CameraState},
+    state::{self, CameraState, Position},
     title::{self, Title},
     worker::{self, Intent, Outcome},
     zoom::ZoomDrive,
@@ -188,6 +188,12 @@ struct App {
     /// What each preset is of, in the operator's own words, keyed by the same
     /// 1-based number as the buttons.
     preset_labels: BTreeMap<u8, String>,
+    /// Where each preset turned out to point, learned by watching the camera
+    /// arrive rather than by asking — the protocol has no way to ask. Empty
+    /// for any preset that hasn't been recalled or marked since the config
+    /// file was written, which is why it is kept apart from the labels: the
+    /// operator types those, and the camera answers for these.
+    preset_positions: BTreeMap<u8, Position>,
     /// Whether the Mark buttons are locked off.
     ///
     /// Locked at every start, and never written to the config file: a preset is
@@ -280,6 +286,7 @@ impl Default for App {
             camera_state: None,
             status: None,
             preset_labels: BTreeMap::new(),
+            preset_positions: BTreeMap::new(),
             marking_locked: true,
             titles: BTreeMap::new(),
             shown_title: None,
@@ -321,6 +328,7 @@ impl App {
         match app.config_path.as_deref().map(config::load) {
             Some(Ok(config)) => {
                 app.preset_labels = config.presets;
+                app.preset_positions = config.preset_positions;
                 app.titles = config.titles;
                 if let Some(camera) = config.camera {
                     app.port_input = camera.clone();
@@ -490,10 +498,26 @@ impl App {
                 });
                 return;
             }
+            // A preset command that worked leaves the camera standing on that
+            // preset, which is the only moment its location can be read — so
+            // write down what the worker saw while it was there. Recall and
+            // Mark are equally good witnesses: either way the camera is on
+            // the preset when the position is taken.
+            Outcome::Preset(
+                Intent::RecallPreset(number) | Intent::SavePreset(number),
+                Ok(Some(position)),
+            ) => {
+                self.preset_positions.insert(*number, *position);
+                self.save_config();
+                // Falls through to the status line: what the operator asked
+                // for was the move, and that is what gets reported.
+                false
+            }
             // A drive that worked was already visible before its completion
             // arrived; one that failed is the only kind still worth saying.
             Outcome::Done(intent, Ok(())) if worker::is_movement(*intent) => return,
             Outcome::Done(_, result) => result.is_err(),
+            Outcome::Preset(_, result) => result.is_err(),
         };
         self.status = Some(Status {
             text: worker::describe_outcome(&outcome),
@@ -731,7 +755,7 @@ impl App {
             // Power and focus mode are already shown by the lamp and the
             // toggle, so what's left is only the numbers, kept quiet: they're
             // there to be checked, not read.
-            ui.weak(state::format_position(&lens));
+            ui.weak(state::format_position(&lens.position));
         }
     }
 
@@ -1085,6 +1109,7 @@ impl App {
         let config = config::Config {
             camera: self.camera.clone(),
             presets: written(&self.preset_labels),
+            preset_positions: self.preset_positions.clone(),
             titles: written(&self.titles),
         };
         if let Err(error) = config::save(&config, &path) {
@@ -1511,10 +1536,7 @@ mod tests {
         Harness,
         kittest::{NodeT, Queryable},
     };
-    use grafton_visca::{
-        camera::PanTiltPosition, command::PanTiltDirection, types::FocusPosition,
-        types::ZoomPosition,
-    };
+    use grafton_visca::command::PanTiltDirection;
     use viscous::{focus::FocusDirection, zoom::ZoomDirection};
 
     /// An app already connected to a camera, plus the receiving end of the
@@ -1554,9 +1576,7 @@ mod tests {
         CameraState {
             power_on,
             lens: Some(viscous::state::Lens {
-                pan_tilt: PanTiltPosition::new(0, 0),
-                zoom: ZoomPosition::try_from(0u16).unwrap(),
-                focus: FocusPosition::new(0),
+                position: Position::default(),
                 auto_focus,
             }),
         }
@@ -2404,6 +2424,44 @@ mod tests {
         assert_eq!(
             reopened.preset_labels.get(&2).map(String::as_str),
             Some("Chorister")
+        );
+    }
+
+    #[test]
+    fn where_a_recalled_preset_pointed_is_there_again_next_run() {
+        let path = test_config_path("preset-position");
+        let (mut app, _sent) = connected_app(None);
+        app.config_path = Some(path.clone());
+        let somewhere = Position {
+            pan: -120,
+            tilt: 45,
+            zoom: 0x1000,
+            focus: 0x2000,
+        };
+
+        app.apply_outcome(Outcome::Preset(
+            Intent::RecallPreset(2),
+            Ok(Some(somewhere)),
+        ));
+
+        let reopened = App::with_config(Some(path.clone()));
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(reopened.preset_positions.get(&2), Some(&somewhere));
+    }
+
+    #[test]
+    fn a_preset_the_camera_would_not_locate_is_left_unrecorded() {
+        // The recall worked and says so; there is simply nothing to write
+        // down, and writing down a guess would be worse than knowing nothing.
+        let (mut app, _sent) = connected_app(None);
+
+        app.apply_outcome(Outcome::Preset(Intent::RecallPreset(2), Ok(None)));
+
+        assert!(app.preset_positions.is_empty());
+        assert_eq!(
+            app.status.as_ref().map(|status| status.failed),
+            Some(false),
+            "the recall itself succeeded"
         );
     }
 

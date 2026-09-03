@@ -530,9 +530,7 @@ mod tests {
         crate::state::CameraState {
             power_on: true,
             lens: Some(crate::state::Lens {
-                pan_tilt: grafton_visca::camera::PanTiltPosition::new(0, 0),
-                zoom: grafton_visca::types::ZoomPosition::try_from(0u16).unwrap(),
-                focus: grafton_visca::types::FocusPosition::new(0),
+                position: crate::state::Position::default(),
                 auto_focus,
             }),
         }
