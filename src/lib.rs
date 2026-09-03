@@ -22,6 +22,7 @@ pub mod pan_tilt;
 pub mod power;
 pub mod preset;
 pub mod session;
+pub mod shot;
 pub mod state;
 pub mod title;
 pub mod ui;
