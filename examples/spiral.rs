@@ -35,12 +35,24 @@ use viscous::{
 /// the wire most of its time and is far finer than the head can resolve.
 const TICK: Duration = Duration::from_millis(50);
 
-/// The speed to calibrate at: high enough to cover measurable ground in a
-/// second, low enough not to lurch.
+/// The speed to calibrate at: high enough to cover ground quickly, low
+/// enough not to lurch.
 const CALIBRATION_SPEED: u8 = 6;
 
-/// How long to hold the calibration drive.
-const CALIBRATION_TIME: Duration = Duration::from_secs(1);
+/// How far to move on each axis while calibrating, in camera units. Matches
+/// `examples/probe_absolute.rs`'s figure: far enough to time honestly, short
+/// enough to stay well inside the travel.
+const CALIBRATION_DISTANCE: i16 = 200;
+
+/// How long to wait before asking again if a position query is refused right
+/// after a move. A hardware run of `examples/probe_absolute.rs` found the
+/// camera briefly reports itself busy in exactly that instant rather than
+/// stuck — every refusal it hit recovered on the very first retry.
+const SETTLE: [Duration; 3] = [
+    Duration::from_millis(300),
+    Duration::from_millis(600),
+    Duration::from_millis(1200),
+];
 
 /// How far away to put the far end of the spiral, in camera units.
 const REACH: i16 = 400;
@@ -134,7 +146,7 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    match state::query_position(camera) {
+    match query_after_settling(camera) {
         Ok(landed) => println!("landed on {}", state::format_position(&landed)),
         Err(error) => println!("landed, but the camera wouldn't say where: {error}"),
     }
@@ -142,36 +154,78 @@ fn main() -> ExitCode {
 }
 
 /// Measures how far the head travels per second at one step of speed, by
-/// driving it for a known time and asking where it ended up.
+/// sending it a known distance and timing how long the trip took.
+///
+/// An earlier version of this drove for a fixed one second and measured the
+/// distance covered instead. Against real hardware that turned out to time
+/// mostly the run-up to speed rather than the running speed itself,
+/// understating the true rate several times over — a one-second sample spends
+/// a large share of itself accelerating. Sending the head somewhere and
+/// timing the whole trip, the way `probe_absolute` does, counts that run-up
+/// as part of the move rather than as most of the sample.
 ///
 /// Both axes are driven toward the middle of their travel, and the camera is
 /// put back where it started afterwards, so calibrating costs the caller its
 /// position for a couple of seconds and nothing else.
 fn measure(camera: &Camera, home: Position) -> Result<Rates, grafton_visca::Error> {
-    let inward = |value: i16| value <= 0;
-    let per_step = |travelled: i16| {
-        f32::from(travelled.abs()) / CALIBRATION_TIME.as_secs_f32() / f32::from(CALIBRATION_SPEED)
+    let inward = |value: i16| {
+        if value > 0 {
+            -CALIBRATION_DISTANCE
+        } else {
+            CALIBRATION_DISTANCE
+        }
     };
-    let speed = i32::from(CALIBRATION_SPEED);
+    let per_second = |elapsed: Duration| {
+        f32::from(CALIBRATION_DISTANCE) / elapsed.as_secs_f32() / f32::from(CALIBRATION_SPEED)
+    };
 
-    let signed = |toward_positive: bool| if toward_positive { speed } else { -speed };
+    let panned = Position {
+        pan: home.pan + inward(home.pan),
+        ..home
+    };
+    let started = Instant::now();
+    shot::go_to(
+        camera,
+        panned,
+        Travel {
+            pan_speed: CALIBRATION_SPEED,
+            tilt_speed: 1,
+        },
+    )?;
+    let pan = per_second(started.elapsed());
 
-    pan_tilt::drive(camera, Velocity::from_signed(signed(inward(home.pan)), 0))?;
-    thread::sleep(CALIBRATION_TIME);
-    pan_tilt::drive(camera, Velocity::STOP)?;
-    let panned = state::query_position(camera)?;
-
-    pan_tilt::drive(camera, Velocity::from_signed(0, signed(inward(home.tilt))))?;
-    thread::sleep(CALIBRATION_TIME);
-    pan_tilt::drive(camera, Velocity::STOP)?;
-    let tilted = state::query_position(camera)?;
+    let tilted = Position {
+        tilt: home.tilt + inward(home.tilt),
+        ..panned
+    };
+    let started = Instant::now();
+    shot::go_to(
+        camera,
+        tilted,
+        Travel {
+            pan_speed: 1,
+            tilt_speed: CALIBRATION_SPEED,
+        },
+    )?;
+    let tilt = per_second(started.elapsed());
 
     shot::go_to(camera, home, LANDING)?;
 
-    Ok(Rates {
-        pan: per_step(panned.pan - home.pan),
-        tilt: per_step(tilted.tilt - panned.tilt),
-    })
+    Ok(Rates { pan, tilt })
+}
+
+/// Asks where the camera is, retrying for a moment if it says the query isn't
+/// executable yet — see [`SETTLE`].
+fn query_after_settling(camera: &Camera) -> Result<Position, grafton_visca::Error> {
+    let mut last = state::query_position(camera);
+    for delay in SETTLE {
+        if last.is_ok() {
+            break;
+        }
+        thread::sleep(delay);
+        last = state::query_position(camera);
+    }
+    last
 }
 
 /// Flies one shape, then sets the camera down exactly where it was aimed.
