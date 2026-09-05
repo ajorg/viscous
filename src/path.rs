@@ -22,11 +22,14 @@
 //!   would say otherwise.
 //! - **Speed numbers scale linearly.** See [`Rates`].
 //!
-//! A path deliberately does not land itself. Its tangential speed falls to
-//! nothing as it converges, and the slowest drive the camera accepts is 1 —
-//! there is nothing below it — so the last fraction of the approach can't be
-//! flown. Fly the shape, then let [`crate::shot::go_to`] set the camera down
-//! exactly.
+//! A path deliberately does not land itself. Both its radial and tangential
+//! speed ease to nothing as it converges — so the flight neither lurches
+//! away from rest nor slams to a stop at the far end — but the slowest drive
+//! the camera accepts is 1, and there is nothing below it, so the last sliver
+//! of the approach still can't be flown at true zero. Fly the shape, then let
+//! [`crate::shot::go_to`] set the camera down exactly; what is left for it to
+//! correct is the width of one tick at the drive's floor speed, not whatever
+//! the closing speed happened to be when the flight ran out.
 
 use std::{f32::consts::TAU, time::Duration};
 
@@ -53,6 +56,21 @@ pub struct Rates {
     pub pan: f32,
     /// Camera units per second at tilt speed 1.
     pub tilt: f32,
+}
+
+/// A 0→1 ease with zero slope at both ends: smoothstep, `3t² - 2t³`.
+///
+/// Used for the radius instead of a plain linear taper so a flight neither
+/// lurches away from rest nor slams to a stop as it converges — see the
+/// module docs.
+fn ease(fraction: f32) -> f32 {
+    fraction * fraction * (3.0 - 2.0 * fraction)
+}
+
+/// The derivative of [`ease`] with respect to `fraction`, for turning the
+/// eased radius into a rate.
+fn ease_rate(fraction: f32) -> f32 {
+    6.0 * fraction * (1.0 - fraction)
 }
 
 /// A spiral flight: from one position to another, winding in as it goes.
@@ -93,15 +111,15 @@ impl Spiral {
     /// The polar description of the path at `fraction`: how far out from the
     /// destination, and at what angle around it.
     ///
-    /// The radius runs to nothing while the angle keeps turning, which is what
-    /// makes the curve close rather than orbit.
+    /// The radius eases to nothing while the angle keeps turning at a steady
+    /// rate, which is what makes the curve close rather than orbit.
     fn polar(&self, fraction: f32) -> (f32, f32, f32) {
         let out_pan = f32::from(self.from.pan) - f32::from(self.to.pan);
         let out_tilt = f32::from(self.from.tilt) - f32::from(self.to.tilt);
         let start_radius = out_pan.hypot(out_tilt);
         let start_angle = out_tilt.atan2(out_pan);
 
-        let radius = start_radius * (1.0 - fraction);
+        let radius = start_radius * (1.0 - ease(fraction));
         let angle = start_angle + TAU * self.turns * fraction;
         (radius, angle, start_radius)
     }
@@ -128,9 +146,10 @@ impl Spiral {
         let (radius, angle, start_radius) = self.polar(fraction);
         let seconds = self.duration.as_secs_f32();
 
-        // d/dt of `to + radius * (cos angle, sin angle)`, with the radius
-        // closing at a constant rate and the angle turning at a constant one.
-        let closing = -start_radius / seconds;
+        // d/dt of `to + radius * (cos angle, sin angle)`: the radius closes
+        // at the eased rate (see `ease_rate`), and the angle turns at a
+        // constant one.
+        let closing = -start_radius * ease_rate(fraction) / seconds;
         let turning = TAU * self.turns / seconds;
         (
             closing * angle.cos() - radius * turning * angle.sin(),
@@ -312,6 +331,23 @@ mod tests {
             .expect("still running");
 
         assert!(brisk.pan_speed < sluggish.pan_speed);
+    }
+
+    #[test]
+    fn a_flight_neither_lurches_off_nor_slams_to_a_stop() {
+        // Pure radial, no turning, so the closing speed is the whole story.
+        let flight = Spiral::new(at(-500, 0), at(0, 0), 0.0, seconds(10));
+
+        let (start, _) = flight.drift(0.0);
+        let (middle, _) = flight.drift(0.5);
+        let (end, _) = flight.drift(1.0);
+
+        assert_eq!(start, 0.0, "should not lurch away from rest");
+        assert_eq!(end, 0.0, "should not slam to a stop at the destination");
+        assert!(
+            middle.abs() > 0.0,
+            "the distance still has to be covered somewhere in between"
+        );
     }
 
     #[test]
