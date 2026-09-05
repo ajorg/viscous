@@ -1,17 +1,22 @@
 //! Measures the true cruising rate at a spread of speed numbers, on each
-//! axis, by cancelling out the head's acceleration time rather than living
-//! with it.
+//! axis — and checks, rather than assumes, that the head has actually
+//! finished accelerating by the time it says so.
 //!
 //! `examples/probe_absolute.rs` times a single fixed-distance trip per speed.
 //! Against real hardware that undercounts the true rate, and by more as
 //! speed rises: a short trip spends a growing share of itself accelerating
 //! to speed and decelerating back to a stop, so the average speed it reports
-//! sits below the head's actual cruising speed. This instead times two trips
-//! of different lengths at the same speed and divides the *difference* in
-//! distance by the *difference* in time. Both trips spend the same time
-//! ramping up to the same speed and back down to a stop, so that shared
-//! overhead cancels exactly, leaving the cruising rate on its own — the
-//! number [`viscous::path::Rates`] actually wants.
+//! sits below the head's actual cruising speed.
+//!
+//! Two distances and a difference would cancel that shared ramp time — *if*
+//! the head has actually reached cruising speed by the shorter of the two.
+//! But two points always fit a line, whether or not that line means
+//! anything: nothing about a two-point measurement can say whether the
+//! shorter distance was still inside the ramp. This uses three evenly spaced
+//! distances instead. If the head is truly cruising by the first of them,
+//! each equal step between them takes equal time; when the two steps
+//! disagree, that disagreement is itself the signal that the ramp reaches
+//! past the distances tried, not something measurement noise would produce.
 //!
 //! ```text
 //! cargo run --example calibrate_speed -- COM3
@@ -21,13 +26,16 @@
 //! Defaults to a spread across the whole range if no speeds are given on the
 //! command line. Every move is toward the centre of the camera's travel, the
 //! same direction `probe_absolute.rs` and `spiral.rs` have already used —
-//! but the longer of the two distances reaches further than either of them
-//! has gone before, so the ramp's share of the trip stays small even at the
-//! top of the range. Watch the head on the first run and be ready to
+//! but the furthest of the three distances reaches further than either of
+//! them has gone before, so watch the head on the first run and be ready to
 //! interrupt if it looks like it is nearing a hard stop. The camera is put
 //! back at its starting position between trips and again at the end.
 
-use std::{env, process::ExitCode, time::Instant};
+use std::{
+    env,
+    process::ExitCode,
+    time::{Duration, Instant},
+};
 
 use viscous::{
     connection::{self, Camera, Target},
@@ -36,13 +44,17 @@ use viscous::{
     state::{self, Position},
 };
 
-/// The shorter of the two calibration distances, in camera units. Matches
-/// `examples/probe_absolute.rs`'s figure, already proven safe.
+/// The three calibration distances, in camera units, evenly spaced so that
+/// equal steps between them should take equal time once the head is truly
+/// cruising.
 const SHORT: i16 = 200;
-
-/// The longer of the two calibration distances, reaching further than any
-/// earlier probe has driven the head.
+const MID: i16 = 400;
 const LONG: i16 = 600;
+
+/// How far the two inner-step times may disagree, as a fraction of the
+/// larger one, before a reading is flagged as not yet cruising rather than
+/// trusted outright.
+const TOLERANCE: f32 = 0.15;
 
 /// The speeds to measure when none are given on the command line: finer at
 /// the slow end, where a deliberate move to a shot would live, coarser
@@ -54,6 +66,18 @@ const RETURN: Travel = Travel {
     pan_speed: 4,
     tilt_speed: 4,
 };
+
+/// A measured cruising rate, and whether the measurement actually looked
+/// like cruising.
+struct Reading {
+    /// Camera units per second, over the distance from [`SHORT`] to
+    /// [`LONG`].
+    rate: f32,
+    /// Whether the two equal steps between [`SHORT`], [`MID`], and [`LONG`]
+    /// took equal time — the check a two-point measurement has no way to
+    /// make.
+    settled: bool,
+}
 
 fn main() -> ExitCode {
     let mut args = env::args().skip(1);
@@ -93,10 +117,19 @@ fn main() -> ExitCode {
 
     for speed in speeds {
         match measure(camera, home, speed) {
-            Ok((pan, tilt)) => println!("{speed:>5}  {pan:>10.1}  {tilt:>10.1}"),
+            Ok((pan, tilt)) => println!(
+                "{speed:>5}  {:>10}  {:>10}",
+                format_reading(&pan),
+                format_reading(&tilt),
+            ),
             Err(error) => println!("{speed:>5}  refused: {error}"),
         }
     }
+
+    println!();
+    println!("* the two inner steps didn't agree — the head may not have finished");
+    println!("  ramping up to speed within {LONG} units; treat as a lower bound,");
+    println!("  not the true cruising rate");
 
     println!();
     if let Err(error) = shot::go_to(camera, home, RETURN) {
@@ -107,15 +140,31 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+fn format_reading(reading: &Reading) -> String {
+    if reading.settled {
+        format!("{:.1}", reading.rate)
+    } else {
+        format!("{:.1}*", reading.rate)
+    }
+}
+
 /// Measures the cruising rate at `speed` on both axes. Drives one axis at a
 /// time, holding the other at its slowest speed while its target stays put,
 /// the same isolation `probe_absolute.rs` uses.
-fn measure(camera: &Camera, home: Position, speed: u8) -> Result<(f32, f32), grafton_visca::Error> {
-    let pan = trip_rate(
+fn measure(
+    camera: &Camera,
+    home: Position,
+    speed: u8,
+) -> Result<(Reading, Reading), grafton_visca::Error> {
+    let pan = axis_rate(
         camera,
         home,
         Position {
             pan: toward_centre(home.pan, SHORT),
+            ..home
+        },
+        Position {
+            pan: toward_centre(home.pan, MID),
             ..home
         },
         Position {
@@ -128,11 +177,15 @@ fn measure(camera: &Camera, home: Position, speed: u8) -> Result<(f32, f32), gra
         },
     )?;
 
-    let tilt = trip_rate(
+    let tilt = axis_rate(
         camera,
         home,
         Position {
             tilt: toward_centre(home.tilt, SHORT),
+            ..home
+        },
+        Position {
+            tilt: toward_centre(home.tilt, MID),
             ..home
         },
         Position {
@@ -158,31 +211,50 @@ fn toward_centre(value: i16, distance: i16) -> i16 {
     }
 }
 
-/// Times trips to `short` and `long` and returns the cruising rate: the
-/// known distance between them (always `LONG - SHORT`, regardless of which
-/// side of centre `home` sits on) divided by the difference in how long they
-/// took, which cancels the ramp time shared by both. Leaves the camera at
-/// `home` between the two trips and after the second.
-fn trip_rate(
+/// Times round trips to `near`, `mid`, and `far`, then reports the cruising
+/// rate — the known distance from `near` to `far` (always `LONG - SHORT`)
+/// divided by how long that took — along with whether the two equal steps in
+/// between took equal time, which is what says the rate means what it
+/// claims to rather than just being a line drawn through two points.
+fn axis_rate(
     camera: &Camera,
     home: Position,
-    short: Position,
-    long: Position,
+    near: Position,
+    mid: Position,
+    far: Position,
     travel: Travel,
-) -> Result<f32, grafton_visca::Error> {
-    let started = Instant::now();
-    shot::go_to(camera, short, travel)?;
-    let short_elapsed = started.elapsed();
-    shot::go_to(camera, home, travel)?;
+) -> Result<Reading, grafton_visca::Error> {
+    let near_elapsed = timed_round_trip(camera, home, near, travel)?;
+    let mid_elapsed = timed_round_trip(camera, home, mid, travel)?;
+    let far_elapsed = timed_round_trip(camera, home, far, travel)?;
 
-    let started = Instant::now();
-    shot::go_to(camera, long, travel)?;
-    let long_elapsed = started.elapsed();
-    shot::go_to(camera, home, travel)?;
+    let first_step = mid_elapsed.saturating_sub(near_elapsed).as_secs_f32();
+    let second_step = far_elapsed.saturating_sub(mid_elapsed).as_secs_f32();
+    let settled = first_step > 0.0
+        && second_step > 0.0
+        && (first_step - second_step).abs() / first_step.max(second_step) < TOLERANCE;
 
     // `saturating_sub` rather than plain subtraction: if timing noise ever
-    // inverts the two elapsed times, dividing by zero prints an obviously
-    // wrong `inf` instead of panicking partway through a hardware run.
-    let elapsed = long_elapsed.saturating_sub(short_elapsed).as_secs_f32();
-    Ok(f32::from(LONG - SHORT) / elapsed)
+    // inverts two elapsed times, dividing by zero prints an obviously wrong
+    // `inf` instead of panicking partway through a hardware run.
+    let elapsed = far_elapsed.saturating_sub(near_elapsed).as_secs_f32();
+    Ok(Reading {
+        rate: f32::from(LONG - SHORT) / elapsed,
+        settled,
+    })
+}
+
+/// Sends the camera to `target`, times how long it took, then returns it to
+/// `home`.
+fn timed_round_trip(
+    camera: &Camera,
+    home: Position,
+    target: Position,
+    travel: Travel,
+) -> Result<Duration, grafton_visca::Error> {
+    let started = Instant::now();
+    shot::go_to(camera, target, travel)?;
+    let elapsed = started.elapsed();
+    shot::go_to(camera, home, travel)?;
+    Ok(elapsed)
 }
