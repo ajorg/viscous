@@ -23,7 +23,12 @@
 //! limit. Nothing here is part of the app: it's a diagnostic, and it exists
 //! only for as long as this question does.
 
-use std::{env, process::ExitCode, time::Instant};
+use std::{
+    env,
+    process::ExitCode,
+    thread,
+    time::{Duration, Instant},
+};
 
 use viscous::{
     connection::{self, Camera, Target},
@@ -106,6 +111,17 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// How long to wait before asking again, once, after a position query is
+/// refused. If the camera reports itself busy for a moment after a move
+/// completes rather than immediately clearing, this is what tells the two
+/// apart: recovering on the retry says "briefly busy", still refusing says
+/// "stuck", and either is worth knowing before anything is built on top.
+const SETTLE: [Duration; 3] = [
+    Duration::from_millis(300),
+    Duration::from_millis(600),
+    Duration::from_millis(1200),
+];
+
 /// Sends the camera to `shot` and reports how far it went and how long it
 /// took. Returns whether the move was accepted at all.
 fn measure(camera: &Camera, shot: Position, travel: Travel, leg: &str) -> bool {
@@ -114,16 +130,21 @@ fn measure(camera: &Camera, shot: Position, travel: Travel, leg: &str) -> bool {
     let elapsed = started.elapsed();
 
     if let Err(error) = sent {
-        println!("speed {:>2} {leg} — refused: {error}", travel.pan_speed);
+        println!(
+            "speed {:>2} {leg} — refused after {:.2}s: {error}",
+            travel.pan_speed,
+            elapsed.as_secs_f64(),
+        );
         return false;
     }
 
-    let arrived = match state::query_position(camera) {
+    let arrived = match query_after_settling(camera) {
         Ok(position) => position,
         Err(error) => {
             println!(
-                "speed {:>2} {leg} — moved, but wouldn't say where to: {error}",
-                travel.pan_speed
+                "speed {:>2} {leg} — moved in {:.2}s, but still won't say where to: {error}",
+                travel.pan_speed,
+                elapsed.as_secs_f64(),
             );
             return true;
         }
@@ -145,4 +166,22 @@ fn measure(camera: &Camera, shot: Position, travel: Travel, leg: &str) -> bool {
         },
     );
     true
+}
+
+/// Asks where the camera is, and if it refuses, asks again a few times with a
+/// growing pause between tries before giving up.
+fn query_after_settling(camera: &Camera) -> Result<Position, grafton_visca::Error> {
+    let mut last = state::query_position(camera);
+    for delay in SETTLE {
+        if last.is_ok() {
+            break;
+        }
+        thread::sleep(delay);
+        println!(
+            "  (refused — trying again after {:.1}s)",
+            delay.as_secs_f64()
+        );
+        last = state::query_position(camera);
+    }
+    last
 }
