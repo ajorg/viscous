@@ -24,14 +24,17 @@
 //! number rose, which a real speed table never does. A pause between moves
 //! (in case a move sent too soon after the last one was hitting the same
 //! busy window `probe_absolute.rs` found on its position queries) did not
-//! fix it — a second run gave the identical leg time, to the millisecond, at
-//! five different commanded speeds. Real physical motion does not do that;
-//! nothing timed a real move ever repeats itself exactly. This was measuring
-//! *something*, just not what it claimed to. Every leg's landing is now
-//! confirmed against a position query rather than assumed from its timing
-//! alone — the same check `probe_absolute.rs` already makes and this had
-//! skipped, and the one thing that can tell "moved as fast as reported" from
-//! "reported a duration for a move that didn't happen as commanded" apart.
+//! fix it — a second run gave the same leg time at several different
+//! commanded speeds, at the millisecond resolution this was printing at.
+//! That resolution was too coarse to tell "genuinely identical" from
+//! "independently close" apart, so two things were added rather than one
+//! more guess: every leg's landing is now confirmed against a position query
+//! instead of assumed from its timing alone (the same check
+//! `probe_absolute.rs` already makes), and grafton-visca's own trace-level
+//! logging — ACK/completion classification, socket attribution, resend
+//! attempts — is now switched on rather than left silent. Between the two,
+//! the next run has enough resolution and enough visibility into the wire to
+//! settle what timing alone could only gesture at.
 //!
 //! ```text
 //! cargo run --example calibrate_speed -- COM3
@@ -113,6 +116,16 @@ struct Reading {
 }
 
 fn main() -> ExitCode {
+    // grafton-visca logs ACK/completion classification, socket attribution,
+    // and resend attempts at trace level; nothing showed it before now. An
+    // explicit `RUST_LOG` still wins, so a quieter run stays available.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("grafton_visca=trace")),
+        )
+        .init();
+
     let mut args = env::args().skip(1);
     let Some(target) = args.next() else {
         eprintln!("usage: calibrate_speed <serial port|tcp://host[:port]> [speed]...");
@@ -168,8 +181,13 @@ fn main() -> ExitCode {
 }
 
 fn print_reading(axis: &str, reading: &Reading) {
+    // Microsecond resolution, not millisecond: three decimal places had
+    // rounded distinct readings onto the same printed value on an earlier
+    // run, which looked like exact duplication but wasn't shown precisely
+    // enough to tell that apart from independent readings landing close
+    // together.
     println!(
-        "  {axis:<4} near={:.3}s mid={:.3}s far={:.3}s -> {:>8.1} u/s{}{}",
+        "  {axis:<4} near={:.6}s mid={:.6}s far={:.6}s -> {:>8.1} u/s{}{}",
         reading.near.as_secs_f64(),
         reading.mid.as_secs_f64(),
         reading.far.as_secs_f64(),
