@@ -20,18 +20,18 @@
 //!
 //! A first hardware run found something worse than an unfinished ramp at the
 //! higher speeds: rates several times faster than `probe_absolute.rs` had
-//! already confirmed the head physically capable of, and falling as the
-//! speed number rose, which a real speed table never does. The suspect is
-//! cadence — this fires far more `Pan-tiltPosition Absolute Position`
-//! commands back to back, with no pause, than anything run against this
-//! camera before. `examples/probe_absolute.rs`'s own hardware run found the
-//! camera briefly refuses a position query sent too soon after a move; the
-//! same busy window may be swallowing part of a *move*'s reported travel
-//! time when the next one follows too closely. So every move here is now
-//! followed by a pause before the next is sent, and every leg's raw time is
-//! printed rather than only the rate computed from it — if the pause fixes
-//! the collapse, this is the confirmation; if it doesn't, the raw numbers
-//! are what finds the real cause instead of guessing again.
+//! already confirmed the head physically capable of, falling as the speed
+//! number rose, which a real speed table never does. A pause between moves
+//! (in case a move sent too soon after the last one was hitting the same
+//! busy window `probe_absolute.rs` found on its position queries) did not
+//! fix it — a second run gave the identical leg time, to the millisecond, at
+//! five different commanded speeds. Real physical motion does not do that;
+//! nothing timed a real move ever repeats itself exactly. This was measuring
+//! *something*, just not what it claimed to. Every leg's landing is now
+//! confirmed against a position query rather than assumed from its timing
+//! alone — the same check `probe_absolute.rs` already makes and this had
+//! skipped, and the one thing that can tell "moved as fast as reported" from
+//! "reported a duration for a move that didn't happen as commanded" apart.
 //!
 //! ```text
 //! cargo run --example calibrate_speed -- COM3
@@ -105,6 +105,11 @@ struct Reading {
     /// took equal time — the check a two-point measurement has no way to
     /// make.
     settled: bool,
+    /// How far off the largest of the three legs' actual landing was from
+    /// where it was sent, or `None` if the camera wouldn't confirm any of
+    /// them. A timed leg that never really moved would still report a
+    /// duration; only checking where it landed can catch that.
+    missed: Option<i32>,
 }
 
 fn main() -> ExitCode {
@@ -164,7 +169,7 @@ fn main() -> ExitCode {
 
 fn print_reading(axis: &str, reading: &Reading) {
     println!(
-        "  {axis:<4} near={:.3}s mid={:.3}s far={:.3}s -> {:>8.1} u/s{}",
+        "  {axis:<4} near={:.3}s mid={:.3}s far={:.3}s -> {:>8.1} u/s{}{}",
         reading.near.as_secs_f64(),
         reading.mid.as_secs_f64(),
         reading.far.as_secs_f64(),
@@ -173,6 +178,11 @@ fn print_reading(axis: &str, reading: &Reading) {
             ""
         } else {
             "  (not settled — treat as a lower bound)"
+        },
+        match reading.missed {
+            Some(0) => String::new(),
+            Some(units) => format!("  (missed a landing by {units} units)"),
+            None => "  (couldn't confirm any landing)".to_string(),
         },
     );
 }
@@ -253,9 +263,9 @@ fn axis_rate(
     far: Position,
     travel: Travel,
 ) -> Result<Reading, grafton_visca::Error> {
-    let near_elapsed = timed_round_trip(camera, home, near, travel)?;
-    let mid_elapsed = timed_round_trip(camera, home, mid, travel)?;
-    let far_elapsed = timed_round_trip(camera, home, far, travel)?;
+    let (near_elapsed, near_missed) = timed_round_trip(camera, home, near, travel)?;
+    let (mid_elapsed, mid_missed) = timed_round_trip(camera, home, mid, travel)?;
+    let (far_elapsed, far_missed) = timed_round_trip(camera, home, far, travel)?;
 
     let first_step = mid_elapsed.saturating_sub(near_elapsed).as_secs_f32();
     let second_step = far_elapsed.saturating_sub(mid_elapsed).as_secs_f32();
@@ -273,25 +283,50 @@ fn axis_rate(
         far: far_elapsed,
         rate: f32::from(LONG - SHORT) / elapsed,
         settled,
+        missed: [near_missed, mid_missed, far_missed]
+            .into_iter()
+            .flatten()
+            .max(),
     })
 }
 
-/// Sends the camera to `target`, times how long it took, then returns it to
-/// `home` — pausing after each of the two moves so the next command is never
-/// sent while the last one might still be settling. See the module docs.
+/// Sends the camera to `target`, times how long it took, confirms where that
+/// actually left it, then returns it to `home` — pausing after each of the
+/// two moves so the next command is never sent while the last one might
+/// still be settling. See the module docs.
 fn timed_round_trip(
     camera: &Camera,
     home: Position,
     target: Position,
     travel: Travel,
-) -> Result<Duration, grafton_visca::Error> {
+) -> Result<(Duration, Option<i32>), grafton_visca::Error> {
     let started = Instant::now();
     shot::go_to(camera, target, travel)?;
     let elapsed = started.elapsed();
+
+    let missed = query_after_settling(camera).ok().map(|arrived| {
+        i32::from((arrived.pan - target.pan).abs()) + i32::from((arrived.tilt - target.tilt).abs())
+    });
     thread::sleep(SETTLE);
 
     shot::go_to(camera, home, travel)?;
     thread::sleep(SETTLE);
 
-    Ok(elapsed)
+    Ok((elapsed, missed))
+}
+
+/// Asks where the camera is, retrying for a moment if it says the query
+/// isn't executable yet — see `examples/probe_absolute.rs`, whose hardware
+/// run found the camera briefly busy in exactly that instant, always
+/// recovering by the first retry.
+fn query_after_settling(camera: &Camera) -> Result<Position, grafton_visca::Error> {
+    let mut last = state::query_position(camera);
+    for _ in 0..3 {
+        if last.is_ok() {
+            break;
+        }
+        thread::sleep(SETTLE);
+        last = state::query_position(camera);
+    }
+    last
 }
