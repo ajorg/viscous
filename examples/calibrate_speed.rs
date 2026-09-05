@@ -18,6 +18,21 @@
 //! disagree, that disagreement is itself the signal that the ramp reaches
 //! past the distances tried, not something measurement noise would produce.
 //!
+//! A first hardware run found something worse than an unfinished ramp at the
+//! higher speeds: rates several times faster than `probe_absolute.rs` had
+//! already confirmed the head physically capable of, and falling as the
+//! speed number rose, which a real speed table never does. The suspect is
+//! cadence — this fires far more `Pan-tiltPosition Absolute Position`
+//! commands back to back, with no pause, than anything run against this
+//! camera before. `examples/probe_absolute.rs`'s own hardware run found the
+//! camera briefly refuses a position query sent too soon after a move; the
+//! same busy window may be swallowing part of a *move*'s reported travel
+//! time when the next one follows too closely. So every move here is now
+//! followed by a pause before the next is sent, and every leg's raw time is
+//! printed rather than only the rate computed from it — if the pause fixes
+//! the collapse, this is the confirmation; if it doesn't, the raw numbers
+//! are what finds the real cause instead of guessing again.
+//!
 //! ```text
 //! cargo run --example calibrate_speed -- COM3
 //! cargo run --example calibrate_speed -- tcp://192.168.1.50:5678 1 3 6 12 24
@@ -34,6 +49,7 @@
 use std::{
     env,
     process::ExitCode,
+    thread,
     time::{Duration, Instant},
 };
 
@@ -56,6 +72,12 @@ const LONG: i16 = 600;
 /// trusted outright.
 const TOLERANCE: f32 = 0.15;
 
+/// How long to pause after each move before sending the next. Matches the
+/// figure `examples/probe_absolute.rs`'s hardware run found was always
+/// enough for a refused position query to recover; a move sent too soon
+/// after the last one may hit the same busy window.
+const SETTLE: Duration = Duration::from_millis(300);
+
 /// The speeds to measure when none are given on the command line: finer at
 /// the slow end, where a deliberate move to a shot would live, coarser
 /// toward the top.
@@ -67,9 +89,15 @@ const RETURN: Travel = Travel {
     tilt_speed: 4,
 };
 
-/// A measured cruising rate, and whether the measurement actually looked
-/// like cruising.
+/// The three timed legs to one axis's calibration, and what they say about
+/// the cruising rate.
 struct Reading {
+    /// How long the trip to [`SHORT`] took.
+    near: Duration,
+    /// How long the trip to [`MID`] took.
+    mid: Duration,
+    /// How long the trip to [`LONG`] took.
+    far: Duration,
     /// Camera units per second, over the distance from [`SHORT`] to
     /// [`LONG`].
     rate: f32,
@@ -112,24 +140,18 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     };
     println!("starting from {}", state::format_position(&home));
-    println!();
-    println!("{:>5}  {:>10}  {:>10}", "speed", "pan u/s", "tilt u/s");
 
     for speed in speeds {
+        println!();
         match measure(camera, home, speed) {
-            Ok((pan, tilt)) => println!(
-                "{speed:>5}  {:>10}  {:>10}",
-                format_reading(&pan),
-                format_reading(&tilt),
-            ),
-            Err(error) => println!("{speed:>5}  refused: {error}"),
+            Ok((pan, tilt)) => {
+                println!("speed {speed}:");
+                print_reading("pan", &pan);
+                print_reading("tilt", &tilt);
+            }
+            Err(error) => println!("speed {speed} — refused: {error}"),
         }
     }
-
-    println!();
-    println!("* the two inner steps didn't agree — the head may not have finished");
-    println!("  ramping up to speed within {LONG} units; treat as a lower bound,");
-    println!("  not the true cruising rate");
 
     println!();
     if let Err(error) = shot::go_to(camera, home, RETURN) {
@@ -140,12 +162,19 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn format_reading(reading: &Reading) -> String {
-    if reading.settled {
-        format!("{:.1}", reading.rate)
-    } else {
-        format!("{:.1}*", reading.rate)
-    }
+fn print_reading(axis: &str, reading: &Reading) {
+    println!(
+        "  {axis:<4} near={:.3}s mid={:.3}s far={:.3}s -> {:>8.1} u/s{}",
+        reading.near.as_secs_f64(),
+        reading.mid.as_secs_f64(),
+        reading.far.as_secs_f64(),
+        reading.rate,
+        if reading.settled {
+            ""
+        } else {
+            "  (not settled — treat as a lower bound)"
+        },
+    );
 }
 
 /// Measures the cruising rate at `speed` on both axes. Drives one axis at a
@@ -239,13 +268,17 @@ fn axis_rate(
     // `inf` instead of panicking partway through a hardware run.
     let elapsed = far_elapsed.saturating_sub(near_elapsed).as_secs_f32();
     Ok(Reading {
+        near: near_elapsed,
+        mid: mid_elapsed,
+        far: far_elapsed,
         rate: f32::from(LONG - SHORT) / elapsed,
         settled,
     })
 }
 
 /// Sends the camera to `target`, times how long it took, then returns it to
-/// `home`.
+/// `home` — pausing after each of the two moves so the next command is never
+/// sent while the last one might still be settling. See the module docs.
 fn timed_round_trip(
     camera: &Camera,
     home: Position,
@@ -255,6 +288,10 @@ fn timed_round_trip(
     let started = Instant::now();
     shot::go_to(camera, target, travel)?;
     let elapsed = started.elapsed();
+    thread::sleep(SETTLE);
+
     shot::go_to(camera, home, travel)?;
+    thread::sleep(SETTLE);
+
     Ok(elapsed)
 }
