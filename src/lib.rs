@@ -19,7 +19,6 @@ pub mod gamepad;
 pub mod keymap;
 pub mod nudge;
 pub mod pan_tilt;
-pub mod path;
 pub mod power;
 pub mod preset;
 pub mod session;
