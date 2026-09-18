@@ -25,14 +25,18 @@ use grafton_visca::{
     types::{PanSpeed, TiltSpeed},
 };
 
-use crate::state::Position;
+use crate::{
+    pan_tilt::{MAX_PAN_SPEED, MAX_TILT_SPEED},
+    state::Position,
+};
 
 /// How fast to travel to a shot, on each axis.
 ///
 /// Two speeds rather than one because pan and tilt are separate motors with
 /// separate ranges, and because a move with far to pan and little to tilt
 /// wants them different: at a single speed the tilt finishes early and the
-/// shot hooks into its final framing instead of arriving at it.
+/// shot hooks into its final framing instead of arriving at it — see
+/// [`proportional`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Travel {
     /// How fast to pan, in VISCA's `1..=`[`crate::pan_tilt::MAX_PAN_SPEED`].
@@ -51,6 +55,41 @@ pub const DELIBERATE: Travel = Travel {
     pan_speed: 4,
     tilt_speed: 4,
 };
+
+/// Speeds proportional to how far each axis actually has to travel from
+/// `current` to `target`, so a shot that's mostly a pan and barely a tilt
+/// doesn't have the tilt arrive early and leave the rest of the pan looking
+/// like a straight lateral tacked onto a diagonal — [`DELIBERATE`] alone
+/// can't do this, since it sends both axes at the same speed regardless of
+/// distance.
+///
+/// The axis with farther to go travels at `DELIBERATE`'s speed for that axis;
+/// the other is slowed in direct proportion to how much less distance it has
+/// to cover. That's a linear approximation of the camera's true speed — the
+/// real relationship between a VISCA speed number and how fast the head
+/// actually moves is measurably *not* linear — so this doesn't perfectly
+/// synchronise the two axes' arrival, but it is far closer than sending them
+/// at identical speeds no matter the distance, which is what it replaces.
+pub fn proportional(current: Position, target: Position) -> Travel {
+    let pan_distance = target.pan.abs_diff(current.pan);
+    let tilt_distance = target.tilt.abs_diff(current.tilt);
+    let farthest = pan_distance.max(tilt_distance);
+    if farthest == 0 {
+        return DELIBERATE;
+    }
+    Travel {
+        pan_speed: scaled_speed(pan_distance, farthest, DELIBERATE.pan_speed, MAX_PAN_SPEED),
+        tilt_speed: scaled_speed(tilt_distance, farthest, DELIBERATE.tilt_speed, MAX_TILT_SPEED),
+    }
+}
+
+/// `reference` at `farthest`, scaled down for a shorter `distance`, and never
+/// below 1 — VISCA has no speed of zero, and an axis with nowhere to go still
+/// has to carry some value on the wire even though it does nothing with it.
+fn scaled_speed(distance: u16, farthest: u16, reference: u8, max_speed: u8) -> u8 {
+    let speed = u32::from(reference) * u32::from(distance) / u32::from(farthest);
+    u8::try_from(speed).unwrap_or(max_speed).clamp(1, max_speed)
+}
 
 /// `Pan-tiltPosition Absolute Position`, encoded here rather than taken from
 /// grafton-visca, for the sake of how long it is given to answer.
@@ -161,6 +200,75 @@ mod tests {
             zoom: 0x1000,
             focus: 0x2000,
         }
+    }
+
+    #[test]
+    fn the_farther_axis_travels_at_the_deliberate_speed() {
+        let travel = proportional(
+            Position::default(),
+            Position {
+                pan: 120,
+                tilt: 45,
+                ..Position::default()
+            },
+        );
+
+        assert_eq!(travel.pan_speed, DELIBERATE.pan_speed, "pan is the farther axis");
+    }
+
+    #[test]
+    fn the_nearer_axis_is_slowed_in_proportion_to_the_farther_ones_distance() {
+        let travel = proportional(
+            Position::default(),
+            Position {
+                pan: 120,
+                tilt: 60,
+                ..Position::default()
+            },
+        );
+
+        assert_eq!(
+            travel.tilt_speed,
+            DELIBERATE.tilt_speed / 2,
+            "half the distance should ask for half the speed"
+        );
+    }
+
+    #[test]
+    fn a_move_with_nothing_to_do_on_one_axis_still_gets_a_valid_speed_for_it() {
+        let travel = proportional(
+            Position::default(),
+            Position {
+                pan: 120,
+                tilt: 0,
+                ..Position::default()
+            },
+        );
+
+        assert_eq!(
+            travel.tilt_speed, 1,
+            "VISCA has no such thing as a speed of zero"
+        );
+    }
+
+    #[test]
+    fn already_standing_on_the_target_travels_at_the_deliberate_speed() {
+        assert_eq!(proportional(somewhere(), somewhere()), DELIBERATE);
+    }
+
+    #[test]
+    fn an_equal_move_on_both_axes_travels_at_the_same_speed_on_both() {
+        let travel = proportional(
+            Position::default(),
+            Position {
+                pan: 80,
+                tilt: -80,
+                ..Position::default()
+            },
+        );
+
+        assert_eq!(travel.pan_speed, travel.tilt_speed);
+        assert_eq!(travel.pan_speed, DELIBERATE.pan_speed);
     }
 
     #[test]

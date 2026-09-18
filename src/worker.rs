@@ -288,11 +288,22 @@ where
         // `CAM_Memory Recall` gives no way to change — and the position it
         // lands on is learned for next time. Once a preset is known, recalling
         // it again arrives the way a shot should: at a chosen, unhurried
-        // speed, by asking the camera to go there rather than to recall it.
+        // speed on each axis proportional to how far that axis actually has
+        // to go, by asking the camera to go there rather than to recall it.
+        //
+        // The proportion needs to know where the camera is standing right
+        // now, which costs a query up front — one a camera busy settling
+        // from the last command can refuse. That only costs the proportion:
+        // a camera that won't say where it is travels at a flat deliberate
+        // pace on both axes rather than the move being refused outright.
         Intent::RecallPreset(number) => {
             let result = match known_presets.get(&number) {
                 Some(&position) => {
-                    shot::go_to(camera, position, shot::DELIBERATE).map(|()| Some(position))
+                    let travel = state::query_position(camera)
+                        .map_or(shot::DELIBERATE, |current| {
+                            shot::proportional(current, position)
+                        });
+                    shot::go_to(camera, position, travel).map(|()| Some(position))
                 }
                 None => harvest(camera, preset::recall_preset(camera, number)),
             };
@@ -508,9 +519,12 @@ mod tests {
 
     #[test]
     fn a_preset_already_known_travels_there_deliberately_instead_of_being_recalled() {
-        let (camera, transport) = scripted_camera_with_transport(vec![
-            helpers::standard_command_response(1), // the absolute move
-        ]);
+        // Where the camera is standing before the move, so the proportional
+        // speed can be worked out — see `shot::proportional`.
+        let mut replies = state::fixtures::reports(Position::default());
+        replies.push(helpers::standard_command_response(1)); // the absolute move
+
+        let (camera, transport) = scripted_camera_with_transport(replies);
         let (intent_tx, intent_rx) = channel();
         let (result_tx, result_rx) = channel();
 
@@ -525,17 +539,48 @@ mod tests {
             result_rx.recv().unwrap(),
             Outcome::Preset(_, Ok(Some(at))) if at == somewhere()
         ));
-        let sent = transport.sent();
-        assert_eq!(sent.len(), 1, "no query needed, the position was known already");
+        let last = transport.sent().last().expect("something was sent").clone();
         assert_eq!(
-            sent[0][1..4],
+            last[1..4],
             ABSOLUTE_POSITION_OPCODE,
             "a known preset should travel by absolute move, not CAM_Memory Recall"
         );
         assert_eq!(
-            sent[0][4..6],
+            last[4..6],
+            [4, 1],
+            "pan is the farther axis of somewhere() from the origin and travels at the \
+             deliberate speed; tilt has less than half as far to go and is slowed to match"
+        );
+    }
+
+    #[test]
+    fn a_camera_that_wont_say_where_it_is_still_travels_deliberately_rather_than_being_refused() {
+        let replies = vec![
+            helpers::errors::syntax_error(1), // the position query fails
+            helpers::standard_command_response(1), // the absolute move still goes out
+        ];
+
+        let (camera, transport) = scripted_camera_with_transport(replies);
+        let (intent_tx, intent_rx) = channel();
+        let (result_tx, result_rx) = channel();
+
+        let mut known = BTreeMap::new();
+        known.insert(1, somewhere());
+        intent_tx.send(Intent::RecallPreset(1)).unwrap();
+        drop(intent_tx);
+
+        run(&camera, &intent_rx, &result_tx, known);
+
+        assert!(matches!(
+            result_rx.recv().unwrap(),
+            Outcome::Preset(_, Ok(Some(at))) if at == somewhere()
+        ));
+        let last = transport.sent().last().expect("something was sent").clone();
+        assert_eq!(
+            last[4..6],
             [shot::DELIBERATE.pan_speed, shot::DELIBERATE.tilt_speed],
-            "should travel at the deliberate speed, not the camera's own recall rate"
+            "not knowing where the camera is should fall back to a flat deliberate pace, \
+             not refuse the move"
         );
     }
 
@@ -543,6 +588,7 @@ mod tests {
     fn a_preset_learned_earlier_in_the_same_run_is_recalled_deliberately_next_time() {
         let mut replies = vec![helpers::standard_command_response(1)]; // first recall
         replies.extend(state::fixtures::reports(somewhere())); // harvested afterward
+        replies.extend(state::fixtures::reports(Position::default())); // current position, asked before the second recall's move
         replies.push(helpers::standard_command_response(1)); // second recall, now known
 
         let (camera, transport) = scripted_camera_with_transport(replies);
@@ -576,6 +622,7 @@ mod tests {
     fn a_preset_saved_this_run_is_recalled_deliberately_afterward() {
         let mut replies = vec![helpers::standard_command_response(1)]; // save
         replies.extend(state::fixtures::reports(somewhere())); // harvested afterward
+        replies.extend(state::fixtures::reports(Position::default())); // current position, asked before the recall's move
         replies.push(helpers::standard_command_response(1)); // recall, now known
 
         let (camera, transport) = scripted_camera_with_transport(replies);
