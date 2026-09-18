@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::io;
 use std::process::ExitCode;
 use std::sync::mpsc::channel;
@@ -51,8 +52,12 @@ fn main() -> ExitCode {
     // stick around for its reply, so there's nothing to gain by blocking
     // process exit on an in-flight command's ack/completion round trip
     // (which, for a preset recall, can be tens of seconds).
+    //
+    // This front end doesn't keep a config file, so it starts every run not
+    // knowing where any preset points — same as always. It still learns
+    // them as they're recalled or marked, for the rest of this run.
     thread::spawn(move || {
-        worker::run(&camera, &intent_rx, &result_tx);
+        worker::run(&camera, &intent_rx, &result_tx, BTreeMap::new());
     });
 
     // The transcript has room for the whole version reply; the TUI's one-line

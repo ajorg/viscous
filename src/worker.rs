@@ -2,6 +2,7 @@
 //! on VISCA's ack/completion round trip (which, for a preset recall, can take
 //! as long as the physical move itself).
 
+use std::collections::BTreeMap;
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
 
@@ -17,6 +18,7 @@ use crate::{
     nudge::{self, Step},
     pan_tilt::{self, Velocity},
     power, preset,
+    shot,
     state::{self, CameraState, Position},
     title::{self, Title},
     zoom::{self, ZoomDirection, ZoomDrive},
@@ -263,7 +265,14 @@ where
     Ok(state::query_position(camera).ok())
 }
 
-fn dispatch<T>(camera: &BlockingClient<GenericVisca, T>, intent: Intent) -> Outcome
+/// Runs one intent against `camera`, consulting and updating `known_presets`
+/// for the two that can teach it something — see [`Intent::RecallPreset`]'s
+/// handling below.
+fn dispatch<T>(
+    camera: &BlockingClient<GenericVisca, T>,
+    intent: Intent,
+    known_presets: &mut BTreeMap<u8, Position>,
+) -> Outcome
 where
     T: BlockingTransport + HasTransportConfig + 'static,
 {
@@ -274,12 +283,30 @@ where
         Intent::DriveFocus(direction) => {
             Outcome::Done(intent, focus::drive_focus(camera, direction))
         }
-        Intent::RecallPreset(number) => Outcome::Preset(
-            intent,
-            harvest(camera, preset::recall_preset(camera, number)),
-        ),
+        // The first recall of a preset has nowhere to travel deliberately to
+        // yet, so it goes at the camera's own pace — fast, since that's what
+        // `CAM_Memory Recall` gives no way to change — and the position it
+        // lands on is learned for next time. Once a preset is known, recalling
+        // it again arrives the way a shot should: at a chosen, unhurried
+        // speed, by asking the camera to go there rather than to recall it.
+        Intent::RecallPreset(number) => {
+            let result = match known_presets.get(&number) {
+                Some(&position) => {
+                    shot::go_to(camera, position, shot::DELIBERATE).map(|()| Some(position))
+                }
+                None => harvest(camera, preset::recall_preset(camera, number)),
+            };
+            if let Ok(Some(position)) = result {
+                known_presets.insert(number, position);
+            }
+            Outcome::Preset(intent, result)
+        }
         Intent::SavePreset(number) => {
-            Outcome::Preset(intent, harvest(camera, preset::save_preset(camera, number)))
+            let result = harvest(camera, preset::save_preset(camera, number));
+            if let Ok(Some(position)) = result {
+                known_presets.insert(number, position);
+            }
+            Outcome::Preset(intent, result)
         }
         Intent::SetAutoFocus(auto) => Outcome::Done(intent, focus::set_auto_focus(camera, auto)),
         Intent::Home => Outcome::Done(intent, pan_tilt::home(camera)),
@@ -294,6 +321,13 @@ where
 /// Runs camera intents received from `intents` against `camera` until the
 /// channel closes, sending each command's outcome to `results`.
 ///
+/// `known_presets` seeds what this run already knows about where presets
+/// point — typically a front end's config, read back from a previous run —
+/// so a preset recalled once already, in an earlier run or an earlier
+/// process, travels deliberately from the very first recall this run makes
+/// rather than needing to relearn it before slowing down. An empty map is
+/// fine: every preset just starts out unknown, the way it always did.
+///
 /// Intended to run on its own thread, started once per connected camera, so
 /// a slow completion round trip never blocks the UI thread. Stops early if
 /// `results` is no longer being received (the UI side has gone away).
@@ -301,6 +335,7 @@ pub fn run<T>(
     camera: &BlockingClient<GenericVisca, T>,
     intents: &Receiver<Intent>,
     results: &Sender<Outcome>,
+    mut known_presets: BTreeMap<u8, Position>,
 ) where
     T: BlockingTransport + HasTransportConfig + 'static,
 {
@@ -313,7 +348,10 @@ pub fn run<T>(
         batch.extend(intents.try_iter());
 
         for intent in coalesced(&batch) {
-            if results.send(dispatch(camera, intent)).is_err() {
+            if results
+                .send(dispatch(camera, intent, &mut known_presets))
+                .is_err()
+            {
                 return;
             }
         }
@@ -353,6 +391,28 @@ mod tests {
             .expect("camera should build from a scripted transport")
     }
 
+    /// Like [`scripted_camera`], but keeps a handle on the transport so a
+    /// test can look at what actually went out on the wire — needed to tell
+    /// a deliberate absolute move apart from the camera's own preset recall,
+    /// which an [`Outcome`] alone can't distinguish.
+    fn scripted_camera_with_transport(
+        replies: Vec<grafton_visca::testing::testkit::Step>,
+    ) -> (
+        BlockingClient<GenericVisca, ScriptedBlockingTransport>,
+        ScriptedBlockingTransport,
+    ) {
+        let transport = ScriptedBlockingTransport::new(replies);
+        let camera = grafton_visca::CameraBuilder::new()
+            .build_blocking::<GenericVisca, _>(transport.clone())
+            .expect("camera should build from a scripted transport");
+        (camera, transport)
+    }
+
+    /// `Pan-tiltPosition Absolute Position`'s opcode, as it appears at
+    /// `sent[1..4]` — distinct from `CAM_Memory Recall`'s `[0x01, 0x04,
+    /// 0x3F]`, which is what tells a deliberate move apart from a recall.
+    const ABSOLUTE_POSITION_OPCODE: [u8; 3] = [0x01, 0x06, 0x02];
+
     fn zoom_in() -> ZoomDrive {
         ZoomDrive {
             direction: ZoomDirection::In,
@@ -382,7 +442,7 @@ mod tests {
         intent_tx.send(Intent::DriveZoom(Some(zoom_in()))).unwrap();
         drop(intent_tx);
 
-        run(&camera, &intent_rx, &result_tx);
+        run(&camera, &intent_rx, &result_tx, BTreeMap::new());
 
         assert!(
             matches!(result_rx.recv().unwrap(), Outcome::Done(_, Ok(()))),
@@ -415,7 +475,7 @@ mod tests {
 
         intent_tx.send(intent).unwrap();
         drop(intent_tx);
-        run(&camera, &intent_rx, &result_tx);
+        run(&camera, &intent_rx, &result_tx, BTreeMap::new());
 
         result_rx
             .recv()
@@ -444,6 +504,102 @@ mod tests {
         let outcome = preset_outcome(replies, Intent::SavePreset(3));
 
         assert!(matches!(outcome, Outcome::Preset(_, Ok(Some(at))) if at == somewhere()));
+    }
+
+    #[test]
+    fn a_preset_already_known_travels_there_deliberately_instead_of_being_recalled() {
+        let (camera, transport) = scripted_camera_with_transport(vec![
+            helpers::standard_command_response(1), // the absolute move
+        ]);
+        let (intent_tx, intent_rx) = channel();
+        let (result_tx, result_rx) = channel();
+
+        let mut known = BTreeMap::new();
+        known.insert(1, somewhere());
+        intent_tx.send(Intent::RecallPreset(1)).unwrap();
+        drop(intent_tx);
+
+        run(&camera, &intent_rx, &result_tx, known);
+
+        assert!(matches!(
+            result_rx.recv().unwrap(),
+            Outcome::Preset(_, Ok(Some(at))) if at == somewhere()
+        ));
+        let sent = transport.sent();
+        assert_eq!(sent.len(), 1, "no query needed, the position was known already");
+        assert_eq!(
+            sent[0][1..4],
+            ABSOLUTE_POSITION_OPCODE,
+            "a known preset should travel by absolute move, not CAM_Memory Recall"
+        );
+        assert_eq!(
+            sent[0][4..6],
+            [shot::DELIBERATE.pan_speed, shot::DELIBERATE.tilt_speed],
+            "should travel at the deliberate speed, not the camera's own recall rate"
+        );
+    }
+
+    #[test]
+    fn a_preset_learned_earlier_in_the_same_run_is_recalled_deliberately_next_time() {
+        let mut replies = vec![helpers::standard_command_response(1)]; // first recall
+        replies.extend(state::fixtures::reports(somewhere())); // harvested afterward
+        replies.push(helpers::standard_command_response(1)); // second recall, now known
+
+        let (camera, transport) = scripted_camera_with_transport(replies);
+        let (intent_tx, intent_rx) = channel();
+        let (result_tx, result_rx) = channel();
+
+        intent_tx.send(Intent::RecallPreset(1)).unwrap();
+        intent_tx.send(Intent::RecallPreset(1)).unwrap();
+        drop(intent_tx);
+
+        run(&camera, &intent_rx, &result_tx, BTreeMap::new());
+
+        assert!(matches!(
+            result_rx.recv().unwrap(),
+            Outcome::Preset(_, Ok(Some(at))) if at == somewhere()
+        ));
+        assert!(matches!(
+            result_rx.recv().unwrap(),
+            Outcome::Preset(_, Ok(Some(at))) if at == somewhere()
+        ));
+
+        let last = transport.sent().last().expect("something was sent").clone();
+        assert_eq!(
+            last[1..4],
+            ABSOLUTE_POSITION_OPCODE,
+            "the second recall should already know where preset 1 is"
+        );
+    }
+
+    #[test]
+    fn a_preset_saved_this_run_is_recalled_deliberately_afterward() {
+        let mut replies = vec![helpers::standard_command_response(1)]; // save
+        replies.extend(state::fixtures::reports(somewhere())); // harvested afterward
+        replies.push(helpers::standard_command_response(1)); // recall, now known
+
+        let (camera, transport) = scripted_camera_with_transport(replies);
+        let (intent_tx, intent_rx) = channel();
+        let (result_tx, result_rx) = channel();
+
+        intent_tx.send(Intent::SavePreset(2)).unwrap();
+        intent_tx.send(Intent::RecallPreset(2)).unwrap();
+        drop(intent_tx);
+
+        run(&camera, &intent_rx, &result_tx, BTreeMap::new());
+
+        result_rx.recv().expect("the save reports an outcome");
+        assert!(matches!(
+            result_rx.recv().unwrap(),
+            Outcome::Preset(_, Ok(Some(at))) if at == somewhere()
+        ));
+
+        let last = transport.sent().last().expect("something was sent").clone();
+        assert_eq!(
+            last[1..4],
+            ABSOLUTE_POSITION_OPCODE,
+            "marking a preset should teach the next recall where it is, same as recalling would"
+        );
     }
 
     #[test]
@@ -484,7 +640,7 @@ mod tests {
         intent_tx.send(Intent::Home).unwrap();
         drop(intent_tx);
 
-        run(&camera, &intent_rx, &result_tx);
+        run(&camera, &intent_rx, &result_tx, BTreeMap::new());
 
         assert!(
             matches!(result_rx.recv().unwrap(), Outcome::Done(_, Err(_))),
@@ -540,7 +696,7 @@ mod tests {
             .unwrap();
         drop(intent_tx);
 
-        run(&camera, &intent_rx, &result_tx);
+        run(&camera, &intent_rx, &result_tx, BTreeMap::new());
 
         assert!(
             matches!(
@@ -565,7 +721,7 @@ mod tests {
         intent_tx.send(Intent::QueryState).unwrap();
         drop(intent_tx);
 
-        run(&camera, &intent_rx, &result_tx);
+        run(&camera, &intent_rx, &result_tx, BTreeMap::new());
 
         assert!(matches!(result_rx.recv().unwrap(), Outcome::State(_)));
     }
@@ -607,7 +763,7 @@ mod tests {
         }
         drop(intent_tx);
 
-        run(&camera, &intent_rx, &result_tx);
+        run(&camera, &intent_rx, &result_tx, BTreeMap::new());
 
         for intent in intents {
             assert!(

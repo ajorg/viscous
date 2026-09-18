@@ -41,6 +41,17 @@ pub struct Travel {
     pub tilt_speed: u8,
 }
 
+/// A deliberate, unhurried pace for arriving at a shot on purpose, rather than
+/// snapping to it the way the camera's own preset recall does.
+///
+/// Measured against a real EVI-D80: settled and repeatable on both axes,
+/// clearly slower than the camera's fastest gears without being so slow that
+/// waiting for a shot feels like the wrong call.
+pub const DELIBERATE: Travel = Travel {
+    pan_speed: 4,
+    tilt_speed: 4,
+};
+
 /// `Pan-tiltPosition Absolute Position`, encoded here rather than taken from
 /// grafton-visca, for the sake of how long it is given to answer.
 ///

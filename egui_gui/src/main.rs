@@ -152,7 +152,12 @@ struct Worker {
 /// Connects to whatever `target` names — a serial port or a `tcp://` endpoint,
 /// same string either front end takes — and starts the worker thread that owns
 /// the camera from then on.
-fn connect(target: &str) -> Result<Worker, String> {
+///
+/// `known_presets` is the config's own memory of where each preset points,
+/// carried in so the very first recall of a preset already learned in an
+/// earlier run travels there deliberately rather than needing to be
+/// recalled once more before it does.
+fn connect(target: &str, known_presets: BTreeMap<u8, Position>) -> Result<Worker, String> {
     let connected = connection::connect(&Target::from(target))?;
 
     let (worker_tx, worker_rx) = mpsc::channel::<Intent>();
@@ -162,7 +167,7 @@ fn connect(target: &str) -> Result<Worker, String> {
     // whose answer decides what the window offers, and it is worth having
     // before the first frame is drawn rather than a round trip afterwards.
     let titles = title::supported(&camera);
-    thread::spawn(move || worker::run(&camera, &worker_rx, &result_tx));
+    thread::spawn(move || worker::run(&camera, &worker_rx, &result_tx, known_presets));
 
     Ok(Worker {
         link: connected.link,
@@ -399,12 +404,13 @@ impl App {
 
     fn start_connect(&mut self, ctx: &egui::Context) {
         let port = self.port_input.trim().to_string();
+        let known_presets = self.preset_positions.clone();
         self.connection = Connection::Connecting;
         let (tx, rx) = mpsc::channel();
         self.connect_rx = Some(rx);
         let ctx = ctx.clone();
         thread::spawn(move || {
-            let _ = tx.send(connect(&port));
+            let _ = tx.send(connect(&port, known_presets));
             ctx.request_repaint();
         });
     }
