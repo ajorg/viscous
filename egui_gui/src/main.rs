@@ -62,7 +62,7 @@ const PRESETS: u8 = 6;
 /// keeps a row a row: every button, field and gap grows by the same amount, so
 /// what lined up before still lines up. Ctrl+plus and Ctrl+minus go on working
 /// from here for anyone who wants it larger still.
-const INTERFACE_SCALE: f32 = 1.3;
+const INTERFACE_SCALE: f32 = 1.15;
 
 /// How wide a numbered recall button is drawn, as a multiple of the height of a
 /// line of body text.
