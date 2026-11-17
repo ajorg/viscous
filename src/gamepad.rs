@@ -6,7 +6,7 @@
 //! plugged in. Reading the actual device is a thin translation layer in the
 //! front end, and is the only part that needs hardware to check.
 //!
-//! The sticks feed the same [`deflection`](crate::deflection) curve and
+//! The sticks feed the same [`deflection`](crate::deflection) bands and
 //! deadzone as the pointer and the keys, so a hand that has learned the
 //! on-screen pad has learned the stick.
 

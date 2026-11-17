@@ -33,22 +33,40 @@ pub const MAX_PAN_SPEED: u8 = 24;
 /// shorter range than pan's).
 pub const MAX_TILT_SPEED: u8 = 20;
 
-/// The pan speeds a control will actually ask for, slowest first.
+/// The fastest speed a control asks for, on either axis.
 ///
-/// Deliberately short of what the camera can do. The top of VISCA's range is a
-/// speed for slewing somewhere, not for pointing at anything: it swings past a
-/// subject before a hand can stop it, and the picture arrives as a blur either
-/// way. Held to half of that, every position on a control is a speed worth
-/// driving at, and the ones in the middle are the ones a shot is framed with.
+/// Measured rather than chosen, on the camera this was written beside (an
+/// EVI-class head, `examples/probe_speeds.rs`), in its own position units per
+/// second and the same on both axes to within a few percent:
 ///
-/// Nothing is lost by giving the top up: getting somewhere far away in a hurry
-/// is what the presets and [`home`] are for, and they arrive at the camera's
-/// own pace without anyone having to hold a stick over.
-pub const PAN_SPEEDS: RangeInclusive<u8> = MIN_SPEED..=MAX_PAN_SPEED / 2;
+/// ```text
+/// speed   1    2    3    4    5    6    7    8     9    10    11    12
+/// rate   75  101  131  185  308  516  749  947  1237  1393  1597  1819
+/// ```
+///
+/// Up to 9, each speed is a third to two thirds faster than the one below it:
+/// nine steps that can each be told from its neighbours on a live picture.
+/// Past 9 the table flattens to steps of about a seventh, which is close to
+/// the least difference in speed an eye can see at all — speeds that would
+/// each cost a share of a control's travel and give back nothing a hand could
+/// use. So the range stops where the steps stop being worth having.
+///
+/// It was also never a speed for pointing at anything. The top of VISCA's
+/// range swings past a subject before a hand can stop it; getting somewhere
+/// far away in a hurry is what the presets and [`home`] are for, and they
+/// arrive at the camera's own pace without anyone having to hold a stick over.
+const TOP_SPEED: u8 = 9;
 
-/// The tilt speeds a control will actually ask for, slowest first. Half of
-/// what the camera accepts, for the reasons [`PAN_SPEEDS`] gives.
-pub const TILT_SPEEDS: RangeInclusive<u8> = MIN_SPEED..=MAX_TILT_SPEED / 2;
+/// The pan speeds a control will actually ask for, slowest first. See
+/// [`TOP_SPEED`] for where they stop and why.
+pub const PAN_SPEEDS: RangeInclusive<u8> = MIN_SPEED..=TOP_SPEED;
+
+/// The tilt speeds a control will actually ask for, slowest first.
+///
+/// The same as [`PAN_SPEEDS`], and not only for tidiness: a speed number is
+/// worth the same rate on both axes, so sharing one range is what makes a
+/// control pushed equally both ways travel at 45 degrees.
+pub const TILT_SPEEDS: RangeInclusive<u8> = MIN_SPEED..=TOP_SPEED;
 
 /// A continuous pan/tilt drive request: which way to drive, and how fast
 /// along each axis.
@@ -259,21 +277,11 @@ mod tests {
     }
 
     #[test]
-    fn half_a_push_asks_for_far_less_than_half_the_top_speed() {
-        // What makes the pad usable for framing rather than only for getting
-        // somewhere: a straight mapping would put half a push at half the top
-        // speed, which crosses a room faster than a subject can be followed.
-        let half = velocity_from_axes(0.5, 0.0).pan_speed;
-
-        assert!(
-            half * 3 <= *PAN_SPEEDS.end(),
-            "half the travel should stay slow, got {half} of {}",
-            *PAN_SPEEDS.end()
-        );
-    }
-
-    #[test]
     fn the_slow_half_of_the_pad_stays_in_the_slow_speeds() {
+        // What makes the pad usable for framing rather than only for getting
+        // somewhere. The speed numbers understate it: the third speed is a
+        // fourteenth of the rate of the ninth, so half the travel is spent
+        // below a tenth of the fastest the pad can go.
         for step in 11..=50 {
             let speed = velocity_from_axes(step as f32 / 100.0, 0.0).pan_speed;
             assert!(
@@ -285,18 +293,16 @@ mod tests {
     }
 
     #[test]
-    fn the_middle_of_the_travel_is_where_the_slowest_speeds_are() {
-        // What a hand reaches for most, and what the pad is mostly for: a push
-        // held somewhere short of the stops frames a shot, so the middle of
-        // the travel belongs to the bottom of the range rather than the middle
-        // of it. Getting somewhere in a hurry is the far end's job.
-        assert_eq!(velocity_from_axes(0.5, 0.0).pan_speed, MIN_SPEED);
-        assert!(
-            velocity_from_axes(0.65, 0.0).pan_speed * 4 <= *PAN_SPEEDS.end(),
-            "two thirds of a push asked for {} of {}",
-            velocity_from_axes(0.65, 0.0).pan_speed,
-            *PAN_SPEEDS.end()
-        );
+    fn both_axes_are_driven_from_the_same_speeds() {
+        // A speed number is the same rate on either axis, so a push that is
+        // equal both ways only travels at 45 degrees if it asks each for the
+        // same number.
+        assert_eq!(PAN_SPEEDS, TILT_SPEEDS);
+        for step in 11..=100 {
+            let push = step as f32 / 100.0;
+            let velocity = velocity_from_axes(push, push);
+            assert_eq!(velocity.pan_speed, velocity.tilt_speed);
+        }
     }
 
     #[test]

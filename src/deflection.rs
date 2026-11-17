@@ -4,6 +4,11 @@
 //! and focus rockers, and the movement keys — so that a hand which has learned
 //! one of them has learned all of them. Each control differs only in the range
 //! of speeds the camera will accept from it.
+//!
+//! A camera has a handful of speeds, not a continuum, so what a control really
+//! has is a row of **bands**: stretches of its travel that each ask for one
+//! speed. Everything about how the control feels comes down to where those
+//! bands begin and end, which is what this module decides.
 
 use std::ops::RangeInclusive;
 
@@ -17,65 +22,108 @@ use std::ops::RangeInclusive;
 /// trackpad under a resting finger have the same problem in miniature.
 pub const DEADZONE: f32 = 0.1;
 
-/// How sharply speed builds as a control is pushed further.
+/// How many times wider the slowest speed's band is than the fastest's, with
+/// each band in between narrower than the last by the same proportion.
 ///
-/// A straight mapping gives the fast end more of the travel than it is worth:
-/// half a push asks for half the speed, and the slow speeds a shot is framed
-/// with are crowded into the first part of the push, too small to hold steady.
-/// Bending it hands them more room, while full deflection still means the top
-/// of the range, so nothing is given up.
+/// The starting point is that every speed gets a band a hand can find and
+/// hold. The speeds a camera offers are spaced by ratio — measured on the
+/// hardware, each is around a third to two thirds faster than the one below —
+/// and that is also how a change of speed is seen: the eye tells two speeds
+/// apart by their proportion, not their difference, so each step up the table
+/// looks about as large as any other. Steps that look alike deserve bands that
+/// feel alike, which means bands of about the same width rather than widths
+/// that follow the speed numbers or the rates behind them.
 ///
-/// Steep, because framing is nearly all of what these controls do. **Half the
-/// travel asks for the slowest speed the camera has**, and it takes about two
-/// thirds of a push before the second speed arrives; the rest of the range
-/// lives in the last third, where a hand that has decided to go somewhere
-/// pushes anyway. What that is worth is easiest to see in how much travel the
-/// slowest speed gets: a fifth of it under the gentler curve this replaced,
-/// which is a band too narrow to find on a sprung stick and hold, against half
-/// of it now.
+/// The curve this replaced did the opposite. It gave the slowest speed half
+/// of all the travel and left the fastest eight of twelve sharing the last
+/// fifth, a few hundredths of the travel each: past three quarters of a push,
+/// moving a hand by less than it can feel changed the speed by half.
 ///
-/// The camera's own slowest speed is the floor here and no curve can go under
-/// it — this only decides how much of a hand's travel is spent up against it.
-const EXPO: f32 = 4.0;
+/// Not quite equal, though, because the travel is not used equally. Framing a
+/// shot happens at the bottom of the range and is where a hand lingers and
+/// corrects; the top is passed through on the way somewhere. So the slow end
+/// gets the wider bands, tapering evenly to the fast end, and even the
+/// narrowest is one a hand can stay inside.
+const SLOW_END_SHARE: f32 = 3.0;
 
-/// What share of a control's speed range a push of `magnitude` (`0.0..=1.0`)
-/// asks for, or `None` while it's still inside the deadzone.
-pub fn fraction(magnitude: f32) -> Option<f32> {
+/// Where each of `count` bands begins, as a fraction of full deflection,
+/// slowest first: the first begins at the [`DEADZONE`], and the last runs
+/// from where it begins to full deflection.
+///
+/// Public because these are worth seeing as well as feeling — a control that
+/// draws its own bands shows a hand where the next speed is before it gets
+/// there.
+pub fn band_starts(count: usize) -> Vec<f32> {
+    // Each band a fixed proportion narrower than the one before, such that
+    // the last is `SLOW_END_SHARE` times narrower than the first.
+    let taper = if count > 1 {
+        SLOW_END_SHARE.powf(-1.0 / (count - 1) as f32)
+    } else {
+        1.0
+    };
+    let widths: Vec<f32> = (0..count).map(|band| taper.powi(band as i32)).collect();
+    let total: f32 = widths.iter().sum();
+
+    let mut start = DEADZONE;
+    widths
+        .iter()
+        .map(|width| {
+            let begins = start;
+            start += width / total * (1.0 - DEADZONE);
+            begins
+        })
+        .collect()
+}
+
+/// Which of `count` bands a push of `magnitude` (`0.0..=1.0`) is in, slowest
+/// being `0`, or `None` while it's still inside the deadzone.
+pub fn band(magnitude: f32, count: usize) -> Option<usize> {
     if magnitude <= DEADZONE {
         return None;
     }
-    // The travel outside the deadzone spans the whole range, so the slowest
-    // speed sits right at the deadzone edge and the fastest is only reachable
-    // at full deflection.
-    let travel = ((magnitude - DEADZONE) / (1.0 - DEADZONE)).clamp(0.0, 1.0);
-    Some(travel.powf(EXPO))
+    band_starts(count)
+        .iter()
+        .rposition(|begins| magnitude >= *begins)
 }
 
 /// The speed a push of `magnitude` asks for from a camera that accepts
 /// `speeds`, or `None` while the control is at rest.
 pub fn speed(magnitude: f32, speeds: RangeInclusive<u8>) -> Option<u8> {
-    let span = f32::from(speeds.end() - speeds.start());
-    fraction(magnitude).map(|fraction| speeds.start() + (fraction * span).round() as u8)
+    let count = usize::from(speeds.end() - speeds.start()) + 1;
+    band(magnitude, count).map(|band| speeds.start() + band as u8)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// A stand-in speed range with room to see the shape of the curve.
-    const SPEEDS: RangeInclusive<u8> = 0..=100;
+    /// A camera-sized speed range: the nine a pan is driven at.
+    const SPEEDS: RangeInclusive<u8> = 1..=9;
+
+    /// How much of the travel each speed in `speeds` gets, in hundredths of
+    /// full deflection, counted rather than calculated.
+    fn travel_per_speed(speeds: RangeInclusive<u8>) -> Vec<usize> {
+        speeds
+            .clone()
+            .map(|wanted| {
+                (1..=1000)
+                    .filter(|step| speed(*step as f32 / 1000.0, speeds.clone()) == Some(wanted))
+                    .count()
+                    / 10
+            })
+            .collect()
+    }
 
     #[test]
     fn a_control_at_rest_asks_for_nothing() {
-        assert_eq!(fraction(0.0), None);
-        assert_eq!(fraction(DEADZONE), None);
+        assert_eq!(band(0.0, 9), None);
+        assert_eq!(band(DEADZONE, 9), None);
         assert_eq!(speed(0.0, SPEEDS), None);
     }
 
     #[test]
     fn full_deflection_asks_for_everything() {
-        assert_eq!(fraction(1.0), Some(1.0));
-        assert_eq!(speed(1.0, SPEEDS), Some(100));
+        assert_eq!(speed(1.0, SPEEDS), Some(9));
     }
 
     #[test]
@@ -85,55 +133,55 @@ mod tests {
 
     #[test]
     fn the_slowest_speed_sits_just_past_the_deadzone() {
-        assert_eq!(speed(DEADZONE + 0.001, SPEEDS), Some(0));
+        assert_eq!(speed(DEADZONE + 0.001, SPEEDS), Some(1));
+        assert_eq!(speed(DEADZONE + 0.001, 0..=7), Some(0));
     }
 
     #[test]
-    fn a_control_at_the_middle_of_its_travel_asks_for_the_slowest_speed() {
-        // The point of the curve, in the words it was asked for in: the
-        // minimum speed should be what a control held near its middle drives
-        // at. Camera-sized ranges rather than the wide one the other tests
-        // use, since "the slowest speed" is a real number of steps down.
-        assert_eq!(speed(0.5, 1..=12), Some(1));
-        assert_eq!(speed(0.5, 0..=7), Some(0));
+    fn every_speed_gets_a_band_a_hand_can_hold() {
+        // The whole point. A speed reachable only inside a couple of
+        // hundredths of the travel is one a hand passes through, not one it
+        // can choose; a twentieth is about the least that can be stayed in.
+        for speeds in [1..=9, 0..=7] {
+            let travel = travel_per_speed(speeds.clone());
+            assert!(
+                travel.iter().all(|hundredths| *hundredths >= 5),
+                "each of {speeds:?} should get at least 5% of the travel, got {travel:?}"
+            );
+        }
     }
 
     #[test]
-    fn the_slowest_speed_gets_the_lion_s_share_of_the_travel() {
-        // Counted rather than reasoned about, because this is the thing being
-        // bought: a slowest speed reachable only in a narrow band by the
-        // deadzone is one a sprung stick cannot be held at. Two fifths of the
-        // travel that drives at all, which counting the deadzone is half the
-        // distance from the middle of a control to its stop.
-        let steps = 11..=100;
-        let total = steps.clone().count();
-        let slowest = steps
-            .filter(|step| speed(*step as f32 / 100.0, 1..=12).expect("past the deadzone") == 1)
-            .count();
-
+    fn no_speed_takes_much_more_of_the_travel_than_the_rest() {
+        // The fault this replaced: the slowest speed had half the travel to
+        // itself, which is half a control doing one thing.
+        let travel = travel_per_speed(SPEEDS);
         assert!(
-            slowest * 5 >= total * 2,
-            "the slowest speed got only {slowest} of {total} steps of travel"
+            travel.iter().all(|hundredths| *hundredths <= 20),
+            "no speed should get more than a fifth of the travel, got {travel:?}"
         );
     }
 
     #[test]
-    fn the_slow_speeds_get_more_of_the_travel_than_their_share() {
-        // A straight mapping would spend exactly a third of the travel on the
-        // slowest third of the speeds; framing happens down there, so the
-        // curve owes it more room.
-        let steps = 11..=100;
-        let total = steps.clone().count();
-        let slow = steps
-            .filter(|step| {
-                speed(*step as f32 / 100.0, SPEEDS).expect("past the deadzone drives") <= 33
-            })
-            .count();
-
+    fn the_slow_end_gets_the_wider_bands() {
+        let travel = travel_per_speed(SPEEDS);
         assert!(
-            slow * 3 > total,
-            "the slowest third of the speeds got only {slow} of {total} steps of travel"
+            travel.windows(2).all(|pair| pair[0] >= pair[1]),
+            "bands should narrow toward the fast end, got {travel:?}"
         );
+        assert!(
+            travel[0] >= travel[travel.len() - 1] * 2,
+            "the slowest band should be much the widest, got {travel:?}"
+        );
+    }
+
+    #[test]
+    fn the_bands_between_them_cover_all_the_travel_past_the_deadzone() {
+        let starts = band_starts(9);
+        assert_eq!(starts.len(), 9);
+        assert_eq!(starts[0], DEADZONE);
+        assert!(starts.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(*starts.last().unwrap() < 1.0);
     }
 
     #[test]
@@ -150,8 +198,8 @@ mod tests {
     }
 
     #[test]
-    fn a_speed_range_that_does_not_start_at_zero_starts_where_it_says() {
-        assert_eq!(speed(DEADZONE + 0.001, 1..=24), Some(1));
-        assert_eq!(speed(1.0, 1..=24), Some(24));
+    fn a_camera_with_one_speed_drives_at_it_everywhere() {
+        assert_eq!(speed(0.2, 3..=3), Some(3));
+        assert_eq!(speed(1.0, 3..=3), Some(3));
     }
 }

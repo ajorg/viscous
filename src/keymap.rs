@@ -25,12 +25,13 @@ use crate::{
 /// frame a shot at, and [`FAST_KEY_DEFLECTION`] is the fastest a control drives.
 ///
 /// Chosen for the speed it comes out at rather than for the number itself: it
-/// lands on 5 of the 12 pan speeds a control asks for, which is the pace a held
-/// arrow key wants. Since a key has no travel to feel its way along, it doesn't
-/// benefit from [`deflection`](crate::deflection)'s curve — it only has to
-/// land in the same place the curve puts that speed, which is why steepening
-/// the curve moved this number without changing what the key does.
-pub const KEY_DEFLECTION: f32 = 0.8;
+/// lands on 5 of the 9 pan speeds a control asks for, which is the pace a held
+/// arrow key wants, and in the middle of the zoom and focus speeds. Since a
+/// key has no travel to feel its way along, it doesn't benefit from where
+/// [`deflection`](crate::deflection) puts its bands — it only has to land
+/// inside the one for that speed, which is why moving the bands moved this
+/// number without changing what the key does.
+pub const KEY_DEFLECTION: f32 = 0.66;
 
 /// The fastest a key drives, which zoom and focus reach by holding shift.
 ///
@@ -259,16 +260,12 @@ mod tests {
     fn a_shifted_arrow_drives_slowly_enough_to_frame_with() {
         // A key has no travel to feel its way along, so it has to land on a
         // usable pace by itself: fast enough to get somewhere, slow enough to
-        // follow something with. The response curve moved where a given
-        // deflection comes out, and this keeps `KEY_DEFLECTION` honest about
-        // the speed it was picked for.
-        let top = *crate::pan_tilt::PAN_SPEEDS.end();
+        // follow something with. Where the bands fall decides what a given
+        // deflection comes out as, and this keeps `KEY_DEFLECTION` honest
+        // about the speed it was picked for.
         let driven = held_velocity(KeyCode::Right, KeyModifiers::SHIFT).pan_speed;
 
-        assert!(
-            (top / 4..top / 2).contains(&driven),
-            "a driving arrow should be a framing pace, got {driven} of {top}"
-        );
+        assert_eq!(driven, 5, "a driving arrow should be a framing pace");
     }
 
     /// Which way a key drives zoom, and how fast.
