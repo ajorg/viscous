@@ -26,6 +26,27 @@ const PAD_TEXT_HEIGHTS: f32 = 16.0;
 const PUCK_RADIUS: f32 = 0.12;
 const CENTER_RADIUS: f32 = 0.033;
 
+/// How far the lines marking where each speed begins stand out from the track
+/// they are drawn on, as a share of the way from the track's colour to the
+/// colour of text.
+///
+/// A shade of the track rather than a colour of their own: a little lighter
+/// than it in a dark scheme, a little darker in a light one. They are there to
+/// be found by an eye that goes looking, and a grid drawn any louder would be
+/// the first thing seen on a control whose point is the puck.
+const BAND_LINE_STRENGTH: f32 = 0.12;
+
+/// The stroke the lines marking where each speed begins are drawn with, on
+/// this pad and on the rockers under it.
+pub fn band_line(visuals: &egui::Visuals) -> Stroke {
+    Stroke::new(
+        visuals.widgets.noninteractive.bg_stroke.width,
+        visuals
+            .extreme_bg_color
+            .lerp_to_gamma(visuals.text_color(), BAND_LINE_STRENGTH),
+    )
+}
+
 /// Where the eight direction ticks start and end, as fractions of the radius.
 const TICK_INNER: f32 = 0.85;
 const TICK_OUTER: f32 = 0.98;
@@ -78,7 +99,16 @@ pub fn least_pad_size(ui: &Ui) -> f32 {
 /// even when the pad isn't `live`, in the dead colour the rest of it is drawn
 /// in: that a stick is answering is worth seeing whatever the camera is doing
 /// about it.
-pub fn pan_tilt_pad(ui: &mut Ui, size: f32, live: bool, why: &str, stick: Vec2) -> Velocity {
+///
+/// `speed_lines` draws a fine line wherever a speed begins.
+pub fn pan_tilt_pad(
+    ui: &mut Ui,
+    size: f32,
+    live: bool,
+    why: &str,
+    stick: Vec2,
+    speed_lines: bool,
+) -> Velocity {
     let radius = size / 2.0;
     let sense = if live {
         Sense::click_and_drag()
@@ -110,8 +140,41 @@ pub fn pan_tilt_pad(ui: &mut Ui, size: f32, live: bool, why: &str, stick: Vec2) 
         visuals.weak_text_color(),
     );
 
+    let band_stroke = band_line(visuals);
+
     let painter = ui.painter();
     painter.circle_filled(center, radius, track_color);
+
+    // Where each speed begins, for whoever has asked to see it. Pan and tilt
+    // are each driven by their own share of the push — how far sideways sets
+    // one, how far up or down the other — so the places a speed changes are
+    // straight lines across the pad, not rings around its centre: every
+    // upright line is a pan speed starting, every level one a tilt speed, and
+    // the square they leave empty in the middle is where the pad asks for
+    // nothing.
+    let drawn = if speed_lines {
+        vec![
+            (pan_tilt::pan_band_starts(), true),
+            (pan_tilt::tilt_band_starts(), false),
+        ]
+    } else {
+        Vec::new()
+    };
+    for (starts, upright) in drawn {
+        for start in starts {
+            for side in [-1.0, 1.0] {
+                let along = side * start * radius;
+                // As much of the line as lies on the round pad.
+                let reach = (radius * radius - along * along).max(0.0).sqrt();
+                let (from, to) = if upright {
+                    (vec2(along, -reach), vec2(along, reach))
+                } else {
+                    (vec2(-reach, along), vec2(reach, along))
+                };
+                painter.line_segment([center + from, center + to], band_stroke);
+            }
+        }
+    }
 
     for i in 0..8 {
         let angle = i as f32 * PI / 4.0;
@@ -284,7 +347,7 @@ mod tests {
     /// after the pointer has come to rest on a pad that is `live`.
     fn hovering_the_pad_explains_itself(live: bool) -> bool {
         let mut harness = Harness::new_ui(move |ui| {
-            pan_tilt_pad(ui, 200.0, live, "not just now", Vec2::ZERO);
+            pan_tilt_pad(ui, 200.0, live, "not just now", Vec2::ZERO, false);
         });
         harness.run();
 
@@ -320,7 +383,7 @@ mod tests {
         // for what it is only showing would be asking twice.
         let asked = Cell::new(Velocity::STOP);
         Harness::new_ui(|ui| {
-            asked.set(pan_tilt_pad(ui, 200.0, true, "", vec2(1.0, 1.0)));
+            asked.set(pan_tilt_pad(ui, 200.0, true, "", vec2(1.0, 1.0), true));
         })
         .run();
 

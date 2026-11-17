@@ -17,6 +17,14 @@ pub struct Config {
     /// something has actually connected.
     #[serde(default)]
     pub camera: Option<String>,
+    /// Whether the window draws a fine line across the pad and the rockers
+    /// wherever a speed begins. Off unless asked for, and asked for here
+    /// rather than in the window: `speed_lines = true`.
+    ///
+    /// Written out even when off, so that the file itself says the setting
+    /// exists to anyone who opens it to look.
+    #[serde(default)]
+    pub speed_lines: bool,
     /// Preset number -> label.
     #[serde(default)]
     pub presets: BTreeMap<u8, String>,
@@ -127,6 +135,28 @@ mod tests {
             config.presets.get(&1).map(String::as_str),
             Some("wide shot")
         );
+    }
+
+    #[test]
+    fn speed_lines_are_off_until_the_file_asks_for_them() {
+        let path = test_path("speed-lines");
+        fs::write(&path, "[presets]\n1 = \"wide shot\"\n").expect("write should succeed");
+        let unasked = load(&path).expect("a config without the setting should load");
+        assert!(!unasked.speed_lines);
+
+        fs::write(
+            &path,
+            "speed_lines = true\n\n[presets]\n1 = \"wide shot\"\n",
+        )
+        .expect("write should succeed");
+        let asked = load(&path).expect("a config with the setting should load");
+        assert!(asked.speed_lines);
+
+        // And saving keeps the setting, with the labels still under it.
+        save(&asked, &path).expect("save should succeed");
+        let kept = load(&path).expect("what was saved should load");
+        let _ = fs::remove_file(&path);
+        assert_eq!(kept, asked);
     }
 
     #[test]

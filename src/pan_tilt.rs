@@ -101,6 +101,19 @@ impl Velocity {
     }
 }
 
+/// Where along a control's travel each pan speed begins, slowest first, as
+/// fractions of full deflection either side of centre — for a control that
+/// wants to draw them.
+pub fn pan_band_starts() -> Vec<f32> {
+    deflection::band_starts(PAN_SPEEDS.count())
+}
+
+/// Where along a control's travel each tilt speed begins, as
+/// [`pan_band_starts`] gives it for pan.
+pub fn tilt_band_starts() -> Vec<f32> {
+    deflection::band_starts(TILT_SPEEDS.count())
+}
+
 /// Maps one axis's deflection onto that axis's speed range, or `None` if it's
 /// inside the deadzone.
 fn axis_speed(deflection: f32, speeds: RangeInclusive<u8>) -> Option<u8> {

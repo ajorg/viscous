@@ -209,6 +209,11 @@ struct App {
     /// The camera that last connected, remembered so the next run opens on it
     /// instead of on whatever this platform's ports are usually called.
     camera: Option<String>,
+    /// Whether the pad and the rockers draw a fine line where each speed
+    /// begins. Read from the config file and written back as it was found:
+    /// there is no control for it in the window, on purpose — it is a thing
+    /// to turn on once while learning the controls, not to reach for.
+    speed_lines: bool,
     /// Where the descriptions and titles are kept between runs, if this
     /// platform has somewhere to keep them.
     config_path: Option<PathBuf>,
@@ -285,6 +290,7 @@ impl Default for App {
             shown_title: None,
             titles_supported: true,
             camera: None,
+            speed_lines: false,
             config_path: None,
             requested_size: None,
             shown: false,
@@ -322,6 +328,7 @@ impl App {
             Some(Ok(config)) => {
                 app.preset_labels = config.presets;
                 app.titles = config.titles;
+                app.speed_lines = config.speed_lines;
                 if let Some(camera) = config.camera {
                     app.port_input = camera.clone();
                     app.camera = Some(camera);
@@ -681,11 +688,18 @@ impl App {
                         live,
                         STANDBY_HINT,
                         vec2(stick.left_stick.0, stick.left_stick.1),
+                        self.speed_lines,
                     );
 
                     space(ui, 2.0);
-                    (pointed.zoom, pointed.focus) =
-                        drive_rockers(ui, self.pad_size, live, self.auto_focusing(), &stick);
+                    (pointed.zoom, pointed.focus) = drive_rockers(
+                        ui,
+                        self.pad_size,
+                        live,
+                        self.auto_focusing(),
+                        &stick,
+                        self.speed_lines,
+                    );
 
                     space(ui, 1.0);
                     ui.add_enabled_ui(live, |ui| self.draw_camera_buttons(ui));
@@ -1084,6 +1098,7 @@ impl App {
         };
         let config = config::Config {
             camera: self.camera.clone(),
+            speed_lines: self.speed_lines,
             presets: written(&self.preset_labels),
             titles: written(&self.titles),
         };
@@ -1164,7 +1179,13 @@ fn drive_rockers(
     live: bool,
     auto_focusing: bool,
     stick: &Pad,
+    speed_lines: bool,
 ) -> (Option<ZoomDrive>, Option<FocusDrive>) {
+    let bands = |starts: Vec<f32>| if speed_lines { starts } else { Vec::new() };
+    let (zoom_bands, focus_bands) = (
+        bands(ZoomDrive::band_starts()),
+        bands(FocusDrive::band_starts()),
+    );
     let zoom_marks = rocker::Marks {
         label: "Zoom",
         ends: ("W", "T"),
@@ -1172,6 +1193,7 @@ fn drive_rockers(
             "Wide \u{2014} push further to widen faster",
             "Telephoto \u{2014} push further to tighten faster",
         ),
+        bands: &zoom_bands,
     };
     let focus_marks = rocker::Marks {
         label: "Focus",
@@ -1180,6 +1202,7 @@ fn drive_rockers(
             "Near \u{2014} push further to focus closer faster",
             "Far \u{2014} push further to focus further off faster",
         ),
+        bands: &focus_bands,
     };
     let row = rocker::Row::fitting(ui, width, &[zoom_marks, focus_marks]);
 

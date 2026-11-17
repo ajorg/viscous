@@ -46,6 +46,13 @@ pub struct ZoomDrive {
 const ZOOM_SPEEDS: std::ops::RangeInclusive<u8> = 0..=7;
 
 impl ZoomDrive {
+    /// Where along a rocker's travel each zoom speed begins, slowest first, as
+    /// fractions of full deflection either side of centre — for a control
+    /// that wants to draw them.
+    pub fn band_starts() -> Vec<f32> {
+        deflection::band_starts(ZOOM_SPEEDS.count())
+    }
+
     /// The drive a rocker pushed to `deflection` asks for — negative for
     /// wide, positive for tele — or `None` while it's still at rest.
     pub fn from_deflection(deflection: f32) -> Option<Self> {

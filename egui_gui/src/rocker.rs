@@ -25,6 +25,11 @@ pub struct Marks<'a> {
     pub ends: (&'a str, &'a str),
     /// What each end does, spelled out for whoever hasn't met the marks.
     pub tooltips: (&'a str, &'a str),
+    /// Where along the travel each speed begins, slowest first, as fractions
+    /// of full deflection either side of the middle. Drawn as fine lines
+    /// across the track, so the next speed can be seen before it is reached;
+    /// empty for a rocker that isn't to show them.
+    pub bands: &'a [f32],
 }
 
 /// The widths a set of rockers drawn one under the other shares, so that their
@@ -95,7 +100,7 @@ pub fn rocker(ui: &mut Ui, marks: &Marks<'_>, row: Row, live: bool, why: &str, s
             let height = ui.text_style_height(&TextStyle::Body);
             ui.add_sized(vec2(row.label, height), egui::Label::new(marks.label));
             end(ui, marks.ends.0, row.mark, marks.tooltips.0, why);
-            let deflection = track(ui, marks.label, row.track(ui), live, why, stick);
+            let deflection = track(ui, marks, row.track(ui), live, why, stick);
             end(ui, marks.ends.1, row.mark, marks.tooltips.1, why);
             deflection
         })
@@ -114,7 +119,8 @@ fn end(ui: &mut Ui, mark: &str, width: f32, tooltip: &str, why: &str) {
 }
 
 /// The track and its knob, without the marks around them.
-fn track(ui: &mut Ui, label: &str, length: f32, live: bool, why: &str, stick: f32) -> f32 {
+fn track(ui: &mut Ui, marks: &Marks<'_>, length: f32, live: bool, why: &str, stick: f32) -> f32 {
+    let label = marks.label;
     let text = ui.text_style_height(&TextStyle::Body);
     let thickness = text * TRACK_THICKNESS;
     let sense = if live {
@@ -151,6 +157,15 @@ fn track(ui: &mut Ui, label: &str, length: f32, live: bool, why: &str, stick: f3
 
     let groove = egui::Rect::from_center_size(center, vec2(rect.width(), thickness));
     painter.rect_filled(groove, thickness / 2.0, visuals.extreme_bg_color);
+    // Where each speed begins, either side of the middle, in the same shade
+    // of the track the pad draws its own in.
+    let band_line = crate::joystick::band_line(visuals);
+    for start in marks.bands {
+        for side in [-1.0, 1.0] {
+            let x = center.x + side * start * reach;
+            painter.line_segment([pos2(x, groove.top()), pos2(x, groove.bottom())], band_line);
+        }
+    }
     // The rest position, marked so it's clear there is one to come back to.
     painter.line_segment(
         [
@@ -190,6 +205,7 @@ mod tests {
             label: "Zoom",
             ends: ("W", "T"),
             tooltips: ("Wider", "Tighter"),
+            bands: &[0.1, 0.4, 0.7],
         }
     }
 
@@ -198,6 +214,7 @@ mod tests {
             label: "Focus",
             ends: ("\u{273F}", "\u{221E}"),
             tooltips: ("Nearer", "Further"),
+            bands: &[0.1, 0.4, 0.7],
         }
     }
 
