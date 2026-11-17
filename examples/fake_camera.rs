@@ -260,18 +260,31 @@ impl CameraSim {
     /// real elapsed time. Doing that before every message means a position
     /// inquiry answers with where the camera would actually be by now.
     fn advance(&mut self) {
-        let seconds = self.last_advance.elapsed().as_secs_f64();
+        // Positions are whole units, so every step taken throws away a
+        // fraction of one. Asked where it is often enough, a slow drive would
+        // lose most of its motion that way and a fast one a visible share —
+        // so a step is only taken once there is a worthwhile amount of time
+        // to take it over, and is rounded rather than cut short, which leaves
+        // what little is still lost with no direction to add up in.
+        let elapsed = self.last_advance.elapsed();
+        if elapsed < Duration::from_millis(20) {
+            return;
+        }
+        let seconds = elapsed.as_secs_f64();
         self.last_advance = Instant::now();
 
-        self.pan = advanced(f64::from(self.pan), self.pan_rate, seconds, PAN_LIMITS) as i16;
-        self.tilt = advanced(f64::from(self.tilt), self.tilt_rate, seconds, TILT_LIMITS) as i16;
-        self.zoom = advanced(f64::from(self.zoom), self.zoom_rate, seconds, ZOOM_LIMITS) as u16;
+        self.pan = advanced(f64::from(self.pan), self.pan_rate, seconds, PAN_LIMITS).round() as i16;
+        self.tilt =
+            advanced(f64::from(self.tilt), self.tilt_rate, seconds, TILT_LIMITS).round() as i16;
+        self.zoom =
+            advanced(f64::from(self.zoom), self.zoom_rate, seconds, ZOOM_LIMITS).round() as u16;
         self.focus = advanced(
             f64::from(self.focus),
             self.focus_rate,
             seconds,
             FOCUS_LIMITS,
-        ) as u16;
+        )
+        .round() as u16;
     }
 
     /// Handles one complete VISCA message (including its trailing
@@ -401,6 +414,27 @@ impl CameraSim {
                 self.pan_rate = drive_rate(*pan_direction, 0x02, *pan_speed, MAX_PAN_SPEED);
                 self.tilt_rate = drive_rate(*tilt_direction, 0x01, *tilt_speed, MAX_TILT_SPEED);
                 Duration::ZERO
+            }
+            // Pan/tilt absolute move: 06 02 VV WW <4 nibbles pan> <4 nibbles
+            // tilt>. Unlike the other moves here it honours its speeds, each
+            // axis travelling at the rate a drive at that speed would, and
+            // completes when the slower of the two has arrived — a trip timed
+            // at different speeds has to take different times, or timing it
+            // would be measuring nothing.
+            [0x06, 0x02, pan_speed, tilt_speed, rest @ ..] if rest.len() == 8 => {
+                let pan = nibbles_to_i16(&rest[0..4]);
+                let tilt = nibbles_to_i16(&rest[4..8]);
+                let pan_time = travel_time(
+                    i32::from(pan) - i32::from(self.pan),
+                    drive_rate(0x02, 0x02, *pan_speed, MAX_PAN_SPEED),
+                );
+                let tilt_time = travel_time(
+                    i32::from(tilt) - i32::from(self.tilt),
+                    drive_rate(0x01, 0x01, *tilt_speed, MAX_TILT_SPEED),
+                );
+                self.pan = pan;
+                self.tilt = tilt;
+                pan_time.max(tilt_time)
             }
             // Pan/tilt relative move: 06 03 VV WW <4 nibbles pan> <4 nibbles tilt>
             [0x06, 0x03, _pan_speed, _tilt_speed, rest @ ..] if rest.len() == 8 => {
@@ -642,6 +676,9 @@ fn describe_message(message: &[u8]) -> String {
         }
         (Some(0x01), [0x06, 0x01, pan_speed, tilt_speed, ..]) => {
             format!("pan/tilt drive at {pan_speed}/{tilt_speed}")
+        }
+        (Some(0x01), [0x06, 0x02, pan_speed, tilt_speed, ..]) => {
+            format!("pan/tilt absolute move at {pan_speed}/{tilt_speed}")
         }
         (Some(0x01), [0x06, 0x03, ..]) => "pan/tilt relative move".to_string(),
         (Some(0x01), [0x06, 0x04]) => "pan/tilt home".to_string(),
