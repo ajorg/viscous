@@ -4,7 +4,7 @@
 //! build a custom interactive control in egui, with no external widget crate
 //! needed.
 
-use std::f32::consts::PI;
+use std::{f32::consts::PI, sync::OnceLock};
 
 use egui::{Sense, Stroke, TextStyle, Ui, Vec2, vec2};
 use viscous::pan_tilt::{self, Velocity};
@@ -51,11 +51,32 @@ pub fn band_line(visuals: &egui::Visuals) -> Stroke {
 const TICK_INNER: f32 = 0.85;
 const TICK_OUTER: f32 = 0.98;
 
+/// Draws the part of a circle around `center` between two directions, in
+/// degrees anticlockwise from straight right.
+fn arc(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    radius: f32,
+    (from, to): (f32, f32),
+    stroke: Stroke,
+) {
+    // A degree a segment, which no eye tells from a curve at any size this
+    // pad is drawn.
+    let segments = ((to - from).abs().ceil() as usize).max(1);
+    let points = (0..=segments)
+        .map(|segment| {
+            let angle = (from + (to - from) * segment as f32 / segments as f32).to_radians();
+            center + vec2(angle.cos(), -angle.sin()) * radius
+        })
+        .collect();
+    painter.add(egui::Shape::line(points, stroke));
+}
+
 /// The velocity a puck offset asks for, taking the pad's radius as full
 /// deflection and flipping screen y (which grows downward) so that dragging
 /// up tilts up.
 pub fn velocity_for_offset(offset: Vec2, radius: f32) -> Velocity {
-    pan_tilt::velocity_from_axes(offset.x / radius, -offset.y / radius)
+    pan_tilt::velocity_from_push(offset.x / radius, -offset.y / radius)
 }
 
 /// Clamps an offset from the pad's center to its edge, so dragging off the
@@ -145,33 +166,49 @@ pub fn pan_tilt_pad(
     let painter = ui.painter();
     painter.circle_filled(center, radius, track_color);
 
-    // Where each speed begins, for whoever has asked to see it. Pan and tilt
-    // are each driven by their own share of the push — how far sideways sets
-    // one, how far up or down the other — so the places a speed changes are
-    // straight lines across the pad, not rings around its centre: every
-    // upright line is a pan speed starting, every level one a tilt speed, and
-    // the square they leave empty in the middle is where the pad asks for
-    // nothing.
-    let drawn = if speed_lines {
-        vec![
-            (pan_tilt::pan_band_starts(), true),
-            (pan_tilt::tilt_band_starts(), false),
-        ]
-    } else {
-        Vec::new()
-    };
-    for (starts, upright) in drawn {
-        for start in starts {
-            for side in [-1.0, 1.0] {
-                let along = side * start * radius;
-                // As much of the line as lies on the round pad.
-                let reach = (radius * radius - along * along).max(0.0).sqrt();
-                let (from, to) = if upright {
-                    (vec2(along, -reach), vec2(along, reach))
-                } else {
-                    (vec2(-reach, along), vec2(reach, along))
-                };
-                painter.line_segment([center + from, center + to], band_stroke);
+    // For whoever has asked to see it: the pad cut into its regions, each one
+    // a stretch of it where the camera is asked for the same pan speed and
+    // the same tilt speed wherever in it the puck is. A ring wherever being
+    // further out starts to mean faster, the innermost being where the pad
+    // starts asking for anything at all; and across each ring, a line
+    // wherever the direction starts to mean a different share between the
+    // two.
+    if speed_lines {
+        // The same every frame, and found by trying the whole pad.
+        static SPLITS: OnceLock<Vec<Vec<f32>>> = OnceLock::new();
+        static EDGES: OnceLock<Vec<Vec<(f32, f32)>>> = OnceLock::new();
+        let splits = SPLITS.get_or_init(pan_tilt::split_changes);
+        let edges = EDGES.get_or_init(pan_tilt::ring_edges);
+
+        let rings = pan_tilt::ring_starts();
+        let ends = rings.iter().skip(1).copied().chain([1.0]);
+        for (((start, end), changes), stretches) in rings.iter().zip(ends).zip(splits).zip(edges) {
+            for (from, to) in stretches {
+                // Found for the quarter between right and up, like the
+                // changes below; the other three are that one mirrored.
+                for (a, b) in [
+                    (*from, *to),
+                    (180.0 - to, 180.0 - from),
+                    (180.0 + from, 180.0 + to),
+                    (360.0 - to, 360.0 - from),
+                ] {
+                    arc(painter, center, start * radius, (a, b), band_stroke);
+                }
+            }
+            for degrees in changes {
+                // Found for the quarter between right and up; the other
+                // three are that one mirrored.
+                for mirrored in [*degrees, 180.0 - degrees, 180.0 + degrees, 360.0 - degrees] {
+                    let angle = mirrored.to_radians();
+                    let dir = vec2(angle.cos(), -angle.sin());
+                    painter.line_segment(
+                        [
+                            center + dir * (start * radius),
+                            center + dir * (end * radius),
+                        ],
+                        band_stroke,
+                    );
+                }
             }
         }
     }

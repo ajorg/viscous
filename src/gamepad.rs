@@ -12,7 +12,7 @@
 
 use grafton_visca::command::PanTiltDirection;
 
-use crate::{drives::Drives, focus::FocusDrive, pan_tilt::velocity_from_axes, zoom::ZoomDrive};
+use crate::{drives::Drives, focus::FocusDrive, pan_tilt::velocity_from_push, zoom::ZoomDrive};
 
 /// Which buttons are down. Named the way the layout is, not the way one
 /// vendor's labels are: on an Xbox-style controller [`Self::south`] is A,
@@ -183,7 +183,7 @@ impl Gamepad {
 /// on-screen pad.
 fn drives(pad: &Pad) -> Drives {
     Drives {
-        pan_tilt: velocity_from_axes(pad.left_stick.0, pad.left_stick.1),
+        pan_tilt: velocity_from_push(pad.left_stick.0, pad.left_stick.1),
         // Push up to tighten, the way pushing up on the on-screen rocker's
         // right-hand end does.
         zoom: ZoomDrive::from_deflection(pad.right_stick.1),
