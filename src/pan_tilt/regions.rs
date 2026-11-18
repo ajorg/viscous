@@ -36,7 +36,7 @@
 
 use std::{collections::HashMap, f64::consts::PI, sync::OnceLock};
 
-use super::{PAN_SPEEDS, STEP, TILT_SPEEDS, Velocity, velocity};
+use super::{STEP, Velocity, top_speeds, velocity};
 use crate::deflection::DEADZONE;
 
 /// A point on the pad, in fractions of its radius: right, then up.
@@ -88,15 +88,28 @@ const NEIGHBOURS: usize = 40;
 const TOLERANCE: f64 = 1e-4;
 const NEWTON_STEPS: usize = 60;
 
-/// Every region of the pad, worked out the first time anything asks.
+/// Every region of the pad, for the top speeds in use, worked out the first
+/// time anything asks.
 pub fn regions() -> &'static [Region] {
     static REGIONS: OnceLock<Vec<Region>> = OnceLock::new();
-    REGIONS.get_or_init(laid_out)
+    REGIONS.get_or_init(|| {
+        let top = top_speeds();
+        Tops {
+            pan: i32::from(top.pan),
+            tilt: i32::from(top.tilt),
+        }
+        .laid_out()
+    })
 }
 
 /// What a push `pan` right and `tilt` up asks for, each a fraction of the
 /// pad's radius.
 pub(super) fn velocity_at(pan: f32, tilt: f32) -> Velocity {
+    asked(regions(), pan, tilt)
+}
+
+/// What a push asks for of a pad laid out as `regions`.
+fn asked(regions: &[Region], pan: f32, tilt: f32) -> Velocity {
     let pushed = pan.hypot(tilt);
     if pushed <= DEADZONE {
         return Velocity::STOP;
@@ -104,7 +117,7 @@ pub(super) fn velocity_at(pan: f32, tilt: f32) -> Velocity {
     // A stick pushed into its corners reads past the rim; it is at the rim.
     let scale = f64::from(pushed.max(1.0));
     let at = (f64::from(pan) / scale, f64::from(tilt) / scale);
-    regions()
+    regions
         .iter()
         .min_by(|one, other| {
             power(one.home, one.weight, at).total_cmp(&power(other.home, other.weight, at))
@@ -164,70 +177,73 @@ fn rate(speed: i32) -> f64 {
     f64::from(STEP).powi(speed.abs() - 1) * f64::from(speed.signum())
 }
 
-/// The fastest speed each axis is driven at.
-fn tops() -> (i32, i32) {
-    (i32::from(*PAN_SPEEDS.end()), i32::from(*TILT_SPEEDS.end()))
-}
-
-/// The fastest the ranges allow in direction `angle`, in steps.
-fn reachable(angle: f64) -> f64 {
-    let (pan, tilt) = tops();
-    let (across, up) = (angle.cos().abs(), angle.sin().abs());
-    let reach = match (across > 1e-9, up > 1e-9) {
-        (true, true) => (rate(pan) / across).min(rate(tilt) / up),
-        (true, false) => rate(pan) / across,
-        _ => rate(tilt) / up,
-    };
-    reach.ln() / f64::from(STEP).ln()
-}
-
-/// How fast the rim is in direction `angle`, in steps: pan's top speed at the
-/// sides, tilt's at the top and bottom, and an even blend of the two between —
-/// never more than the camera can do that way.
-fn rim(angle: f64) -> f64 {
-    let (pan, tilt) = tops();
-    let blend =
-        f64::from(pan - 1) * angle.cos().powi(2) + f64::from(tilt - 1) * angle.sin().powi(2);
-    blend.min(reachable(angle))
-}
-
-/// Where a pair of speeds belongs on the pad: in its own direction, and as
-/// far out as its speed is of the rim's that way, every step of speed being
-/// an equal distance along the radius.
-fn home_of(speeds: Speeds) -> Spot {
-    let heading = speeds.heading();
-    let out = ((speeds.level() + 0.5) / (rim(heading) + 1.0)).clamp(0.0, 1.0);
-    let reach = f64::from(DEADZONE) + (1.0 - f64::from(DEADZONE)) * out;
-    (reach * heading.cos(), reach * heading.sin())
-}
-
-/// How far apart one speed step puts two homes along the radius, at the
-/// faster axis's spacing.
-fn radial_step() -> f64 {
-    let (pan, tilt) = tops();
-    (1.0 - f64::from(DEADZONE)) / f64::from(pan.max(tilt))
+/// The fastest speed each axis is driven at — everything about the layout
+/// that depends on the ranges hangs off this.
+#[derive(Debug, Clone, Copy)]
+struct Tops {
+    pan: i32,
+    tilt: i32,
 }
 
 /// The pad's symmetries, as matrices acting alike on points and on pairs of
 /// speeds taken as vectors.
 type Symmetry = [[i32; 2]; 2];
 
-fn symmetries() -> Vec<Symmetry> {
-    let mut all = vec![
-        [[1, 0], [0, 1]],
-        [[-1, 0], [0, 1]],
-        [[1, 0], [0, -1]],
-        [[-1, 0], [0, -1]],
-    ];
-    let (pan, tilt) = tops();
-    if pan == tilt {
-        let swapped: Vec<Symmetry> = all
-            .iter()
-            .map(|m| [[m[0][1], m[0][0]], [m[1][1], m[1][0]]])
-            .collect();
-        all.extend(swapped);
+impl Tops {
+    /// The fastest the ranges allow in direction `angle`, in steps.
+    fn reachable(self, angle: f64) -> f64 {
+        let (across, up) = (angle.cos().abs(), angle.sin().abs());
+        let reach = match (across > 1e-9, up > 1e-9) {
+            (true, true) => (rate(self.pan) / across).min(rate(self.tilt) / up),
+            (true, false) => rate(self.pan) / across,
+            _ => rate(self.tilt) / up,
+        };
+        reach.ln() / f64::from(STEP).ln()
     }
-    all
+
+    /// How fast the rim is in direction `angle`, in steps: pan's top speed at
+    /// the sides, tilt's at the top and bottom, and an even blend of the two
+    /// between — never more than the camera can do that way.
+    fn rim(self, angle: f64) -> f64 {
+        let blend = f64::from(self.pan - 1) * angle.cos().powi(2)
+            + f64::from(self.tilt - 1) * angle.sin().powi(2);
+        blend.min(self.reachable(angle))
+    }
+
+    /// Where a pair of speeds belongs on the pad: in its own direction, and as
+    /// far out as its speed is of the rim's that way, every step of speed
+    /// being an equal distance along the radius.
+    fn home_of(self, speeds: Speeds) -> Spot {
+        let heading = speeds.heading();
+        let out = ((speeds.level() + 0.5) / (self.rim(heading) + 1.0)).clamp(0.0, 1.0);
+        let reach = f64::from(DEADZONE) + (1.0 - f64::from(DEADZONE)) * out;
+        (reach * heading.cos(), reach * heading.sin())
+    }
+
+    /// How far apart one speed step puts two homes along the radius, at the
+    /// faster axis's spacing.
+    fn radial_step(self) -> f64 {
+        (1.0 - f64::from(DEADZONE)) / f64::from(self.pan.max(self.tilt))
+    }
+
+    /// Mirror images left to right and top to bottom; and across the
+    /// diagonals too, when the two axes have the same range.
+    fn symmetries(self) -> Vec<Symmetry> {
+        let mut all = vec![
+            [[1, 0], [0, 1]],
+            [[-1, 0], [0, 1]],
+            [[1, 0], [0, -1]],
+            [[-1, 0], [0, -1]],
+        ];
+        if self.pan == self.tilt {
+            let swapped: Vec<Symmetry> = all
+                .iter()
+                .map(|m| [[m[0][1], m[0][0]], [m[1][1], m[1][0]]])
+                .collect();
+            all.extend(swapped);
+        }
+        all
+    }
 }
 
 fn mirrored(symmetry: &Symmetry, speeds: Speeds) -> Speeds {
@@ -248,18 +264,17 @@ fn unmirrored(symmetry: &Symmetry, spot: Spot) -> Spot {
 /// Every pair of speeds given a region, a whole set of mirror images at a
 /// time: the axes first, then slowest first, and at one speed nearest an
 /// axis first.
-fn chosen() -> Vec<Speeds> {
-    let (pan_top, tilt_top) = tops();
-    let group = symmetries();
+fn chosen(tops: Tops) -> Vec<Speeds> {
+    let group = tops.symmetries();
     let mut seen = std::collections::HashSet::new();
     let mut sets: Vec<Vec<Speeds>> = Vec::new();
-    for pan in -pan_top..=pan_top {
-        for tilt in -tilt_top..=tilt_top {
+    for pan in -tops.pan..=tops.pan {
+        for tilt in -tops.tilt..=tops.tilt {
             let speeds = Speeds { pan, tilt };
             if (pan == 0 && tilt == 0) || seen.contains(&speeds) {
                 continue;
             }
-            if !speeds.is_axis() && speeds.level() > rim(speeds.heading()) + RIM_SLACK {
+            if !speeds.is_axis() && speeds.level() > tops.rim(speeds.heading()) + RIM_SLACK {
                 continue;
             }
             let mut set: Vec<Speeds> = group.iter().map(|m| mirrored(m, speeds)).collect();
@@ -276,9 +291,9 @@ fn chosen() -> Vec<Speeds> {
     let key = |speeds: Speeds| (!speeds.is_axis(), speeds.level(), off_axis(speeds));
     sets.sort_by(|one, other| key(one[0]).partial_cmp(&key(other[0])).expect("no NaN"));
 
-    let least = SPACING * radial_step();
+    let least = SPACING * tops.radial_step();
     let crowds = |one: Speeds, other: Speeds| {
-        let (a, b) = (home_of(one), home_of(other));
+        let (a, b) = (tops.home_of(one), tops.home_of(other));
         (a.0 - b.0).hypot(a.1 - b.1) < least
     };
     let mut kept: Vec<Speeds> = Vec::new();
@@ -610,10 +625,16 @@ fn equalise(
     (weights, found)
 }
 
-/// Lays the pad out.
-fn laid_out() -> Vec<Region> {
-    let chosen = chosen();
-    let group = symmetries();
+impl Tops {
+    /// Lays the pad out for these top speeds.
+    fn laid_out(self) -> Vec<Region> {
+        laid_out(self)
+    }
+}
+
+fn laid_out(tops: Tops) -> Vec<Region> {
+    let chosen = chosen(tops);
+    let group = tops.symmetries();
     let orbits = orbits(&chosen, &group);
     let rim: Vec<(Spot, Edge)> = circle(1.0, RIM_SIDES)
         .into_iter()
@@ -623,7 +644,7 @@ fn laid_out() -> Vec<Region> {
     let corners: Vec<Spot> = rim.iter().map(|(spot, _)| *spot).collect();
     let target = (moments(&corners).0 - moments(&deadzone).0) / chosen.len() as f64;
 
-    let ideal: Vec<Spot> = chosen.iter().map(|speeds| home_of(*speeds)).collect();
+    let ideal: Vec<Spot> = chosen.iter().map(|speeds| tops.home_of(*speeds)).collect();
     let mut homes = ideal.clone();
     let (mut weights, mut found) = equalise(&homes, &orbits, &rim, &deadzone, target);
     for _ in 0..RELAXATIONS {
@@ -655,7 +676,73 @@ fn laid_out() -> Vec<Region> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pan_tilt::{pan_speeds, tilt_speeds};
     use grafton_visca::command::PanTiltDirection;
+
+    /// What a full push straight along each of the four ways asks for, on a
+    /// pad laid out for `tops`, from the slowest to the fastest region.
+    fn steps_out(regions: &[Region], degrees: f32) -> Vec<Velocity> {
+        let angle = degrees.to_radians();
+        let mut seen: Vec<Velocity> = Vec::new();
+        for step in 11..=100 {
+            let distance = step as f32 / 100.0;
+            let velocity = asked(regions, distance * angle.cos(), distance * angle.sin());
+            if seen.last() != Some(&velocity) {
+                seen.push(velocity);
+            }
+        }
+        seen
+    }
+
+    #[test]
+    fn unequal_ranges_give_each_axis_its_own_number_of_steps() {
+        // Eleven pan speeds and seven tilt speeds: going straight out to the
+        // side passes through all eleven, straight up through all seven.
+        let regions = Tops { pan: 11, tilt: 7 }.laid_out();
+        let speeds_of = |seen: Vec<Velocity>, pan: bool| -> Vec<u8> {
+            seen.iter()
+                .map(|velocity| {
+                    if pan {
+                        velocity.pan_speed
+                    } else {
+                        velocity.tilt_speed
+                    }
+                })
+                .collect()
+        };
+        for degrees in [0.0, 180.0] {
+            assert_eq!(
+                speeds_of(steps_out(&regions, degrees), true),
+                (1..=11).collect::<Vec<u8>>(),
+                "out along {degrees} degrees"
+            );
+        }
+        for degrees in [90.0, 270.0] {
+            assert_eq!(
+                speeds_of(steps_out(&regions, degrees), false),
+                (1..=7).collect::<Vec<u8>>(),
+                "out along {degrees} degrees"
+            );
+        }
+        // And no region asks either axis for more than its own top.
+        for region in &regions {
+            assert!(region.velocity.pan_speed <= 11 && region.velocity.tilt_speed <= 7);
+        }
+    }
+
+    #[test]
+    fn unequal_ranges_still_give_equal_areas() {
+        let deadzone = circle(f64::from(DEADZONE), DEADZONE_SIDES);
+        let regions = Tops { pan: 11, tilt: 7 }.laid_out();
+        let areas: Vec<f64> = regions
+            .iter()
+            .map(|region| outside(&outline(region), &deadzone).0)
+            .collect();
+        let mean = areas.iter().sum::<f64>() / areas.len() as f64;
+        for area in &areas {
+            assert!((area / mean - 1.0).abs() < 0.01, "{area} against {mean}");
+        }
+    }
 
     fn outline(region: &Region) -> Vec<Spot> {
         region
@@ -701,7 +788,7 @@ mod tests {
     #[test]
     fn every_speed_along_each_axis_has_a_region() {
         let has = |velocity: Velocity| regions().iter().any(|region| region.velocity == velocity);
-        for speed in PAN_SPEEDS {
+        for speed in pan_speeds() {
             for direction in [PanTiltDirection::Left, PanTiltDirection::Right] {
                 assert!(has(Velocity {
                     direction,
@@ -710,7 +797,7 @@ mod tests {
                 }));
             }
         }
-        for speed in TILT_SPEEDS {
+        for speed in tilt_speeds() {
             for direction in [PanTiltDirection::Up, PanTiltDirection::Down] {
                 assert!(has(Velocity {
                     direction,
@@ -796,7 +883,7 @@ mod tests {
     fn the_rim_is_about_one_speed_all_the_way_round() {
         // With equal ranges the rim's speed is the same every way: within a
         // step of the top, whichever direction the push is.
-        let top = f64::from(*PAN_SPEEDS.end() - 1);
+        let top = f64::from(*pan_speeds().end() - 1);
         for degrees in (0..360).step_by(2) {
             let angle = (degrees as f32).to_radians();
             let velocity = velocity_at(0.99 * angle.cos(), 0.99 * angle.sin());

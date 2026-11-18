@@ -9,7 +9,7 @@
 //! command produce the same sweep as a single smooth motion, with nothing
 //! left queued behind them.
 
-use std::ops::RangeInclusive;
+use std::{ops::RangeInclusive, sync::OnceLock};
 
 use grafton_visca::{
     BlockingClient, Error,
@@ -34,7 +34,8 @@ pub const MAX_PAN_SPEED: u8 = 24;
 /// shorter range than pan's).
 pub const MAX_TILT_SPEED: u8 = 20;
 
-/// The fastest speed a control asks for, on either axis.
+/// The fastest speed a control asks for on either axis, unless the config file
+/// says otherwise (`pan_top_speed` and `tilt_top_speed`).
 ///
 /// Measured rather than chosen, on the camera this was written beside (an
 /// EVI-class head, `examples/probe_speeds.rs`), in its own position units per
@@ -56,18 +57,78 @@ pub const MAX_TILT_SPEED: u8 = 20;
 /// range swings past a subject before a hand can stop it; getting somewhere
 /// far away in a hurry is what the presets and [`home`] are for, and they
 /// arrive at the camera's own pace without anyone having to hold a stick over.
-const TOP_SPEED: u8 = 9;
+///
+/// The same on both axes by default, and not only for tidiness: a speed number
+/// is worth the same rate on both axes, so sharing one top is what lets the
+/// rim of the pad be one speed all the way round.
+pub const DEFAULT_TOP_SPEED: u8 = 9;
 
-/// The pan speeds a control will actually ask for, slowest first. See
-/// [`TOP_SPEED`] for where they stop and why.
-pub const PAN_SPEEDS: RangeInclusive<u8> = MIN_SPEED..=TOP_SPEED;
+/// The fastest speed a control asks for on each axis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TopSpeeds {
+    pub pan: u8,
+    pub tilt: u8,
+}
+
+impl Default for TopSpeeds {
+    fn default() -> Self {
+        Self {
+            pan: DEFAULT_TOP_SPEED,
+            tilt: DEFAULT_TOP_SPEED,
+        }
+    }
+}
+
+impl TopSpeeds {
+    /// Brought within what the drive command accepts on each axis.
+    pub fn clamped(self) -> Self {
+        Self {
+            pan: self.pan.clamp(MIN_SPEED, MAX_PAN_SPEED),
+            tilt: self.tilt.clamp(MIN_SPEED, MAX_TILT_SPEED),
+        }
+    }
+}
+
+/// The top speeds this run uses, fixed the first time they are set or read.
+///
+/// Process-wide rather than handed to every call, because everything that
+/// turns a push into speeds reads them — the pad, the stick, the keys, and the
+/// layouts worked out once and kept — and they come from the config file at
+/// start-up and don't change until the next. A layout worked out under one
+/// set would be wrong under another, so they can't change partway either.
+static TOP_SPEEDS: OnceLock<TopSpeeds> = OnceLock::new();
+
+/// Sets the top speeds for the rest of the run, brought within what the
+/// camera accepts. Has to come before anything drives or lays out a pad:
+/// returns `false`, and changes nothing, if they were already fixed — by an
+/// earlier call, or by being read.
+pub fn use_top_speeds(top: TopSpeeds) -> bool {
+    TOP_SPEEDS.set(top.clamped()).is_ok()
+}
+
+/// The top speeds in use: whatever [`use_top_speeds`] set, or the defaults.
+pub fn top_speeds() -> TopSpeeds {
+    *TOP_SPEEDS.get_or_init(TopSpeeds::default)
+}
+
+/// The pan speeds a control will actually ask for, slowest first.
+pub fn pan_speeds() -> RangeInclusive<u8> {
+    MIN_SPEED..=top_speeds().pan
+}
 
 /// The tilt speeds a control will actually ask for, slowest first.
-///
-/// The same as [`PAN_SPEEDS`], and not only for tidiness: a speed number is
-/// worth the same rate on both axes, so sharing one range is what makes a
-/// control pushed equally both ways travel at 45 degrees.
-pub const TILT_SPEEDS: RangeInclusive<u8> = MIN_SPEED..=TOP_SPEED;
+pub fn tilt_speeds() -> RangeInclusive<u8> {
+    MIN_SPEED..=top_speeds().tilt
+}
+
+/// The one range the rings layout drives both axes from: the lower of the
+/// two tops. Its rings are speeds shared by both axes, so it has no way to
+/// give one axis more of them than the other; the equal-areas layout
+/// ([`regions`]) does.
+fn ring_speeds() -> RangeInclusive<u8> {
+    let top = top_speeds();
+    MIN_SPEED..=top.pan.min(top.tilt)
+}
 
 /// A continuous pan/tilt drive request: which way to drive, and how fast
 /// along each axis.
@@ -160,7 +221,7 @@ fn leading_speed(ring: u8, lag: Option<u8>) -> u8 {
     let steps_faster = (together.ln() / STEP.ln()).round() as u8;
     ring.saturating_sub(steps_faster)
         .max(MIN_SPEED + lag)
-        .min(TOP_SPEED)
+        .min(*ring_speeds().end())
 }
 
 /// How far from the centre of a round control each ring begins, innermost
@@ -174,7 +235,9 @@ fn leading_speed(ring: u8, lag: Option<u8>) -> u8 {
 /// only the axes and the diagonals, narrower than the bands of a rocker, and
 /// every region inside it no smaller than any other.
 pub fn ring_starts() -> Vec<f32> {
-    let regions: Vec<f32> = PAN_SPEEDS.map(|ring| regions_around(ring) as f32).collect();
+    let regions: Vec<f32> = ring_speeds()
+        .map(|ring| regions_around(ring) as f32)
+        .collect();
     let total: f32 = regions.iter().sum();
     let resting = deflection::DEADZONE.powi(2);
     let mut area = resting;
@@ -296,7 +359,7 @@ pub fn ring_edges() -> Vec<Vec<(f32, f32)>> {
 /// another, and that differs from camera to camera; a table measured on one
 /// would be exactly right there and unexplained anywhere else. This says only
 /// that each speed is the same proportion faster than the last, which is how
-/// the measured table behaves (see [`TOP_SPEED`]: sixteen and a half times
+/// the measured table behaves (see [`DEFAULT_TOP_SPEED`]: sixteen and a half times
 /// from 1 to 9, and no speed more than a fifth away from this) and how a
 /// table has to behave if its steps are to look alike.
 ///
@@ -440,8 +503,8 @@ fn axis_speed(deflection: f32, speeds: RangeInclusive<u8>) -> Option<u8> {
 /// direction wants [`velocity_from_push`] instead.
 pub fn velocity_from_axes(pan: f32, tilt: f32) -> Velocity {
     velocity(
-        axis_speed(pan, PAN_SPEEDS).map(|speed| (speed, pan > 0.0)),
-        axis_speed(tilt, TILT_SPEEDS).map(|speed| (speed, tilt > 0.0)),
+        axis_speed(pan, pan_speeds()).map(|speed| (speed, pan > 0.0)),
+        axis_speed(tilt, tilt_speeds()).map(|speed| (speed, tilt > 0.0)),
     )
 }
 
@@ -564,7 +627,7 @@ mod tests {
             reached.push(velocity.pan_speed);
         }
         reached.dedup();
-        assert_eq!(reached, PAN_SPEEDS.collect::<Vec<_>>());
+        assert_eq!(reached, ring_speeds().collect::<Vec<_>>());
     }
 
     #[test]
@@ -625,7 +688,7 @@ mod tests {
     #[test]
     fn a_ring_edge_is_drawn_only_where_something_changes_across_it() {
         let edges = ring_edges();
-        assert_eq!(edges.len(), PAN_SPEEDS.count());
+        assert_eq!(edges.len(), ring_speeds().count());
         assert_eq!(edges[0], vec![(0.0, 90.0)], "the deadzone's edge is whole");
         // Along an axis the speed goes up a step every ring, so every edge
         // crosses it.
@@ -722,7 +785,7 @@ mod tests {
         // Along one, along the other, or both at their slowest: three
         // regions a quarter, so two edges between them.
         let changes = split_changes();
-        assert_eq!(changes.len(), PAN_SPEEDS.count());
+        assert_eq!(changes.len(), ring_speeds().count());
         assert_eq!(changes[0].len(), 2, "{:?}", changes[0]);
     }
 
@@ -825,8 +888,8 @@ mod tests {
     #[test]
     fn full_deflection_asks_for_the_top_speed_of_each_axis() {
         let velocity = velocity_from_axes(1.0, 1.0);
-        assert_eq!(velocity.pan_speed, *PAN_SPEEDS.end());
-        assert_eq!(velocity.tilt_speed, *TILT_SPEEDS.end());
+        assert_eq!(velocity.pan_speed, *pan_speeds().end());
+        assert_eq!(velocity.tilt_speed, *tilt_speeds().end());
     }
 
     #[test]
@@ -834,14 +897,14 @@ mod tests {
         // Measured on the camera: driven at the top of VISCA's range it swings
         // past anything worth looking at, so no amount of pushing reaches it.
         assert!(
-            *PAN_SPEEDS.end() <= MAX_PAN_SPEED / 2,
+            *pan_speeds().end() <= MAX_PAN_SPEED / 2,
             "pushing the pad flat out asked for {} of the camera's {MAX_PAN_SPEED}",
-            *PAN_SPEEDS.end()
+            *pan_speeds().end()
         );
         assert!(
-            *TILT_SPEEDS.end() <= MAX_TILT_SPEED / 2,
+            *tilt_speeds().end() <= MAX_TILT_SPEED / 2,
             "pushing the pad flat out asked for {} of the camera's {MAX_TILT_SPEED}",
-            *TILT_SPEEDS.end()
+            *tilt_speeds().end()
         );
     }
 
@@ -862,9 +925,9 @@ mod tests {
         for step in 11..=50 {
             let speed = velocity_from_axes(step as f32 / 100.0, 0.0).pan_speed;
             assert!(
-                speed * 3 <= *PAN_SPEEDS.end(),
+                speed * 3 <= *pan_speeds().end(),
                 "{step}% of full push asked for {speed} of {}",
-                *PAN_SPEEDS.end()
+                *pan_speeds().end()
             );
         }
     }
@@ -874,7 +937,7 @@ mod tests {
         // A speed number is the same rate on either axis, so a push that is
         // equal both ways only travels at 45 degrees if it asks each for the
         // same number.
-        assert_eq!(PAN_SPEEDS, TILT_SPEEDS);
+        assert_eq!(pan_speeds(), tilt_speeds());
         for step in 11..=100 {
             let push = step as f32 / 100.0;
             let velocity = velocity_from_axes(push, push);
@@ -897,9 +960,9 @@ mod tests {
         // Hard right, barely up: pan should be at its own maximum while tilt
         // stays near the bottom of its range.
         let velocity = velocity_from_axes(1.0, 0.2);
-        assert_eq!(velocity.pan_speed, *PAN_SPEEDS.end());
+        assert_eq!(velocity.pan_speed, *pan_speeds().end());
         assert!(
-            velocity.tilt_speed < *TILT_SPEEDS.end() / 2,
+            velocity.tilt_speed < *tilt_speeds().end() / 2,
             "tilt should stay slow when the control is barely deflected up"
         );
     }
@@ -913,7 +976,7 @@ mod tests {
 
     #[test]
     fn deflection_beyond_full_travel_is_capped_rather_than_rejected() {
-        assert_eq!(velocity_from_axes(3.0, 0.0).pan_speed, *PAN_SPEEDS.end());
+        assert_eq!(velocity_from_axes(3.0, 0.0).pan_speed, *pan_speeds().end());
     }
 
     fn scripted_camera(

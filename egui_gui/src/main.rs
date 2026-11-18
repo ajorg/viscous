@@ -35,7 +35,7 @@ use viscous::{
     gamepad::{Gamepad, Pad, Press},
     keymap::{FAST_KEY_DEFLECTION, KEY_DEFLECTION},
     nudge::Step,
-    pan_tilt::{self, PadLayout, Velocity},
+    pan_tilt::{self, PadLayout, TopSpeeds, Velocity},
     session::{self, POLL_INTERVAL, QUIESCENCE_INTERVAL, RETRY_INTERVAL},
     state::{self, CameraState},
     title::{self, Title},
@@ -218,6 +218,12 @@ struct App {
     /// Read from the config file and written back as it was found, like
     /// [`speed_lines`](Self::speed_lines).
     pad_layout: PadLayout,
+    /// The fastest the controls drive each axis, as the config file asked —
+    /// written back the same, even where the camera can't go that fast and
+    /// [`pan_tilt::use_top_speeds`] brought them down.
+    top_speeds: TopSpeeds,
+    /// The same for zoom, then focus.
+    lens_top_speeds: (u8, u8),
     /// Where the descriptions and titles are kept between runs, if this
     /// platform has somewhere to keep them.
     config_path: Option<PathBuf>,
@@ -296,6 +302,11 @@ impl Default for App {
             camera: None,
             speed_lines: false,
             pad_layout: PadLayout::default(),
+            top_speeds: TopSpeeds::default(),
+            lens_top_speeds: (
+                viscous::zoom::MAX_ZOOM_SPEED,
+                viscous::focus::MAX_FOCUS_SPEED,
+            ),
             config_path: None,
             requested_size: None,
             shown: false,
@@ -331,6 +342,12 @@ impl App {
         };
         match app.config_path.as_deref().map(config::load) {
             Some(Ok(config)) => {
+                // Before anything turns a push into speeds — the layout
+                // started just below included — since they're fixed from the
+                // first time they're read.
+                config.use_top_speeds();
+                app.top_speeds = config.top_speeds();
+                app.lens_top_speeds = (config.zoom_top_speed, config.focus_top_speed);
                 app.preset_labels = config.presets;
                 app.titles = config.titles;
                 app.speed_lines = config.speed_lines;
@@ -1119,6 +1136,10 @@ impl App {
             camera: self.camera.clone(),
             speed_lines: self.speed_lines,
             pad_layout: self.pad_layout,
+            pan_top_speed: self.top_speeds.pan,
+            tilt_top_speed: self.top_speeds.tilt,
+            zoom_top_speed: self.lens_top_speeds.0,
+            focus_top_speed: self.lens_top_speeds.1,
             presets: written(&self.preset_labels),
             titles: written(&self.titles),
         };

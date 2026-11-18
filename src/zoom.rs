@@ -42,15 +42,28 @@ pub struct ZoomDrive {
     pub speed: ZoomSpeed,
 }
 
-/// The speeds VISCA's variable zoom accepts, slowest first.
-const ZOOM_SPEEDS: std::ops::RangeInclusive<u8> = 0..=7;
+/// The fastest speed VISCA's variable zoom accepts; 0 is the slowest.
+pub const MAX_ZOOM_SPEED: u8 = 7;
+
+/// The fastest a control zooms at this run: `zoom_top_speed` in the config
+/// file, or all the way.
+///
+/// Worth lowering on a camera whose top speeds are hard to tell apart: on the
+/// one this was written beside, 6 and 7 are within a twentieth of each other,
+/// so the last band of the rocker buys almost nothing.
+pub static TOP_SPEED: deflection::TopSpeed = deflection::TopSpeed::new(MAX_ZOOM_SPEED);
+
+/// The speeds a control will zoom at, slowest first.
+fn zoom_speeds() -> std::ops::RangeInclusive<u8> {
+    0..=TOP_SPEED.get()
+}
 
 impl ZoomDrive {
     /// Where along a rocker's travel each zoom speed begins, slowest first, as
     /// fractions of full deflection either side of centre — for a control
     /// that wants to draw them.
     pub fn band_starts() -> Vec<f32> {
-        deflection::band_starts(ZOOM_SPEEDS.count())
+        deflection::band_starts(zoom_speeds().count())
     }
 
     /// The drive a rocker pushed to `deflection` asks for — negative for
@@ -61,9 +74,9 @@ impl ZoomDrive {
         } else {
             ZoomDirection::In
         };
-        deflection::speed(deflection.abs(), ZOOM_SPEEDS).map(|speed| Self {
+        deflection::speed(deflection.abs(), zoom_speeds()).map(|speed| Self {
             direction,
-            // In range by construction: `speed` never leaves ZOOM_SPEEDS.
+            // In range by construction: `speed` never leaves 0..=7.
             speed: ZoomSpeed::new(speed).expect("a zoom speed from the accepted range"),
         })
     }

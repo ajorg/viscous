@@ -40,15 +40,24 @@ pub struct FocusDrive {
     pub speed: FocusSpeed,
 }
 
-/// The speeds VISCA's variable focus accepts, slowest first.
-const FOCUS_SPEEDS: std::ops::RangeInclusive<u8> = 0..=7;
+/// The fastest speed VISCA's variable focus accepts; 0 is the slowest.
+pub const MAX_FOCUS_SPEED: u8 = 7;
+
+/// The fastest a control focuses at this run: `focus_top_speed` in the
+/// config file, or all the way.
+pub static TOP_SPEED: deflection::TopSpeed = deflection::TopSpeed::new(MAX_FOCUS_SPEED);
+
+/// The speeds a control will focus at, slowest first.
+fn focus_speeds() -> std::ops::RangeInclusive<u8> {
+    0..=TOP_SPEED.get()
+}
 
 impl FocusDrive {
     /// Where along a rocker's travel each focus speed begins, slowest first,
     /// as fractions of full deflection either side of centre — for a control
     /// that wants to draw them.
     pub fn band_starts() -> Vec<f32> {
-        deflection::band_starts(FOCUS_SPEEDS.count())
+        deflection::band_starts(focus_speeds().count())
     }
 
     /// The drive a rocker pushed to `deflection` asks for — negative for
@@ -59,9 +68,9 @@ impl FocusDrive {
         } else {
             FocusDirection::Far
         };
-        deflection::speed(deflection.abs(), FOCUS_SPEEDS).map(|speed| Self {
+        deflection::speed(deflection.abs(), focus_speeds()).map(|speed| Self {
             direction,
-            // In range by construction: `speed` never leaves FOCUS_SPEEDS.
+            // In range by construction: `speed` never leaves 0..=7.
             speed: FocusSpeed::new(speed).expect("a focus speed from the accepted range"),
         })
     }

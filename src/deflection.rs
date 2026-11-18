@@ -10,7 +10,41 @@
 //! speed. Everything about how the control feels comes down to where those
 //! bands begin and end, which is what this module decides.
 
-use std::ops::RangeInclusive;
+use std::{ops::RangeInclusive, sync::OnceLock};
+
+/// The fastest speed a one-axis control — zoom, focus — drives at for this
+/// run: what the config file asks for, or the most the camera accepts.
+///
+/// Fixed the first time it is set or read, like the pan and tilt tops, and
+/// for the same reason: it comes from the config file at start-up, and the
+/// bands a rocker is drawn with are worked out from it.
+pub struct TopSpeed {
+    chosen: OnceLock<u8>,
+    most: u8,
+}
+
+impl TopSpeed {
+    /// A top speed that is `most` until said otherwise, and can never be
+    /// said to be more.
+    pub const fn new(most: u8) -> Self {
+        Self {
+            chosen: OnceLock::new(),
+            most,
+        }
+    }
+
+    /// Sets it for the rest of the run, brought down to the most the camera
+    /// accepts. Returns `false`, and changes nothing, if it was already fixed
+    /// — by an earlier call, or by being read.
+    pub fn set(&self, top: u8) -> bool {
+        self.chosen.set(top.min(self.most)).is_ok()
+    }
+
+    /// The top speed in use.
+    pub fn get(&self) -> u8 {
+        *self.chosen.get_or_init(|| self.most)
+    }
+}
 
 /// How far a control has to be pushed before it drives at all, as a fraction
 /// of full deflection.

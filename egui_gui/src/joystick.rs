@@ -350,7 +350,7 @@ mod tests {
     fn the_edge_of_the_pad_is_full_speed() {
         assert_eq!(
             velocity_for_offset(vec2(RADIUS, 0.0), RADIUS, PadLayout::Rings).pan_speed,
-            *viscous::pan_tilt::PAN_SPEEDS.end()
+            *viscous::pan_tilt::pan_speeds().end()
         );
     }
 
