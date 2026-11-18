@@ -12,7 +12,7 @@
 
 use grafton_visca::command::PanTiltDirection;
 
-use crate::{drives::Drives, focus::FocusDrive, pan_tilt::velocity_from_push, zoom::ZoomDrive};
+use crate::{drives::Drives, focus::FocusDrive, pan_tilt::PadLayout, zoom::ZoomDrive};
 
 /// Which buttons are down. Named the way the layout is, not the way one
 /// vendor's labels are: on an Xbox-style controller [`Self::south`] is A,
@@ -125,15 +125,23 @@ const PRESET_BUTTONS: [(Down, u8); 6] = [
 #[derive(Debug, Default)]
 pub struct Gamepad {
     previous: Pad,
+    /// How the left stick's push is turned into pan and tilt — the same as
+    /// the on-screen pad's, so a hand that knows one knows the other.
+    layout: PadLayout,
 }
 
 impl Gamepad {
+    /// Turns the left stick's push into pan and tilt by `layout` from now on.
+    pub fn set_layout(&mut self, layout: PadLayout) {
+        self.layout = layout;
+    }
+
     /// Takes the controller's current state and reports what it is asking for:
     /// the drives to hold, and whatever was just pressed.
     pub fn update(&mut self, pad: Pad) -> (Drives, Vec<Press>) {
         let presses = self.presses(&pad);
         self.previous = pad;
-        (drives(&pad), presses)
+        (drives(&pad, self.layout), presses)
     }
 
     /// What was pressed this time round that wasn't held last time.
@@ -181,9 +189,9 @@ impl Gamepad {
 /// What the sticks and triggers are asking for, which depends only on where
 /// they are right now — letting go *is* the stop, exactly as it is for the
 /// on-screen pad.
-fn drives(pad: &Pad) -> Drives {
+fn drives(pad: &Pad, layout: PadLayout) -> Drives {
     Drives {
-        pan_tilt: velocity_from_push(pad.left_stick.0, pad.left_stick.1),
+        pan_tilt: layout.velocity(pad.left_stick.0, pad.left_stick.1),
         // Push up to tighten, the way pushing up on the on-screen rocker's
         // right-hand end does.
         zoom: ZoomDrive::from_deflection(pad.right_stick.1),

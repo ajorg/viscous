@@ -35,7 +35,7 @@ use viscous::{
     gamepad::{Gamepad, Pad, Press},
     keymap::{FAST_KEY_DEFLECTION, KEY_DEFLECTION},
     nudge::Step,
-    pan_tilt::{self, Velocity},
+    pan_tilt::{self, PadLayout, Velocity},
     session::{self, POLL_INTERVAL, QUIESCENCE_INTERVAL, RETRY_INTERVAL},
     state::{self, CameraState},
     title::{self, Title},
@@ -214,6 +214,10 @@ struct App {
     /// there is no control for it in the window, on purpose — it is a thing
     /// to turn on once while learning the controls, not to reach for.
     speed_lines: bool,
+    /// How the pad and the controller's stick turn a push into pan and tilt.
+    /// Read from the config file and written back as it was found, like
+    /// [`speed_lines`](Self::speed_lines).
+    pad_layout: PadLayout,
     /// Where the descriptions and titles are kept between runs, if this
     /// platform has somewhere to keep them.
     config_path: Option<PathBuf>,
@@ -291,6 +295,7 @@ impl Default for App {
             titles_supported: true,
             camera: None,
             speed_lines: false,
+            pad_layout: PadLayout::default(),
             config_path: None,
             requested_size: None,
             shown: false,
@@ -329,6 +334,19 @@ impl App {
                 app.preset_labels = config.presets;
                 app.titles = config.titles;
                 app.speed_lines = config.speed_lines;
+                app.pad_layout = config.pad_layout;
+                app.gamepad.set_layout(config.pad_layout);
+                if config.pad_layout == PadLayout::EqualAreas {
+                    // About half a second's work, done the first time
+                    // anything needs it — which, with the lines off, would be
+                    // the first push past the deadzone, the worst moment
+                    // there is for a pause. Started now instead, it is done
+                    // long before a hand gets there; a push that somehow
+                    // beats it waits for it rather than doing it twice.
+                    std::thread::spawn(|| {
+                        pan_tilt::regions::regions();
+                    });
+                }
                 if let Some(camera) = config.camera {
                     app.port_input = camera.clone();
                     app.camera = Some(camera);
@@ -688,6 +706,7 @@ impl App {
                         live,
                         STANDBY_HINT,
                         vec2(stick.left_stick.0, stick.left_stick.1),
+                        self.pad_layout,
                         self.speed_lines,
                     );
 
@@ -1099,6 +1118,7 @@ impl App {
         let config = config::Config {
             camera: self.camera.clone(),
             speed_lines: self.speed_lines,
+            pad_layout: self.pad_layout,
             presets: written(&self.preset_labels),
             titles: written(&self.titles),
         };

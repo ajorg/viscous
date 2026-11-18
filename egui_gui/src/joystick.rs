@@ -7,7 +7,7 @@
 use std::{f32::consts::PI, sync::OnceLock};
 
 use egui::{Sense, Stroke, TextStyle, Ui, Vec2, vec2};
-use viscous::pan_tilt::{self, Velocity};
+use viscous::pan_tilt::{self, PadLayout, Velocity};
 
 /// The smallest the pad is drawn, as a multiple of the height of a line of
 /// body text.
@@ -75,8 +75,8 @@ fn arc(
 /// The velocity a puck offset asks for, taking the pad's radius as full
 /// deflection and flipping screen y (which grows downward) so that dragging
 /// up tilts up.
-pub fn velocity_for_offset(offset: Vec2, radius: f32) -> Velocity {
-    pan_tilt::velocity_from_push(offset.x / radius, -offset.y / radius)
+pub fn velocity_for_offset(offset: Vec2, radius: f32, layout: PadLayout) -> Velocity {
+    layout.velocity(offset.x / radius, -offset.y / radius)
 }
 
 /// Clamps an offset from the pad's center to its edge, so dragging off the
@@ -121,13 +121,15 @@ pub fn least_pad_size(ui: &Ui) -> f32 {
 /// in: that a stick is answering is worth seeing whatever the camera is doing
 /// about it.
 ///
-/// `speed_lines` draws a fine line wherever a speed begins.
+/// `layout` says how a push becomes pan and tilt, and `speed_lines` draws the
+/// edges of the regions it cuts the pad into.
 pub fn pan_tilt_pad(
     ui: &mut Ui,
     size: f32,
     live: bool,
     why: &str,
     stick: Vec2,
+    layout: PadLayout,
     speed_lines: bool,
 ) -> Velocity {
     let radius = size / 2.0;
@@ -173,7 +175,21 @@ pub fn pan_tilt_pad(
     // starts asking for anything at all; and across each ring, a line
     // wherever the direction starts to mean a different share between the
     // two.
-    if speed_lines {
+    if speed_lines && layout == PadLayout::EqualAreas {
+        for region in pan_tilt::regions::regions() {
+            let corners = region
+                .outline
+                .iter()
+                .map(|(right, up)| center + vec2(*right, -*up) * radius)
+                .collect();
+            painter.add(egui::Shape::closed_line(corners, band_stroke));
+        }
+        // Whatever of the regions reaches into the deadzone asks for
+        // nothing there, so it isn't drawn as if it did.
+        let resting = viscous::deflection::DEADZONE * radius;
+        painter.circle_filled(center, resting, track_color);
+        painter.circle_stroke(center, resting, band_stroke);
+    } else if speed_lines {
         // The same every frame, and found by trying the whole pad.
         static SPLITS: OnceLock<Vec<Vec<f32>>> = OnceLock::new();
         static EDGES: OnceLock<Vec<Vec<(f32, f32)>>> = OnceLock::new();
@@ -254,7 +270,7 @@ pub fn pan_tilt_pad(
     // Only the pointer's own drag is asked for here; what the stick asks for
     // reaches the camera by its own path, and returning it too would have the
     // pad ask for it a second time.
-    velocity_for_offset(dragged.unwrap_or(Vec2::ZERO), radius)
+    velocity_for_offset(dragged.unwrap_or(Vec2::ZERO), radius, layout)
 }
 
 #[cfg(test)]
@@ -293,18 +309,19 @@ mod tests {
 
     #[test]
     fn a_centered_puck_stops() {
-        assert!(velocity_for_offset(Vec2::ZERO, RADIUS).is_stop());
+        assert!(velocity_for_offset(Vec2::ZERO, RADIUS, PadLayout::Rings).is_stop());
+        assert!(velocity_for_offset(Vec2::ZERO, RADIUS, PadLayout::EqualAreas).is_stop());
     }
 
     #[test]
     fn dragging_up_the_screen_tilts_up() {
         // Screen y grows downward, so "up" is a negative offset.
         assert_eq!(
-            velocity_for_offset(vec2(0.0, -RADIUS), RADIUS).direction,
+            velocity_for_offset(vec2(0.0, -RADIUS), RADIUS, PadLayout::Rings).direction,
             PanTiltDirection::Up
         );
         assert_eq!(
-            velocity_for_offset(vec2(0.0, RADIUS), RADIUS).direction,
+            velocity_for_offset(vec2(0.0, RADIUS), RADIUS, PadLayout::Rings).direction,
             PanTiltDirection::Down
         );
     }
@@ -312,11 +329,11 @@ mod tests {
     #[test]
     fn dragging_sideways_pans_that_way() {
         assert_eq!(
-            velocity_for_offset(vec2(RADIUS, 0.0), RADIUS).direction,
+            velocity_for_offset(vec2(RADIUS, 0.0), RADIUS, PadLayout::Rings).direction,
             PanTiltDirection::Right
         );
         assert_eq!(
-            velocity_for_offset(vec2(-RADIUS, 0.0), RADIUS).direction,
+            velocity_for_offset(vec2(-RADIUS, 0.0), RADIUS, PadLayout::Rings).direction,
             PanTiltDirection::Left
         );
     }
@@ -324,7 +341,7 @@ mod tests {
     #[test]
     fn dragging_diagonally_drives_both_axes() {
         assert_eq!(
-            velocity_for_offset(vec2(RADIUS, -RADIUS), RADIUS).direction,
+            velocity_for_offset(vec2(RADIUS, -RADIUS), RADIUS, PadLayout::Rings).direction,
             PanTiltDirection::UpRight
         );
     }
@@ -332,15 +349,15 @@ mod tests {
     #[test]
     fn the_edge_of_the_pad_is_full_speed() {
         assert_eq!(
-            velocity_for_offset(vec2(RADIUS, 0.0), RADIUS).pan_speed,
+            velocity_for_offset(vec2(RADIUS, 0.0), RADIUS, PadLayout::Rings).pan_speed,
             *viscous::pan_tilt::PAN_SPEEDS.end()
         );
     }
 
     #[test]
     fn speed_scales_with_distance_from_the_center() {
-        let near = velocity_for_offset(vec2(30.0, 0.0), RADIUS).pan_speed;
-        let far = velocity_for_offset(vec2(110.0, 0.0), RADIUS).pan_speed;
+        let near = velocity_for_offset(vec2(30.0, 0.0), RADIUS, PadLayout::Rings).pan_speed;
+        let far = velocity_for_offset(vec2(110.0, 0.0), RADIUS, PadLayout::Rings).pan_speed;
         assert!(
             near < far,
             "a further drag should ask for a faster pan ({near} vs {far})"
@@ -361,7 +378,7 @@ mod tests {
 
         assert_eq!(up, vec2(0.0, -RADIUS));
         assert_eq!(
-            velocity_for_offset(up, RADIUS).direction,
+            velocity_for_offset(up, RADIUS, PadLayout::Rings).direction,
             PanTiltDirection::Up
         );
         assert_eq!(
@@ -384,7 +401,15 @@ mod tests {
     /// after the pointer has come to rest on a pad that is `live`.
     fn hovering_the_pad_explains_itself(live: bool) -> bool {
         let mut harness = Harness::new_ui(move |ui| {
-            pan_tilt_pad(ui, 200.0, live, "not just now", Vec2::ZERO, false);
+            pan_tilt_pad(
+                ui,
+                200.0,
+                live,
+                "not just now",
+                Vec2::ZERO,
+                PadLayout::Rings,
+                false,
+            );
         });
         harness.run();
 
@@ -420,7 +445,15 @@ mod tests {
         // for what it is only showing would be asking twice.
         let asked = Cell::new(Velocity::STOP);
         Harness::new_ui(|ui| {
-            asked.set(pan_tilt_pad(ui, 200.0, true, "", vec2(1.0, 1.0), true));
+            asked.set(pan_tilt_pad(
+                ui,
+                200.0,
+                true,
+                "",
+                vec2(1.0, 1.0),
+                PadLayout::EqualAreas,
+                true,
+            ));
         })
         .run();
 

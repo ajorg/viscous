@@ -18,6 +18,7 @@ use grafton_visca::{
     transport::{BlockingTransport, HasTransportConfig},
     types::{PanSpeed, TiltSpeed},
 };
+use serde::{Deserialize, Serialize};
 
 use crate::deflection;
 
@@ -315,6 +316,32 @@ const STEP: f32 = 1.42;
 /// has, which is not slow. Wide enough to rest in without watching the
 /// control; narrow enough that leaving it is a thing done on purpose.
 pub const AXIS_SNAP_DEGREES: f32 = 9.0;
+
+pub mod regions;
+
+/// How a round control's push is turned into a velocity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PadLayout {
+    /// Rings of speed, each cut into a slice for every heading:
+    /// [`velocity_from_push`].
+    #[default]
+    Rings,
+    /// The same commands, each given a region of exactly the same area as
+    /// every other and whatever shape that takes: [`regions`].
+    EqualAreas,
+}
+
+impl PadLayout {
+    /// What a push `pan` right and `tilt` up asks for, each a fraction of the
+    /// control's radius in `-1.0..=1.0`.
+    pub fn velocity(self, pan: f32, tilt: f32) -> Velocity {
+        match self {
+            Self::Rings => velocity_from_push(pan, tilt),
+            Self::EqualAreas => regions::velocity_at(pan, tilt),
+        }
+    }
+}
 
 /// Builds a velocity from where a round control is pushed to: `pan` and
 /// `tilt` the push's two components, each a fraction of the control's radius

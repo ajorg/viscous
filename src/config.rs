@@ -8,6 +8,8 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+use crate::pan_tilt::PadLayout;
+
 /// What a front end remembers between runs: the operator's own words for
 /// each preset and title, and which camera to reach for.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -25,6 +27,11 @@ pub struct Config {
     /// exists to anyone who opens it to look.
     #[serde(default)]
     pub speed_lines: bool,
+    /// How the pad and the stick turn a push into pan and tilt:
+    /// `pad_layout = "rings"`, the default, or `"equal-areas"`, the
+    /// experiment of every region being exactly the same size.
+    #[serde(default)]
+    pub pad_layout: PadLayout,
     /// Preset number -> label.
     #[serde(default)]
     pub presets: BTreeMap<u8, String>,
@@ -153,6 +160,22 @@ mod tests {
         assert!(asked.speed_lines);
 
         // And saving keeps the setting, with the labels still under it.
+        save(&asked, &path).expect("save should succeed");
+        let kept = load(&path).expect("what was saved should load");
+        let _ = fs::remove_file(&path);
+        assert_eq!(kept, asked);
+    }
+
+    #[test]
+    fn the_pad_layout_is_rings_unless_the_file_says_otherwise() {
+        let path = test_path("pad-layout");
+        fs::write(&path, "[presets]\n1 = \"wide shot\"\n").expect("write should succeed");
+        assert_eq!(load(&path).unwrap().pad_layout, PadLayout::Rings);
+
+        fs::write(&path, "pad_layout = \"equal-areas\"\n").expect("write should succeed");
+        let asked = load(&path).expect("a config naming a layout should load");
+        assert_eq!(asked.pad_layout, PadLayout::EqualAreas);
+
         save(&asked, &path).expect("save should succeed");
         let kept = load(&path).expect("what was saved should load");
         let _ = fs::remove_file(&path);
