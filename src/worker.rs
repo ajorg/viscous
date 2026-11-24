@@ -1,24 +1,31 @@
-//! Runs camera commands on a dedicated thread so the UI thread never blocks
-//! on VISCA's ack/completion round trip (which, for a preset recall, can take
-//! as long as the physical move itself).
+//! Owns the camera, on a thread of its own, so a front end never waits on
+//! VISCA's round trips — which for a preset recall can take as long as the
+//! physical move itself.
 
-use std::sync::mpsc::{Receiver, Sender};
-use std::time::{Duration, Instant};
-
-use grafton_visca::{
-    BlockingClient, Error,
-    camera::profiles::GenericVisca,
-    command::PanTiltDirection,
-    transport::{BlockingTransport, HasTransportConfig},
+use std::{
+    future::Future,
+    pin::Pin,
+    sync::mpsc::{self as std_mpsc, Receiver, Sender},
+    thread,
+    time::{Duration, Instant},
 };
 
+use grafton_visca::{
+    Error,
+    command::{PanTiltDirection, VersionInfo},
+};
+use tokio::sync::mpsc::{UnboundedReceiver, error::TryRecvError, unbounded_channel};
+
 use crate::{
+    connection::{self, Target},
     focus::{self, FocusDirection, FocusDrive},
     nudge::{self, Step},
     pan_tilt::{self, Velocity},
-    power, preset,
+    power::Power,
+    preset::{self, Memory},
     state::{self, CameraState},
-    title::{self, Title},
+    title::{self, Title, TitleDisplayInquiry},
+    wire::{self, Wire},
     zoom::{self, ZoomDirection, ZoomDrive},
 };
 
@@ -89,8 +96,8 @@ fn control(intent: Intent) -> Option<Control> {
         Intent::DriveZoom(_) => Some(Control::Zoom),
         Intent::DriveFocus(_) => Some(Control::Focus),
         // A step is deliberately not a control: two drives in the queue
-        // together mean the later one won, but two steps mean two steps.
-        // `coalesced` adds them together instead of dropping either.
+        // together mean the later one won, but two steps mean two steps, and
+        // `coalesced` sends both.
         Intent::Nudge(_)
         | Intent::SetAutoFocus(_)
         | Intent::RecallPreset(_)
@@ -134,7 +141,7 @@ pub fn is_title(intent: Intent) -> bool {
 /// releasing it stops nothing until that backlog has played out.
 ///
 /// Steps are deliberately left alone, and are safe to leave alone. Nothing
-/// generates them but a press — one per press, never one per frame — so they
+/// generates them but a press — one per press, repeats ignored — so they
 /// arrive no faster than a hand can produce them and no backlog can form. And
 /// they must not be touched: a drive says what the camera should be doing
 /// *now*, so only the last one still means anything, but a step says how far
@@ -196,10 +203,29 @@ pub fn describe(intent: Intent) -> String {
 pub fn describe_outcome(outcome: &Outcome) -> String {
     match outcome {
         Outcome::Done(intent, Ok(())) => format!("OK: {}", describe(*intent)),
+        // Not "failed": the camera may well have done it and only the answer
+        // went missing. What is known is that nothing came back.
+        Outcome::Done(intent, Err(Error::Timeout)) => {
+            format!("no answer from the camera ({})", describe(*intent))
+        }
         Outcome::Done(intent, Err(error)) => format!("error ({}): {error}", describe(*intent)),
         Outcome::State(Ok(camera_state)) => state::format_state(camera_state),
         Outcome::State(Err(error)) => format!("state query failed: {error}"),
     }
+}
+
+/// Whether this is the camera not answering, as against the camera answering,
+/// whatever it said.
+///
+/// A front end saying so is describing a condition rather than an event, so
+/// the message is only true until the camera next answers anything; this is
+/// what tells it when that has happened. A state query that failed counts,
+/// because both front ends already report that as the camera not answering.
+pub fn unanswered(outcome: &Outcome) -> bool {
+    matches!(
+        outcome,
+        Outcome::Done(_, Err(Error::Timeout)) | Outcome::State(Err(_))
+    )
 }
 
 /// A short "in progress" description of an intent, shown as soon as it's
@@ -224,58 +250,297 @@ fn direction_label(direction: PanTiltDirection) -> &'static str {
     }
 }
 
-fn dispatch<T>(camera: &BlockingClient<GenericVisca, T>, intent: Intent) -> Outcome
-where
-    T: BlockingTransport + HasTransportConfig + 'static,
-{
-    match intent {
-        Intent::DrivePanTilt(velocity) => Outcome::Done(intent, pan_tilt::drive(camera, velocity)),
-        Intent::Nudge(step) => Outcome::Done(intent, nudge::nudge(camera, step)),
-        Intent::DriveZoom(direction) => Outcome::Done(intent, zoom::drive_zoom(camera, direction)),
-        Intent::DriveFocus(direction) => {
-            Outcome::Done(intent, focus::drive_focus(camera, direction))
-        }
-        Intent::RecallPreset(number) => {
-            Outcome::Done(intent, preset::recall_preset(camera, number))
-        }
-        Intent::SavePreset(number) => Outcome::Done(intent, preset::save_preset(camera, number)),
-        Intent::SetAutoFocus(auto) => Outcome::Done(intent, focus::set_auto_focus(camera, auto)),
-        Intent::Home => Outcome::Done(intent, pan_tilt::home(camera)),
-        Intent::ResetPanTilt => Outcome::Done(intent, pan_tilt::reset(camera)),
-        Intent::SetPower(on) => Outcome::Done(intent, power::set_power(camera, on)),
-        Intent::SetTitle(text) => Outcome::Done(intent, title::set_title(camera, text)),
-        Intent::ShowTitle(on) => Outcome::Done(intent, title::show_title(camera, on)),
-        Intent::QueryState => Outcome::State(state::query_state(camera)),
-    }
+/// A connected camera, and the front end's way of talking to it.
+pub struct Worker {
+    /// How the connection was made, phrased for display.
+    pub link: String,
+    /// What the camera said it is.
+    pub version: VersionInfo,
+    /// Whether this camera answered for its title feature — asked once, as
+    /// part of connecting, since it decides what the window offers.
+    pub titles: bool,
+    /// Where the front end sends what the operator asks for.
+    pub intents: Sender<Intent>,
+    /// What came of it.
+    pub results: Receiver<Outcome>,
 }
 
-/// Runs camera intents received from `intents` against `camera` until the
-/// channel closes, sending each command's outcome to `results`.
+/// Connects to `target` on a thread of its own, which owns the camera from
+/// then on, and returns once the camera has answered — or with a message fit
+/// to show the user if it didn't.
 ///
-/// Intended to run on its own thread, started once per connected camera, so
-/// a slow completion round trip never blocks the UI thread. Stops early if
-/// `results` is no longer being received (the UI side has gone away).
-pub fn run<T>(
-    camera: &BlockingClient<GenericVisca, T>,
-    intents: &Receiver<Intent>,
-    results: &Sender<Outcome>,
-) where
-    T: BlockingTransport + HasTransportConfig + 'static,
-{
-    for intent in intents {
-        // Anything that piled up while the previous command was on the wire
-        // is waiting here, so take the whole backlog at once rather than one
-        // per round trip: that's what makes it possible to notice a drive
-        // command has already been superseded before bothering to send it.
-        let mut batch = vec![intent];
-        batch.extend(intents.try_iter());
+/// Blocks for as long as connecting takes, so a front end with a window to
+/// keep drawing calls this from a thread of its own.
+///
+/// `wake` is called whenever an outcome is waiting on [`Worker::results`], for
+/// a front end that would otherwise have to keep checking.
+pub fn start(target: Target, wake: impl Fn() + Send + 'static) -> Result<Worker, String> {
+    let (ready_tx, ready_rx) = std_mpsc::channel();
+    let (intent_tx, intent_rx) = std_mpsc::channel();
+    let (result_tx, result_rx) = std_mpsc::channel();
+    let results = Results::new(result_tx, wake);
 
-        for intent in coalesced(&batch) {
-            if results.send(dispatch(camera, intent)).is_err() {
-                return;
+    thread::Builder::new()
+        .name("camera".to_string())
+        .spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    let _ =
+                        ready_tx.send(Err(format!("Could not start the camera thread: {error}")));
+                    return;
+                }
+            };
+            runtime.block_on(async move {
+                let opened = match connection::open(&target).await {
+                    Ok(opened) => opened,
+                    Err(error) => {
+                        let _ = ready_tx.send(Err(error));
+                        return;
+                    }
+                };
+                let camera = opened.session.camera();
+                let titles = titles_supported(camera).await;
+                if ready_tx
+                    .send(Ok((opened.link, opened.version, titles)))
+                    .is_err()
+                {
+                    return;
+                }
+                run(camera, forwarded(intent_rx), &results).await;
+            });
+            // Anything still running is the forwarder, waiting on a front end
+            // that has gone; there is nothing left for it to wait for.
+            runtime.shutdown_background();
+        })
+        .map_err(|error| format!("Could not start the camera thread: {error}"))?;
+
+    let (link, version, titles) = ready_rx
+        .recv()
+        .map_err(|_| "The camera thread stopped while connecting".to_string())??;
+    Ok(Worker {
+        link,
+        version,
+        titles,
+        intents: intent_tx,
+        results: result_rx,
+    })
+}
+
+/// Whether the camera has titles, asked as part of connecting.
+async fn titles_supported(camera: &impl Wire) -> bool {
+    let answer = tokio::time::timeout(title::ANSWER_TIME, camera.send(&TitleDisplayInquiry))
+        .await
+        .unwrap_or(Err(Error::Timeout));
+    title::supported(&answer)
+}
+
+/// The front end's intents, moved across from the channel it sends them on
+/// to one the worker can wait on alongside the camera.
+///
+/// The front ends are plain threads and keep a plain channel; only the worker
+/// is async, and this is the whole of the seam between the two.
+fn forwarded(intents: Receiver<Intent>) -> UnboundedReceiver<Intent> {
+    let (forward, forwarded) = unbounded_channel();
+    tokio::task::spawn_blocking(move || {
+        for intent in intents {
+            if forward.send(intent).is_err() {
+                break;
+            }
+        }
+    });
+    forwarded
+}
+
+/// Runs the operator's intents against `camera` until they stop coming,
+/// reporting what came of each to `results`.
+///
+/// Two lanes. Commands go one at a time, in the order they were asked for,
+/// each waiting for the camera to take it — so a stop never overtakes the
+/// drive it stops — and a drive superseded while it waited is never sent.
+/// Questions about the camera's state go on beside them: the camera tracks a
+/// question separately from its commands, so a command never waits for one,
+/// however long the camera takes to answer or whether it does at all.
+pub async fn run(camera: &impl Wire, mut intents: UnboundedReceiver<Intent>, results: &Results) {
+    let mut waiting: Vec<Intent> = Vec::new();
+    let mut command: Option<Pending<'_>> = None;
+    let mut question: Option<Pending<'_>> = None;
+    // Asked for while a question was already out, so asked again once it is
+    // back: the answer in flight may predate a command that changed things.
+    let mut ask_again = false;
+    let mut listening = true;
+
+    loop {
+        if command.is_none() && !waiting.is_empty() {
+            waiting = coalesced(&waiting);
+            let intent = waiting.remove(0);
+            command = Some(Box::pin(dispatch(camera, intent)));
+        }
+        if question.is_none() && ask_again {
+            ask_again = false;
+            question = Some(Box::pin(async {
+                Outcome::State(state::query_state(camera).await)
+            }));
+        }
+        // Gone quiet: everything asked for has been sent. A question still
+        // out is left unanswered, since nobody is left to show it to.
+        if !listening && command.is_none() && waiting.is_empty() {
+            return;
+        }
+
+        tokio::select! {
+            // The front end first: a stop that has just arrived is worth
+            // knowing about before deciding what to send next.
+            biased;
+            intent = intents.recv(), if listening => {
+                // Everything else already waiting too, so a drive that has
+                // been superseded is seen to be before it is sent.
+                let mut next = intent;
+                loop {
+                    match next {
+                        Some(Intent::QueryState) => ask_again = true,
+                        Some(intent) => waiting.push(intent),
+                        None => listening = false,
+                    }
+                    match intents.try_recv() {
+                        Ok(intent) => next = Some(intent),
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Disconnected) => next = None,
+                    }
+                    if !listening {
+                        break;
+                    }
+                }
+            }
+            outcome = finish(&mut command) => {
+                command = None;
+                if !results.report(outcome) {
+                    return;
+                }
+            }
+            outcome = finish(&mut question) => {
+                question = None;
+                if !results.report(outcome) {
+                    return;
+                }
             }
         }
     }
+}
+
+/// Where the worker reports what came of each intent, and how it tells the
+/// front end there is something new to read.
+///
+/// The telling is what lets a window sleep until there is: without it, the
+/// only way to notice a result is to keep looking.
+pub struct Results {
+    sender: Sender<Outcome>,
+    wake: Box<dyn Fn() + Send>,
+}
+
+impl Results {
+    /// Reports to `sender`, calling `wake` after each outcome is sent.
+    pub fn new(sender: Sender<Outcome>, wake: impl Fn() + Send + 'static) -> Self {
+        Self {
+            sender,
+            wake: Box::new(wake),
+        }
+    }
+
+    /// Sends `outcome` and wakes the front end, or returns false if there is
+    /// no front end left to send it to.
+    fn report(&self, outcome: Outcome) -> bool {
+        if self.sender.send(outcome).is_err() {
+            return false;
+        }
+        (self.wake)();
+        true
+    }
+}
+
+/// Something sent to the camera whose outcome hasn't come back yet.
+type Pending<'a> = Pin<Box<dyn Future<Output = Outcome> + 'a>>;
+
+/// Waits for `pending` to come back, or forever if nothing is.
+async fn finish(pending: &mut Option<Pending<'_>>) -> Outcome {
+    match pending {
+        Some(pending) => pending.await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Sends what `intent` asks for and reports how it went, giving up once the
+/// operator has waited for it as long as it deserves.
+async fn dispatch(camera: &impl Wire, intent: Intent) -> Outcome {
+    let result = match intent {
+        Intent::DrivePanTilt(velocity) => match pan_tilt::drive(velocity) {
+            Ok(command) => within(wire::AT_HAND, wire::execute(camera, command)).await,
+            Err(error) => Err(error),
+        },
+        Intent::Nudge(step) => match nudge::nudge(step) {
+            Some(command) => within(wire::AT_HAND, wire::execute(camera, command)).await,
+            None => Ok(()),
+        },
+        Intent::DriveZoom(drive) => {
+            within(
+                wire::AT_HAND,
+                wire::execute(camera, zoom::drive_zoom(drive)),
+            )
+            .await
+        }
+        Intent::DriveFocus(drive) => {
+            within(
+                wire::AT_HAND,
+                wire::execute(camera, focus::drive_focus(drive)),
+            )
+            .await
+        }
+        Intent::SetAutoFocus(auto) => {
+            within(
+                wire::AT_HAND,
+                wire::execute(camera, focus::set_auto_focus(auto)),
+            )
+            .await
+        }
+        Intent::RecallPreset(number) => match Memory::new(preset::Action::Recall, number) {
+            Ok(command) => within(wire::ONE_OFF, wire::execute(camera, command)).await,
+            Err(error) => Err(error),
+        },
+        Intent::SavePreset(number) => match Memory::new(preset::Action::Save, number) {
+            Ok(command) => within(wire::ONE_OFF, wire::execute(camera, command)).await,
+            Err(error) => Err(error),
+        },
+        Intent::Home => within(wire::ONE_OFF, wire::execute(camera, pan_tilt::HOME)).await,
+        Intent::ResetPanTilt => within(wire::ONE_OFF, wire::execute(camera, pan_tilt::RESET)).await,
+        Intent::SetPower(on) => within(wire::ONE_OFF, wire::execute(camera, Power(on))).await,
+        Intent::SetTitle(text) => {
+            within(wire::ONE_OFF, async {
+                for part in title::set_title(text) {
+                    wire::execute(camera, part).await?;
+                }
+                Ok(())
+            })
+            .await
+        }
+        Intent::ShowTitle(on) => {
+            within(wire::AT_HAND, wire::execute(camera, title::show_title(on))).await
+        }
+        Intent::QueryState => return Outcome::State(state::query_state(camera).await),
+    };
+    Outcome::Done(intent, result)
+}
+
+/// `sending`, given up on as unanswered after `patience`.
+async fn within(
+    patience: Duration,
+    sending: impl Future<Output = Result<(), Error>>,
+) -> Result<(), Error> {
+    tokio::time::timeout(patience, sending)
+        .await
+        .unwrap_or(Err(Error::Timeout))
 }
 
 /// Sends `stop` and waits briefly for the camera to answer it.
@@ -300,15 +565,68 @@ pub fn stop_and_confirm(intents: &Sender<Intent>, results: &Receiver<Outcome>, s
 #[cfg(test)]
 mod tests {
     use super::*;
-    use grafton_visca::testing::testkit::{ScriptedBlockingTransport, helpers};
-    use std::sync::mpsc::channel;
+    use crate::wire::scripted::{self, ScriptedCamera, done, done_in, power, silence, taken};
+    use grafton_visca::testing::testkit::Step as Scripted;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+        mpsc::channel,
+    };
 
-    fn scripted_camera(
-        replies: Vec<grafton_visca::testing::testkit::Step>,
-    ) -> BlockingClient<GenericVisca, ScriptedBlockingTransport> {
-        grafton_visca::CameraBuilder::new()
-            .build_blocking::<GenericVisca, _>(ScriptedBlockingTransport::new(replies))
-            .expect("camera should build from a scripted transport")
+    /// Runs `intents` against a camera replying as `script` says, with the
+    /// front end gone once they're sent, and returns what came of them.
+    async fn outcomes(script: Vec<Scripted>, intents: &[Intent]) -> Vec<Outcome> {
+        let (camera, _) = scripted::camera(script).await;
+        let (results, outcomes) = channel();
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let woken = wakes.clone();
+        let results = Results::new(results, move || {
+            woken.fetch_add(1, Ordering::Relaxed);
+        });
+        let (sender, receiver) = unbounded_channel();
+        for intent in intents {
+            sender.send(*intent).unwrap();
+        }
+        drop(sender);
+        run(&camera, receiver, &results).await;
+        let outcomes: Vec<_> = outcomes.try_iter().collect();
+        // Every outcome is one a front end waiting to be told would miss.
+        assert_eq!(
+            wakes.load(Ordering::Relaxed),
+            outcomes.len(),
+            "each outcome should wake the front end once"
+        );
+        outcomes
+    }
+
+    /// A worker running against `camera` for as long as the test needs it,
+    /// and the two ends a front end would hold.
+    struct Running {
+        intents: tokio::sync::mpsc::UnboundedSender<Intent>,
+        results: Receiver<Outcome>,
+    }
+
+    impl Running {
+        fn start(camera: ScriptedCamera) -> Self {
+            let (intents, receiver) = unbounded_channel();
+            let (results, outcomes) = channel();
+            let results = Results::new(results, || {});
+            tokio::task::spawn_local(async move { run(&camera, receiver, &results).await });
+            Self {
+                intents,
+                results: outcomes,
+            }
+        }
+
+        /// The next outcome, waiting for it as a front end would.
+        async fn next(&self) -> Outcome {
+            loop {
+                if let Ok(outcome) = self.results.try_recv() {
+                    return outcome;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        }
     }
 
     fn zoom_in() -> ZoomDrive {
@@ -326,56 +644,41 @@ mod tests {
         Intent::DrivePanTilt(pan_tilt::velocity_from_axes(-1.0, 0.0))
     }
 
-    #[test]
-    fn run_dispatches_each_intent_and_reports_its_result() {
-        let camera = scripted_camera(vec![
-            helpers::standard_command_response(1), // preset recall
-            helpers::standard_command_response(1), // zoom drive
-        ]);
+    #[tokio::test]
+    async fn run_dispatches_each_intent_and_reports_its_result() {
+        let outcomes = outcomes(
+            vec![done(), done()],
+            &[Intent::RecallPreset(1), Intent::DriveZoom(Some(zoom_in()))],
+        )
+        .await;
 
-        let (intent_tx, intent_rx) = channel();
-        let (result_tx, result_rx) = channel();
-
-        intent_tx.send(Intent::RecallPreset(1)).unwrap();
-        intent_tx.send(Intent::DriveZoom(Some(zoom_in()))).unwrap();
-        drop(intent_tx);
-
-        run(&camera, &intent_rx, &result_tx);
-
-        assert!(
-            matches!(result_rx.recv().unwrap(), Outcome::Done(_, Ok(()))),
-            "preset recall should succeed"
-        );
-        assert!(
-            matches!(result_rx.recv().unwrap(), Outcome::Done(_, Ok(()))),
-            "zoom drive should succeed"
-        );
-        assert!(result_rx.try_recv().is_err(), "no further results expected");
+        assert!(matches!(
+            outcomes[..],
+            [
+                Outcome::Done(Intent::RecallPreset(1), Ok(())),
+                Outcome::Done(Intent::DriveZoom(_), Ok(()))
+            ]
+        ));
     }
 
-    #[test]
-    fn run_reports_command_errors_without_stopping() {
-        let camera = scripted_camera(vec![
-            helpers::errors::syntax_error(1),
-            helpers::standard_command_response(1),
-        ]);
-
-        let (intent_tx, intent_rx) = channel();
-        let (result_tx, result_rx) = channel();
-
-        intent_tx.send(Intent::RecallPreset(1)).unwrap();
-        intent_tx.send(Intent::RecallPreset(2)).unwrap();
-        drop(intent_tx);
-
-        run(&camera, &intent_rx, &result_tx);
+    #[tokio::test]
+    async fn run_reports_command_errors_without_stopping() {
+        let syntax_error = Scripted::OnSend {
+            matches: None,
+            responses: vec![vec![0x90, 0x60, 0x02, 0xFF]],
+        };
+        let outcomes = outcomes(
+            vec![syntax_error, done()],
+            &[Intent::RecallPreset(1), Intent::RecallPreset(2)],
+        )
+        .await;
 
         assert!(
-            matches!(result_rx.recv().unwrap(), Outcome::Done(_, Err(_))),
-            "first command was scripted to fail"
-        );
-        assert!(
-            matches!(result_rx.recv().unwrap(), Outcome::Done(_, Ok(()))),
-            "second command should still run"
+            matches!(
+                outcomes[..],
+                [Outcome::Done(_, Err(_)), Outcome::Done(_, Ok(()))]
+            ),
+            "the first was refused and the second still sent: {outcomes:?}"
         );
     }
 
@@ -407,50 +710,110 @@ mod tests {
         );
     }
 
-    #[test]
-    fn run_sends_only_the_last_of_a_queued_run_of_drive_commands() {
+    #[tokio::test]
+    async fn run_sends_only_the_last_of_a_queued_run_of_drive_commands() {
         // A single scripted reply, so a second drive command reaching the
-        // camera would fail rather than silently pass.
-        let camera = scripted_camera(vec![helpers::standard_command_response(1)]);
-
-        let (intent_tx, intent_rx) = channel();
-        let (result_tx, result_rx) = channel();
-
-        intent_tx.send(drive_right()).unwrap();
-        intent_tx.send(drive_left()).unwrap();
-        intent_tx
-            .send(Intent::DrivePanTilt(Velocity::STOP))
-            .unwrap();
-        drop(intent_tx);
-
-        run(&camera, &intent_rx, &result_tx);
+        // camera would go unanswered rather than silently pass.
+        let outcomes = outcomes(
+            vec![done()],
+            &[
+                drive_right(),
+                drive_left(),
+                Intent::DrivePanTilt(Velocity::STOP),
+            ],
+        )
+        .await;
 
         assert!(
             matches!(
-                result_rx.recv().unwrap(),
-                Outcome::Done(Intent::DrivePanTilt(velocity), Ok(())) if velocity.is_stop()
+                outcomes[..],
+                [Outcome::Done(Intent::DrivePanTilt(velocity), Ok(()))] if velocity.is_stop()
             ),
-            "only the stop should have been sent"
+            "only the stop should have been sent: {outcomes:?}"
         );
-        assert!(result_rx.try_recv().is_err(), "no further results expected");
     }
 
-    #[test]
-    fn query_state_intent_reports_state() {
-        let camera = scripted_camera(vec![
-            helpers::power_inquiry_response(true),
-            helpers::errors::syntax_error(1), // next inquiry: fine to fail, we just want Outcome::State
-        ]);
+    #[tokio::test]
+    async fn a_command_never_waits_for_a_question_the_camera_leaves_unanswered() {
+        // The whole point of the second lane: the camera saying nothing about
+        // its state costs the operator nothing.
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (camera, _) = scripted::camera(vec![silence(), done()]).await;
+                let worker = Running::start(camera);
 
-        let (intent_tx, intent_rx) = channel();
-        let (result_tx, result_rx) = channel();
+                worker.intents.send(Intent::QueryState).unwrap();
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                let started = Instant::now();
+                worker.intents.send(drive_right()).unwrap();
 
-        intent_tx.send(Intent::QueryState).unwrap();
-        drop(intent_tx);
+                assert!(matches!(
+                    worker.next().await,
+                    Outcome::Done(Intent::DrivePanTilt(_), Ok(()))
+                ));
+                assert!(
+                    started.elapsed() < Duration::from_millis(100),
+                    "the drive waited {:?}",
+                    started.elapsed()
+                );
+            })
+            .await;
+    }
 
-        run(&camera, &intent_rx, &result_tx);
+    #[tokio::test]
+    async fn a_step_whose_finish_never_comes_does_not_hold_up_the_stop_behind_it() {
+        // The hang as it was met: the camera takes a step and never says it
+        // has finished. Everything after it used to wait half a minute, and
+        // every tap made in the meantime queued up behind it.
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                // The stop in the camera's other socket, since as far as it
+                // knows the first is still busy with the step.
+                let (camera, _) = scripted::camera(vec![taken(), done_in(2)]).await;
+                let worker = Running::start(camera);
+                let stop = Intent::DrivePanTilt(Velocity::STOP);
+                let started = Instant::now();
 
-        assert!(matches!(result_rx.recv().unwrap(), Outcome::State(_)));
+                worker
+                    .intents
+                    .send(Intent::Nudge(Step::towards(PanTiltDirection::Right)))
+                    .unwrap();
+                assert!(matches!(
+                    worker.next().await,
+                    Outcome::Done(Intent::Nudge(_), Err(Error::Timeout))
+                ));
+                worker.intents.send(stop).unwrap();
+                assert!(matches!(
+                    worker.next().await,
+                    Outcome::Done(answered, Ok(())) if answered == stop
+                ));
+                assert!(
+                    started.elapsed() < wire::AT_HAND * 2,
+                    "the stop got through after {:?}",
+                    started.elapsed()
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn query_state_intent_reports_state() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (camera, _) = scripted::camera(vec![power(false)]).await;
+                let worker = Running::start(camera);
+
+                worker.intents.send(Intent::QueryState).unwrap();
+
+                assert!(matches!(
+                    worker.next().await,
+                    Outcome::State(Ok(CameraState {
+                        power_on: false,
+                        ..
+                    }))
+                ));
+            })
+            .await;
     }
 
     #[test]
@@ -467,35 +830,24 @@ mod tests {
         );
     }
 
-    #[test]
-    fn run_dispatches_the_one_off_camera_commands() {
+    #[tokio::test]
+    async fn run_dispatches_the_one_off_camera_commands() {
         let intents = [
             Intent::Home,
             Intent::ResetPanTilt,
             Intent::SetPower(false),
             Intent::SetAutoFocus(true),
             Intent::Nudge(Step::towards(PanTiltDirection::Left)),
+            Intent::SavePreset(2),
+            Intent::ShowTitle(true),
         ];
-        let camera = scripted_camera(
-            intents
-                .iter()
-                .map(|_| helpers::standard_command_response(1))
-                .collect(),
-        );
+        let outcomes = outcomes(intents.iter().map(|_| done()).collect(), &intents).await;
 
-        let (intent_tx, intent_rx) = channel();
-        let (result_tx, result_rx) = channel();
-        for intent in intents {
-            intent_tx.send(intent).unwrap();
-        }
-        drop(intent_tx);
-
-        run(&camera, &intent_rx, &result_tx);
-
-        for intent in intents {
+        assert_eq!(outcomes.len(), intents.len(), "{outcomes:?}");
+        for (outcome, intent) in outcomes.iter().zip(intents) {
             assert!(
-                matches!(result_rx.recv().unwrap(), Outcome::Done(done, Ok(())) if done == intent),
-                "{} should reach the camera",
+                matches!(outcome, Outcome::Done(answered, Ok(())) if *answered == intent),
+                "{} should reach the camera: {outcome:?}",
                 describe(intent)
             );
         }
@@ -633,10 +985,23 @@ mod tests {
     fn describe_outcome_reports_a_failed_command() {
         let text = describe_outcome(&Outcome::Done(
             Intent::DriveZoom(Some(zoom_in())),
-            Err(Error::Timeout),
+            Err(Error::SyntaxError),
         ));
         assert!(text.contains("error"));
         assert!(text.contains("zoom in"));
+    }
+
+    #[test]
+    fn describe_outcome_says_an_unanswered_command_went_unanswered() {
+        // Not that it failed: the camera may have moved and only its answer
+        // gone missing.
+        assert_eq!(
+            describe_outcome(&Outcome::Done(
+                Intent::Nudge(Step::towards(PanTiltDirection::Right)),
+                Err(Error::Timeout),
+            )),
+            "no answer from the camera (step right)"
+        );
     }
 
     #[test]

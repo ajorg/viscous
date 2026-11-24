@@ -10,11 +10,8 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use grafton_visca::command::PanTiltDirection;
-
 use crate::{
     focus::FocusDrive,
-    nudge::Step,
     pan_tilt::{Velocity, velocity_from_axes},
     worker::Intent,
     zoom::ZoomDrive,
@@ -33,12 +30,28 @@ use crate::{
 /// number without changing what the key does.
 pub const KEY_DEFLECTION: f32 = 0.66;
 
-/// The fastest a key drives, which zoom and focus reach by holding shift.
-///
-/// Pan and tilt no longer have a second speed to reach: shift is what tells
-/// an arrow to drive at all rather than to step, so it has no room left to
-/// also mean "faster". The pad and the stick still cover the whole range.
+/// The fastest a zoom or focus key drives, which shift reaches.
 pub const FAST_KEY_DEFLECTION: f32 = 1.0;
+
+/// How far an arrow deflects pan or tilt: just past the deadzone, into the
+/// camera's slowest speed.
+///
+/// The arrows are the fine control. A tap is a hair of movement and holding
+/// one creeps, which no other control does: the pad and the stick have the
+/// whole range for anything faster. Shift takes an arrow up to
+/// [`KEY_DEFLECTION`]'s framing pace rather than to the top speed, which on a
+/// key, with no way to ease off it, sweeps past anything worth looking at.
+pub const ARROW_DEFLECTION: f32 = 0.12;
+
+/// The pan/tilt and the zoom/focus deflections a key asks for, with or without
+/// shift.
+pub fn key_deflections(shift: bool) -> (f32, f32) {
+    if shift {
+        (KEY_DEFLECTION, FAST_KEY_DEFLECTION)
+    } else {
+        (ARROW_DEFLECTION, KEY_DEFLECTION)
+    }
+}
 
 /// A camera drive that runs for as long as its key is held down.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -109,19 +122,9 @@ pub enum Action {
 /// the caller — which knows what's currently being driven — can say what a
 /// release of it should do.
 pub fn map_key(key: KeyEvent) -> Option<Action> {
-    let deflection = if key.modifiers.contains(KeyModifiers::SHIFT) {
-        FAST_KEY_DEFLECTION
-    } else {
-        KEY_DEFLECTION
-    };
-    // Always the framing pace: shift is spent telling the arrow to drive
-    // instead of stepping, so there is no second pan/tilt speed for it to
-    // also ask for.
+    let (aim, deflection) = key_deflections(key.modifiers.contains(KeyModifiers::SHIFT));
     let pan_tilt = |pan: f32, tilt: f32| {
-        Action::Hold(Hold::PanTilt(velocity_from_axes(
-            pan * KEY_DEFLECTION,
-            tilt * KEY_DEFLECTION,
-        )))
+        Action::Hold(Hold::PanTilt(velocity_from_axes(pan * aim, tilt * aim)))
     };
     // Both key deflections are well past the rocker's deadzone, so there is
     // always a drive to be had from one.
@@ -137,24 +140,13 @@ pub fn map_key(key: KeyEvent) -> Option<Action> {
         ))
     };
 
-    let step = |direction| Action::Camera(Intent::Nudge(Step::towards(direction)));
-    let shifted = key.modifiers.contains(KeyModifiers::SHIFT);
-
     let action = match key.code {
-        // Tapped, an arrow steps the camera one unit; held with shift it
-        // drives. Two gestures on one key, kept apart by the modifier rather
-        // than by how long the key was down: a control that has to be timed
-        // right is the wrong one to put precision on, and the pad and the
-        // stick already drive without needing the keyboard's help.
-        KeyCode::Up if shifted => pan_tilt(0.0, 1.0),
-        KeyCode::Down if shifted => pan_tilt(0.0, -1.0),
-        KeyCode::Left if shifted => pan_tilt(-1.0, 0.0),
-        KeyCode::Right if shifted => pan_tilt(1.0, 0.0),
-
-        KeyCode::Up => step(PanTiltDirection::Up),
-        KeyCode::Down => step(PanTiltDirection::Down),
-        KeyCode::Left => step(PanTiltDirection::Left),
-        KeyCode::Right => step(PanTiltDirection::Right),
+        // Held, like every other movement key, and faster with shift; but
+        // slow to start with, since the arrows are the fine control.
+        KeyCode::Up => pan_tilt(0.0, 1.0),
+        KeyCode::Down => pan_tilt(0.0, -1.0),
+        KeyCode::Left => pan_tilt(-1.0, 0.0),
+        KeyCode::Right => pan_tilt(1.0, 0.0),
 
         KeyCode::Char('[') | KeyCode::Char('-') => zoom(-1.0, deflection),
         KeyCode::Char(']') | KeyCode::Char('=') => zoom(1.0, deflection),
@@ -211,61 +203,49 @@ mod tests {
         }
     }
 
-    /// The step an arrow key asks for on its own.
-    fn stepped(code: KeyCode) -> Step {
-        match map_key(press(code, KeyModifiers::NONE)) {
-            Some(Action::Camera(Intent::Nudge(step))) => step,
-            other => panic!("expected a step, got {other:?}"),
+    #[test]
+    fn an_arrow_holds_a_drive_in_its_own_direction_with_or_without_shift() {
+        for modifiers in [KeyModifiers::NONE, KeyModifiers::SHIFT] {
+            for (code, direction) in [
+                (KeyCode::Up, PanTiltDirection::Up),
+                (KeyCode::Down, PanTiltDirection::Down),
+                (KeyCode::Left, PanTiltDirection::Left),
+                (KeyCode::Right, PanTiltDirection::Right),
+            ] {
+                assert_eq!(held_velocity(code, modifiers).direction, direction);
+            }
         }
     }
 
     #[test]
-    fn an_arrow_on_its_own_steps_the_way_it_points() {
-        assert_eq!(stepped(KeyCode::Up), Step::towards(PanTiltDirection::Up));
-        assert_eq!(
-            stepped(KeyCode::Down),
-            Step::towards(PanTiltDirection::Down)
-        );
-        assert_eq!(
-            stepped(KeyCode::Left),
-            Step::towards(PanTiltDirection::Left)
-        );
-        assert_eq!(
-            stepped(KeyCode::Right),
-            Step::towards(PanTiltDirection::Right)
-        );
-    }
-
-    #[test]
-    fn shift_and_an_arrow_hold_a_drive_in_their_own_direction() {
-        assert_eq!(
-            held_velocity(KeyCode::Up, KeyModifiers::SHIFT).direction,
-            PanTiltDirection::Up
-        );
-        assert_eq!(
-            held_velocity(KeyCode::Down, KeyModifiers::SHIFT).direction,
-            PanTiltDirection::Down
-        );
-        assert_eq!(
-            held_velocity(KeyCode::Left, KeyModifiers::SHIFT).direction,
-            PanTiltDirection::Left
-        );
-        assert_eq!(
-            held_velocity(KeyCode::Right, KeyModifiers::SHIFT).direction,
-            PanTiltDirection::Right
-        );
+    fn an_arrow_creeps_at_the_slowest_speed_the_camera_has() {
+        // The arrows are the fine control. Where the bands fall decides what a
+        // given deflection comes out as, and this keeps `ARROW_DEFLECTION`
+        // honest about the speed it was picked for.
+        let plain = held_velocity(KeyCode::Right, KeyModifiers::NONE);
+        assert_eq!(plain.pan_speed, 1);
+        assert_eq!(held_velocity(KeyCode::Up, KeyModifiers::NONE).tilt_speed, 1);
     }
 
     #[test]
     fn a_shifted_arrow_drives_slowly_enough_to_frame_with() {
-        // A key has no travel to feel its way along, so it has to land on a
-        // usable pace by itself: fast enough to get somewhere, slow enough to
-        // follow something with. Where the bands fall decides what a given
-        // deflection comes out as, and this keeps `KEY_DEFLECTION` honest
-        // about the speed it was picked for.
-        let driven = held_velocity(KeyCode::Right, KeyModifiers::SHIFT).pan_speed;
+        // A key has no travel to ease off along, so its fast speed has to be
+        // one a shot can still be followed at, not the top of the range.
+        let shifted = held_velocity(KeyCode::Right, KeyModifiers::SHIFT).pan_speed;
 
-        assert_eq!(driven, 5, "a driving arrow should be a framing pace");
+        assert_eq!(shifted, 5, "a shifted arrow should be a framing pace");
+    }
+
+    #[test]
+    fn shift_drives_an_arrow_faster_as_it_does_every_movement_key() {
+        for code in [KeyCode::Up, KeyCode::Right] {
+            let plain = held_velocity(code, KeyModifiers::NONE);
+            let shifted = held_velocity(code, KeyModifiers::SHIFT);
+            assert!(
+                shifted.pan_speed.max(shifted.tilt_speed) > plain.pan_speed.max(plain.tilt_speed),
+                "{code:?}: {plain:?} then {shifted:?}"
+            );
+        }
     }
 
     /// Which way a key drives zoom, and how fast.

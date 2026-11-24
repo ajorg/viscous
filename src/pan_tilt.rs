@@ -12,10 +12,8 @@
 use std::{ops::RangeInclusive, sync::OnceLock};
 
 use grafton_visca::{
-    BlockingClient, Error,
-    camera::profiles::GenericVisca,
-    command::PanTiltDirection,
-    transport::{BlockingTransport, HasTransportConfig},
+    Error,
+    command::{PanTilt, PanTiltDirection},
     types::{PanSpeed, TiltSpeed},
 };
 use serde::{Deserialize, Serialize};
@@ -508,56 +506,41 @@ pub fn velocity_from_axes(pan: f32, tilt: f32) -> Velocity {
     )
 }
 
-/// Sets the camera's continuous pan/tilt drive, or stops it.
+/// The command that sets the camera's continuous pan/tilt drive, or stops it.
 ///
-/// A stop goes out as a drive in the `Stop` direction rather than through the
-/// library's dedicated stop call, because that is the same command with the
-/// same bytes — one code path covers both.
-pub fn drive<T>(camera: &BlockingClient<GenericVisca, T>, velocity: Velocity) -> Result<(), Error>
-where
-    T: BlockingTransport + HasTransportConfig + 'static,
-{
-    camera.pan_tilt_move(
-        velocity.direction,
-        PanSpeed::new(velocity.pan_speed)?,
-        TiltSpeed::new(velocity.tilt_speed)?,
-    )
+/// A stop goes out as a drive in the `Stop` direction rather than as the
+/// library's dedicated stop, because that is the same command with the same
+/// bytes — one code path covers both.
+pub fn drive(velocity: Velocity) -> Result<PanTilt, Error> {
+    Ok(PanTilt::Move {
+        direction: velocity.direction,
+        pan_speed: PanSpeed::new(velocity.pan_speed)?,
+        tilt_speed: TiltSpeed::new(velocity.tilt_speed)?,
+    })
 }
 
-/// Sends the camera to its home position.
-pub fn home<T>(camera: &BlockingClient<GenericVisca, T>) -> Result<(), Error>
-where
-    T: BlockingTransport + HasTransportConfig + 'static,
-{
-    camera.pan_tilt_home()
-}
+/// The command that sends the camera to its home position.
+pub const HOME: PanTilt = PanTilt::Home;
 
-/// Recalibrates the pan/tilt mechanism, ending at the home position.
+/// The command that recalibrates the pan/tilt mechanism, ending at home.
 ///
-/// Worth having next to [`home`], which it otherwise looks like: a camera
+/// Worth having next to [`HOME`], which it otherwise looks like: a camera
 /// that has been turned by hand, or has lost steps against an obstruction,
 /// answers position inquiries with numbers that no longer match where it is
 /// actually pointing — and every saved preset is expressed in those numbers.
 /// The reset re-finds the mechanical limits and re-zeroes them, at the cost
 /// of a full sweep to get there.
-pub fn reset<T>(camera: &BlockingClient<GenericVisca, T>) -> Result<(), Error>
-where
-    T: BlockingTransport + HasTransportConfig + 'static,
-{
-    camera.pan_tilt_reset()
-}
+pub const RESET: PanTilt = PanTilt::Reset;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use grafton_visca::testing::testkit::{ScriptedBlockingTransport, helpers};
+    use crate::wire::encoded;
 
     #[test]
-    fn home_and_reset_each_reach_the_camera() {
-        let acks = || scripted_camera(vec![helpers::standard_command_response(1)]);
-
-        home(&acks()).expect("scripted camera should ack home");
-        reset(&acks()).expect("scripted camera should ack reset");
+    fn home_and_reset_are_the_camera_commands_of_those_names() {
+        assert_eq!(encoded(&HOME), [0x81, 0x01, 0x06, 0x04, 0xFF]);
+        assert_eq!(encoded(&RESET), [0x81, 0x01, 0x06, 0x05, 0xFF]);
     }
 
     /// What a speed is worth, relative to the slowest, on the [`STEP`] model.
@@ -979,34 +962,40 @@ mod tests {
         assert_eq!(velocity_from_axes(3.0, 0.0).pan_speed, *pan_speeds().end());
     }
 
-    fn scripted_camera(
-        replies: Vec<grafton_visca::testing::testkit::Step>,
-    ) -> BlockingClient<GenericVisca, ScriptedBlockingTransport> {
-        grafton_visca::CameraBuilder::new()
-            .build_blocking::<GenericVisca, _>(ScriptedBlockingTransport::new(replies))
-            .expect("camera should build from a scripted transport")
+    #[test]
+    fn a_drive_goes_out_as_a_move_at_its_speeds() {
+        let velocity = velocity_from_axes(1.0, 1.0);
+        let sent = encoded(&drive(velocity).expect("a velocity from axes is in range"));
+
+        // 81 01 06 01 VV WW 03 01 FF: up-right at pan speed VV, tilt WW.
+        assert_eq!(
+            sent,
+            [
+                0x81,
+                0x01,
+                0x06,
+                0x01,
+                velocity.pan_speed,
+                velocity.tilt_speed,
+                0x02,
+                0x01,
+                0xFF
+            ]
+        );
     }
 
     #[test]
-    fn drive_sends_a_move_command() {
-        let camera = scripted_camera(vec![helpers::standard_command_response(1)]);
-        drive(&camera, velocity_from_axes(1.0, 1.0))
-            .expect("scripted camera should ack and complete the drive");
-    }
-
-    #[test]
-    fn drive_sends_a_stop_command() {
-        let camera = scripted_camera(vec![helpers::standard_command_response(1)]);
-        drive(&camera, Velocity::STOP).expect("scripted camera should ack and complete the stop");
+    fn a_stop_goes_out_as_a_move_that_stops_both_axes() {
+        let sent = encoded(&drive(Velocity::STOP).expect("stop is in range"));
+        assert_eq!(sent[6..8], [0x03, 0x03]);
     }
 
     #[test]
     fn drive_reports_an_out_of_range_speed_rather_than_sending_it() {
-        let camera = scripted_camera(vec![]);
         let too_fast = Velocity {
             pan_speed: MAX_PAN_SPEED + 1,
             ..velocity_from_axes(1.0, 0.0)
         };
-        assert!(drive(&camera, too_fast).is_err());
+        assert!(drive(too_fast).is_err());
     }
 }

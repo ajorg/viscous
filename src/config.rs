@@ -154,12 +154,44 @@ pub fn load(path: &Path) -> Result<Config, ConfigError> {
 }
 
 /// Saves the config to `path`, creating its parent directory if needed.
+///
+/// Any setting already in the file that this build doesn't know is kept as
+/// it was. The file is shared by every build that runs on this machine, older
+/// and newer, and a build that wrote back only what it understood would wipe
+/// a newer build's settings just by being run to compare against it.
 pub fn save(config: &Config, path: &Path) -> Result<(), ConfigError> {
-    let contents = toml::to_string_pretty(config).map_err(ConfigError::Serialize)?;
+    // Through text rather than `Table::try_from`, which refuses the preset
+    // and title maps: their keys are numbers, which only the text serializer
+    // knows to write as TOML's string keys.
+    let mut table: toml::Table = toml::to_string(config)
+        .map_err(ConfigError::Serialize)?
+        .parse()
+        .map_err(ConfigError::Parse)?;
+    for (key, value) in settings_unknown_to(&table, path) {
+        table.insert(key, value);
+    }
+    let contents = toml::to_string_pretty(&table).map_err(ConfigError::Serialize)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(ConfigError::Write)?;
     }
     fs::write(path, contents).map_err(ConfigError::Write)
+}
+
+/// The top-level settings in the file at `path` that `known` has no key for.
+///
+/// Nothing, if the file is missing or isn't TOML. There is nothing there to
+/// keep, and a save is the way such a file gets mended.
+fn settings_unknown_to(known: &toml::Table, path: &Path) -> Vec<(String, toml::Value)> {
+    let Ok(existing) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let Ok(existing) = existing.parse::<toml::Table>() else {
+        return Vec::new();
+    };
+    existing
+        .into_iter()
+        .filter(|(key, _)| !known.contains_key(key))
+        .collect()
 }
 
 #[cfg(test)]
@@ -269,6 +301,74 @@ mod tests {
         let kept = load(&path).expect("what was saved should load");
         let _ = fs::remove_file(&path);
         assert_eq!(kept, asked);
+    }
+
+    #[test]
+    fn a_setting_from_a_newer_build_survives_a_save_by_this_one() {
+        let path = test_path("unknown-settings");
+        fs::write(
+            &path,
+            "camera = \"COM4\"\nfuture_knob = 3\n\n[presets]\n1 = \"wide shot\"\n\n\
+             [future_table]\nanswer = \"kept\"\n",
+        )
+        .expect("write should succeed");
+
+        let mut config = load(&path).expect("unknown settings should not stop a load");
+        config.presets.insert(2, "podium".to_string());
+        save(&config, &path).expect("save should succeed");
+
+        let written = fs::read_to_string(&path).expect("the saved file should read back");
+        let reloaded = load(&path).expect("what was saved should load");
+        let _ = fs::remove_file(&path);
+
+        let table: toml::Table = written.parse().expect("the saved file should be TOML");
+        assert_eq!(table["future_knob"].as_integer(), Some(3), "{written}");
+        assert_eq!(table["future_table"]["answer"].as_str(), Some("kept"));
+        assert_eq!(reloaded, config, "and what this build knows still saves");
+    }
+
+    #[test]
+    fn a_setting_this_build_knows_is_written_from_the_config_not_the_old_file() {
+        // Keeping unknown settings mustn't turn into keeping stale known ones:
+        // a preset deleted in the window has to stay deleted.
+        let path = test_path("known-settings");
+        fs::write(
+            &path,
+            "speed_lines = true\n\n[presets]\n1 = \"wide shot\"\n",
+        )
+        .expect("write should succeed");
+
+        save(&Config::default(), &path).expect("save should succeed");
+        let reloaded = load(&path).expect("what was saved should load");
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(reloaded, Config::default());
+    }
+
+    #[test]
+    fn saving_keeps_the_order_settings_are_declared_in() {
+        let path = test_path("order");
+        let _ = fs::remove_file(&path);
+
+        save(&Config::default(), &path).expect("save should succeed");
+        let written = fs::read_to_string(&path).expect("the saved file should read back");
+        let _ = fs::remove_file(&path);
+
+        let keys: Vec<_> = written
+            .lines()
+            .filter_map(|line| line.split_once(" = ").map(|(key, _)| key))
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                "speed_lines",
+                "pad_layout",
+                "pan_top_speed",
+                "tilt_top_speed",
+                "zoom_top_speed",
+                "focus_top_speed"
+            ]
+        );
     }
 
     #[test]

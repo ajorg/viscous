@@ -10,6 +10,12 @@
 //! the operating system hands its state to whoever asks, so what reaches this
 //! window doesn't depend on which window is in front.
 
+use std::{
+    sync::{Arc, Mutex, PoisonError, mpsc},
+    thread,
+    time::Duration,
+};
+
 use gilrs::{Axis, Button, Gilrs};
 use viscous::gamepad::{Buttons, Pad};
 
@@ -21,30 +27,68 @@ pub trait Controller {
     fn poll(&mut self) -> Option<Pad>;
 }
 
-/// The controllers plugged into this machine.
-pub struct Attached(Gilrs);
+/// The controllers plugged into this machine, watched from a thread of their
+/// own.
+///
+/// A window only runs when it draws, and nothing about a stick moving makes it
+/// draw. Rather than drawing on a timer just to look, the watching thread waits
+/// for the controller to say something and wakes the window when it does.
+pub struct Attached {
+    latest: Arc<Mutex<Option<Pad>>>,
+}
+
+/// How long the watching thread waits for an event before looking anyway. A
+/// backstop only: events are what normally wake it.
+const STILL_THERE: Duration = Duration::from_secs(1);
 
 impl Attached {
-    /// Starts watching for controllers, or reports that this platform has no
-    /// way to — in which case the window simply has no controller in it, which
-    /// is what a machine without one looks like anyway.
+    /// Starts watching for controllers, calling `wake` whenever what they
+    /// report changes — or reports that this platform has no way to watch, in
+    /// which case the window simply has no controller in it, which is what a
+    /// machine without one looks like anyway.
     ///
     /// Called once, before any controller is plugged in: they are noticed as
     /// they arrive, so the one found in a drawer mid-service still works.
-    pub fn open() -> Option<Self> {
-        Gilrs::new().ok().map(Self)
+    pub fn open(wake: impl Fn() + Send + 'static) -> Option<Self> {
+        let latest = Arc::new(Mutex::new(None));
+        let shared = latest.clone();
+        let (opened, watching) = mpsc::channel();
+        thread::Builder::new()
+            .name("controller".to_string())
+            .spawn(move || {
+                // Made here rather than handed over: nothing promises a
+                // controller handle can move between threads.
+                let Ok(mut gilrs) = Gilrs::new() else {
+                    let _ = opened.send(false);
+                    return;
+                };
+                let _ = opened.send(true);
+                let mut last = None;
+                loop {
+                    // Draining the queue is what brings the remembered state
+                    // up to date; the events themselves say what changed,
+                    // which is a question this program never has to ask.
+                    let _ = gilrs.next_event_blocking(Some(STILL_THERE));
+                    while gilrs.next_event().is_some() {}
+                    // The first controller connected, of however many: this
+                    // window drives one camera, and a second stick on it
+                    // would only fight the first.
+                    let now = gilrs.gamepads().next().map(|(_, pad)| read(&pad));
+                    if now != last {
+                        last = now;
+                        *shared.lock().unwrap_or_else(PoisonError::into_inner) = now;
+                        wake();
+                    }
+                }
+            })
+            .ok()?;
+        watching.recv().ok()?.then_some(Self { latest })
     }
 }
 
 impl Controller for Attached {
     fn poll(&mut self) -> Option<Pad> {
-        // Draining the event queue is what brings the remembered state up to
-        // date; the events themselves say what changed, which is a question
-        // this program never has to ask.
-        while self.0.next_event().is_some() {}
-        // The first controller connected, of however many: this window drives
-        // one camera, and a second stick on it would only fight the first.
-        self.0.gamepads().next().map(|(_, pad)| read(&pad))
+        *self.latest.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 

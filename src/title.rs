@@ -12,12 +12,9 @@ use std::fmt;
 use std::time::Duration;
 
 use grafton_visca::{
-    BlockingClient, CameraId, Error,
-    camera::profiles::GenericVisca,
+    CameraId, Error,
     command::{CommandBehavior, InquiryResponseSpec, ViscaCommand},
-    mode::BlockingFutureExt,
-    timeout::{CommandCategory, Deadline},
-    transport::{BlockingTransport, HasTransportConfig},
+    timeout::CommandCategory,
 };
 
 /// How many characters a title holds. Shorter ones are padded out with
@@ -131,7 +128,8 @@ pub fn decode(codes: &[u8]) -> String {
 }
 
 /// One `CAM_Title` message: where the title goes, or ten of its characters.
-struct TitleSet {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TitleSet {
     /// 0x00 for the appearance, 0x01 for the first ten characters, 0x02 for
     /// the last ten.
     part: u8,
@@ -157,7 +155,8 @@ impl ViscaCommand for TitleSet {
 
 /// The `CAM_Title` message that shows, hides or clears whatever title the
 /// camera is holding.
-struct TitleDisplay(u8);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TitleDisplay(u8);
 
 impl ViscaCommand for TitleDisplay {
     const MAX_SIZE: usize = 6;
@@ -182,7 +181,7 @@ impl ViscaCommand for TitleDisplay {
 /// going to say it in sixty. Running out of time here is not an answer either
 /// way, and costs nothing but a title command sent to a camera that may refuse
 /// it once.
-const ANSWER_TIME: Duration = Duration::from_secs(2);
+pub const ANSWER_TIME: Duration = Duration::from_secs(2);
 
 /// `CAM_TitleDisplayModeInq`, which asks whether the title is currently
 /// showing — and, in doing so, whether there is such a thing as a title here
@@ -193,7 +192,8 @@ const ANSWER_TIME: Duration = Duration::from_secs(2);
 /// commands because an inquiry changes nothing — a camera that does have the
 /// feature comes through this with whatever title it was holding intact,
 /// where clearing one to find out would have thrown it away.
-struct TitleDisplayInquiry;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TitleDisplayInquiry;
 
 impl ViscaCommand for TitleDisplayInquiry {
     const MAX_SIZE: usize = 5;
@@ -229,24 +229,17 @@ impl ViscaCommand for TitleDisplayInquiry {
 /// feature is absent rather than momentarily unavailable. Anything else, a
 /// camera that is asleep or busy or silent included, counts as having titles,
 /// because none of those are the camera saying it hasn't.
-pub fn supported<T>(camera: &BlockingClient<GenericVisca, T>) -> bool
-where
-    T: BlockingTransport + HasTransportConfig + 'static,
-{
-    let answer = camera
-        .send_command_with_deadline(&TitleDisplayInquiry, Deadline::from_timeout(ANSWER_TIME))
-        .block();
+///
+/// `answer` is how the camera answered [`TitleDisplayInquiry`].
+pub fn supported<T>(answer: &Result<T, Error>) -> bool {
     !matches!(answer, Err(Error::SyntaxError))
 }
 
-/// Gives the camera a title to hold, without showing it.
+/// The commands that give the camera a title to hold, without showing it.
 ///
 /// Three messages, because that's how the camera takes one: its appearance,
 /// then its characters ten at a time.
-pub fn set_title<T>(camera: &BlockingClient<GenericVisca, T>, title: Title) -> Result<(), Error>
-where
-    T: BlockingTransport + HasTransportConfig + 'static,
-{
+pub fn set_title(title: Title) -> [TitleSet; 3] {
     let mut appearance = [0x00; 10];
     appearance[..4].copy_from_slice(&APPEARANCE);
 
@@ -254,45 +247,23 @@ where
     let half = |characters: &[u8]| {
         <[u8; 10]>::try_from(characters).expect("a title splits into two halves of ten")
     };
-    for (part, payload) in [
+    [
         (0x00, appearance),
         (0x01, half(first)),
         (0x02, half(second)),
-    ] {
-        camera.execute(TitleSet { part, payload })?;
-    }
-    Ok(())
+    ]
+    .map(|(part, payload)| TitleSet { part, payload })
 }
 
-/// Shows the title the camera is holding, or hides it again.
-pub fn show_title<T>(camera: &BlockingClient<GenericVisca, T>, on: bool) -> Result<(), Error>
-where
-    T: BlockingTransport + HasTransportConfig + 'static,
-{
-    camera.execute(TitleDisplay(if on { 0x02 } else { 0x03 }))
+/// The command that shows the title the camera is holding, or hides it.
+pub fn show_title(on: bool) -> TitleDisplay {
+    TitleDisplay(if on { 0x02 } else { 0x03 })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use grafton_visca::testing::testkit::{ScriptedBlockingTransport, Step, helpers};
-
-    fn scripted_camera(
-        acks: usize,
-    ) -> (
-        BlockingClient<GenericVisca, ScriptedBlockingTransport>,
-        ScriptedBlockingTransport,
-    ) {
-        let transport = ScriptedBlockingTransport::new(
-            (0..acks)
-                .map(|_| helpers::standard_command_response(1))
-                .collect::<Vec<_>>(),
-        );
-        let camera = grafton_visca::CameraBuilder::new()
-            .build_blocking::<GenericVisca, _>(transport.clone())
-            .expect("camera should build from a scripted transport");
-        (camera, transport)
-    }
+    use crate::wire::encoded;
 
     #[test]
     fn a_title_is_encoded_in_the_cameras_own_character_set() {
@@ -333,12 +304,8 @@ mod tests {
 
     #[test]
     fn set_title_sends_the_appearance_then_the_characters_in_two_halves() {
-        let (camera, transport) = scripted_camera(3);
+        let sent = set_title(Title::new("PODIUM")).map(|part| encoded(&part));
 
-        set_title(&camera, Title::new("PODIUM")).expect("scripted camera should ack each part");
-
-        let sent = transport.sent();
-        assert_eq!(sent.len(), 3);
         assert_eq!(
             sent[0],
             vec![
@@ -358,61 +325,34 @@ mod tests {
 
     #[test]
     fn show_title_turns_the_display_on_and_off() {
-        let (camera, transport) = scripted_camera(2);
-
-        show_title(&camera, true).expect("scripted camera should ack the display on");
-        show_title(&camera, false).expect("scripted camera should ack the display off");
-
         assert_eq!(
-            transport.sent(),
-            vec![
-                vec![0x81, 0x01, 0x04, 0x74, 0x02, 0xFF],
-                vec![0x81, 0x01, 0x04, 0x74, 0x03, 0xFF],
-            ]
+            encoded(&show_title(true)),
+            [0x81, 0x01, 0x04, 0x74, 0x02, 0xFF]
+        );
+        assert_eq!(
+            encoded(&show_title(false)),
+            [0x81, 0x01, 0x04, 0x74, 0x03, 0xFF]
         );
     }
 
     #[test]
-    fn a_camera_that_answers_the_title_inquiry_has_titles() {
-        let transport = ScriptedBlockingTransport::new(vec![helpers::inquiry_response(
-            vec![0x81, 0x09, 0x04, 0x74, 0xFF],
-            1,
-            // "showing", which is as much as this camera has to say about it.
-            vec![0x90, 0x50, 0x02, 0xFF],
-        )]);
-        let camera = grafton_visca::CameraBuilder::new()
-            .build_blocking::<GenericVisca, _>(transport.clone())
-            .expect("camera should build from a scripted transport");
-
-        assert!(supported(&camera));
-        assert_eq!(transport.sent(), vec![vec![0x81, 0x09, 0x04, 0x74, 0xFF]]);
+    fn the_title_inquiry_asks_whether_the_title_is_showing() {
+        assert_eq!(
+            encoded(&TitleDisplayInquiry),
+            [0x81, 0x09, 0x04, 0x74, 0xFF]
+        );
     }
 
     #[test]
-    fn a_camera_that_calls_the_title_inquiry_a_syntax_error_has_no_titles() {
-        let transport = ScriptedBlockingTransport::new(vec![helpers::errors::syntax_error(1)]);
-        let camera = grafton_visca::CameraBuilder::new()
-            .build_blocking::<GenericVisca, _>(transport)
-            .expect("camera should build from a scripted transport");
-
-        assert!(!supported(&camera));
-    }
-
-    #[test]
-    fn a_camera_that_cannot_answer_the_title_inquiry_yet_keeps_its_titles() {
+    fn only_a_syntax_error_says_a_camera_has_no_titles() {
         // "Not executable" is what a camera in standby says to almost
         // anything, and it is not the camera saying it has no titles — nor is
         // silence, or a link that dropped a byte. Only a syntax error means
         // the command isn't there.
-        let transport = ScriptedBlockingTransport::new(vec![Step::OnSend {
-            matches: None,
-            responses: vec![helpers::not_executable(1)],
-        }]);
-        let camera = grafton_visca::CameraBuilder::new()
-            .build_blocking::<GenericVisca, _>(transport)
-            .expect("camera should build from a scripted transport");
-
-        assert!(supported(&camera));
+        assert!(supported(&Ok(())));
+        assert!(!supported::<()>(&Err(Error::SyntaxError)));
+        assert!(supported::<()>(&Err(Error::CommandNotExecutable)));
+        assert!(supported::<()>(&Err(Error::Timeout)));
     }
 
     #[test]

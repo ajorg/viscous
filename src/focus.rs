@@ -3,16 +3,10 @@
 //! Like zoom, VISCA focus only exposes continuous near/far drive commands,
 //! so focus is held rather than stepped: one command to start, one to stop.
 
-use grafton_visca::{
-    BlockingClient,
-    Error,
-    camera::profiles::GenericVisca,
-    // `command::FocusSpeed`, deliberately: the library also has a
-    // `types::FocusSpeed` of the same shape, and only this one is the speed
-    // the `Focus` command variants below actually take.
-    command::{Focus, FocusSpeed},
-    transport::{BlockingTransport, HasTransportConfig},
-};
+// `command::FocusSpeed`, deliberately: the library also has a
+// `types::FocusSpeed` of the same shape, and only this one is the speed the
+// `Focus` command variants below actually take.
+use grafton_visca::command::{Focus, FocusSpeed};
 
 use crate::deflection;
 
@@ -76,60 +70,40 @@ impl FocusDrive {
     }
 }
 
-/// Starts `drive`, or stops the focus when it's `None`.
+/// The command that starts `drive`, or stops the focus when it's `None`.
 ///
-/// Built on `execute` — grafton-visca's own documented escape hatch for
-/// commands its typed helpers don't cover — rather than on `focus_near`/
-/// `focus_far`, which take one of five named speed levels. Those can't express
+/// The library's variable-speed focus commands, rather than its
+/// `focus_near`/`focus_far` helpers, which take one of five named speed
+/// levels. Those can't express
 /// the slowest focus there is: they turn a speed of 0 into the *standard*-speed
 /// command (`81 01 04 08 03`), which is the camera's own middling default, so
 /// the slowest level would come out faster than the next one up. Verified on
 /// the wire, not read off the documentation.
 ///
 /// Going direct gives focus the same 0-to-7 the zoom rocker has, in order.
-pub fn drive_focus<T>(
-    camera: &BlockingClient<GenericVisca, T>,
-    drive: Option<FocusDrive>,
-) -> Result<(), Error>
-where
-    T: BlockingTransport + HasTransportConfig + 'static,
-{
+pub fn drive_focus(drive: Option<FocusDrive>) -> Focus {
     match drive {
-        Some(drive) => camera.execute(match drive.direction {
+        Some(drive) => match drive.direction {
             FocusDirection::Near => Focus::NearWithSpeed(drive.speed),
             FocusDirection::Far => Focus::FarWithSpeed(drive.speed),
-        }),
-        None => camera.focus_stop(),
+        },
+        None => Focus::Stop,
     }
 }
 
-/// Switches focus between the camera's automatic and manual modes.
+/// The command that switches focus between automatic and manual.
 ///
 /// Manual is less a preference than a precondition: a camera focusing
 /// automatically overrides the near/far drive the moment it sees the scene
 /// again, so [`drive_focus`] only holds while focus is manual.
-pub fn set_auto_focus<T>(camera: &BlockingClient<GenericVisca, T>, auto: bool) -> Result<(), Error>
-where
-    T: BlockingTransport + HasTransportConfig + 'static,
-{
-    if auto {
-        camera.focus_auto()
-    } else {
-        camera.focus_manual()
-    }
+pub fn set_auto_focus(auto: bool) -> Focus {
+    if auto { Focus::Auto } else { Focus::Manual }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use grafton_visca::testing::testkit::{ScriptedBlockingTransport, helpers};
-
-    fn scripted_camera() -> BlockingClient<GenericVisca, ScriptedBlockingTransport> {
-        let transport = ScriptedBlockingTransport::new(vec![helpers::standard_command_response(1)]);
-        grafton_visca::CameraBuilder::new()
-            .build_blocking::<GenericVisca, _>(transport)
-            .expect("camera should build from a scripted transport")
-    }
+    use crate::wire::encoded;
 
     fn drive(direction: FocusDirection) -> Option<FocusDrive> {
         Some(FocusDrive {
@@ -139,11 +113,16 @@ mod tests {
     }
 
     #[test]
-    fn drive_focus_starts_a_drive_in_each_direction() {
-        drive_focus(&scripted_camera(), drive(FocusDirection::Near))
-            .expect("scripted camera should ack and complete focus near");
-        drive_focus(&scripted_camera(), drive(FocusDirection::Far))
-            .expect("scripted camera should ack and complete focus far");
+    fn drive_focus_starts_a_drive_in_each_direction_at_its_speed() {
+        // 81 01 04 08 2p FF focuses far at speed p, 3p near.
+        assert_eq!(
+            encoded(&drive_focus(drive(FocusDirection::Far))),
+            [0x81, 0x01, 0x04, 0x08, 0x24, 0xFF]
+        );
+        assert_eq!(
+            encoded(&drive_focus(drive(FocusDirection::Near))),
+            [0x81, 0x01, 0x04, 0x08, 0x34, 0xFF]
+        );
     }
 
     #[test]
@@ -197,13 +176,21 @@ mod tests {
 
     #[test]
     fn drive_focus_stops_the_drive_when_given_no_direction() {
-        drive_focus(&scripted_camera(), None)
-            .expect("scripted camera should ack and complete the stop");
+        assert_eq!(
+            encoded(&drive_focus(None)),
+            [0x81, 0x01, 0x04, 0x08, 0x00, 0xFF]
+        );
     }
 
     #[test]
     fn set_auto_focus_switches_the_camera_both_ways() {
-        set_auto_focus(&scripted_camera(), true).expect("scripted camera should ack auto focus");
-        set_auto_focus(&scripted_camera(), false).expect("scripted camera should ack manual focus");
+        assert_eq!(
+            encoded(&set_auto_focus(true)),
+            [0x81, 0x01, 0x04, 0x38, 0x02, 0xFF]
+        );
+        assert_eq!(
+            encoded(&set_auto_focus(false)),
+            [0x81, 0x01, 0x04, 0x38, 0x03, 0xFF]
+        );
     }
 }

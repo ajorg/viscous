@@ -25,5 +25,6 @@ pub mod session;
 pub mod state;
 pub mod title;
 pub mod ui;
+pub mod wire;
 pub mod worker;
 pub mod zoom;

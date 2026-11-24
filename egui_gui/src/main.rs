@@ -21,25 +21,25 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use eframe::egui;
 use egui::{Key, TextWrapMode, Ui, Vec2, vec2};
-use grafton_visca::{Error, command::PanTiltDirection};
+use grafton_visca::Error;
 use pad::Controller;
 use viscous::{
     config,
-    connection::{self, Target, format_camera, format_version},
+    connection::{Target, format_camera, format_version},
     drives::Drives,
     focus::FocusDrive,
     gamepad::{Gamepad, Pad, Press},
-    keymap::{FAST_KEY_DEFLECTION, KEY_DEFLECTION},
+    keymap::key_deflections,
     nudge::Step,
     pan_tilt::{self, PadLayout, TopSpeeds, Velocity},
-    session::{self, POLL_INTERVAL, QUIESCENCE_INTERVAL, RETRY_INTERVAL},
+    session::{self, QUIESCENCE_INTERVAL, RETRY_INTERVAL},
     state::{self, CameraState},
     title::{self, Title},
-    worker::{self, Intent, Outcome},
+    worker::{self, Intent, Outcome, Worker},
     zoom::ZoomDrive,
 };
 
@@ -77,13 +77,6 @@ const RECALL_WIDTH: f32 = 2.0;
 /// the ones an operator switches between during a session.
 const TITLES: u8 = 3;
 
-/// How often to draw a frame while a controller is plugged in.
-///
-/// A stick is read where a frame is drawn, so how often the window draws is how
-/// often the sticks are noticed — and a hand that moves a stick expects the
-/// shot to move with it, not a tenth of a second later.
-const CONTROLLER_INTERVAL: Duration = Duration::from_millis(16);
-
 /// Where the Mark buttons are in their row and how big they are drawn, so the
 /// lock at the head of the column can be given the same.
 ///
@@ -103,6 +96,9 @@ struct MarkColumn {
 struct Status {
     text: String,
     failed: bool,
+    /// Whether this line says the camera isn't answering, which stops being
+    /// true the moment it answers anything, and is taken down then.
+    unanswered: bool,
 }
 
 impl Status {
@@ -110,6 +106,7 @@ impl Status {
         Self {
             text: text.into(),
             failed: false,
+            unanswered: false,
         }
     }
 
@@ -117,6 +114,7 @@ impl Status {
         Self {
             text: text.into(),
             failed: true,
+            unanswered: false,
         }
     }
 }
@@ -133,45 +131,6 @@ enum Connection {
         details: String,
     },
     Failed(String),
-}
-
-/// What a successful [`connect`] produces: how to describe the connection,
-/// plus the channels the rest of the app uses to talk to the worker thread.
-struct Worker {
-    link: String,
-    summary: String,
-    details: String,
-    /// Whether this camera answered for its title feature — asked once here,
-    /// while the camera is still ours and before the worker thread has any
-    /// commands of its own to get through.
-    titles: bool,
-    intents: Sender<Intent>,
-    results: Receiver<Outcome>,
-}
-
-/// Connects to whatever `target` names — a serial port or a `tcp://` endpoint,
-/// same string either front end takes — and starts the worker thread that owns
-/// the camera from then on.
-fn connect(target: &str) -> Result<Worker, String> {
-    let connected = connection::connect(&Target::from(target))?;
-
-    let (worker_tx, worker_rx) = mpsc::channel::<Intent>();
-    let (result_tx, result_rx) = mpsc::channel::<Outcome>();
-    let camera = connected.camera;
-    // Asked here rather than through the worker: this is the one question
-    // whose answer decides what the window offers, and it is worth having
-    // before the first frame is drawn rather than a round trip afterwards.
-    let titles = title::supported(&camera);
-    thread::spawn(move || worker::run(&camera, &worker_rx, &result_tx));
-
-    Ok(Worker {
-        link: connected.link,
-        summary: format_camera(&connected.version),
-        details: format_version(&connected.version),
-        titles,
-        intents: worker_tx,
-        results: result_rx,
-    })
 }
 
 struct App {
@@ -279,9 +238,6 @@ struct App {
     /// which the pad and the rockers draw themselves at — so there is one place
     /// to watch the camera being driven, whatever is driving it.
     stick: Pad,
-    /// Whether there was a controller to read last frame, which decides how
-    /// soon the next frame is asked for.
-    in_hand: bool,
 }
 
 impl Default for App {
@@ -323,7 +279,6 @@ impl Default for App {
             controller: None,
             gamepad: Gamepad::default(),
             stick: Pad::default(),
-            in_hand: false,
         }
     }
 }
@@ -437,8 +392,14 @@ impl App {
         let (tx, rx) = mpsc::channel();
         self.connect_rx = Some(rx);
         let ctx = ctx.clone();
+        // Connecting waits on the camera, which the window mustn't. Once
+        // connected, the worker wakes the window whenever it has something to
+        // show, so the window never has to keep looking.
         thread::spawn(move || {
-            let _ = tx.send(connect(&port));
+            let wake = ctx.clone();
+            let _ = tx.send(worker::start(Target::from(port.as_str()), move || {
+                wake.request_repaint()
+            }));
             ctx.request_repaint();
         });
     }
@@ -460,8 +421,8 @@ impl App {
                 self.save_config();
                 self.connection = Connection::Connected {
                     link: worker.link,
-                    summary: worker.summary,
-                    details: worker.details,
+                    summary: format_camera(&worker.version),
+                    details: format_version(&worker.version),
                 };
                 // Per camera, not per run: connecting to a different one is
                 // asking the question again, and its answer replaces the last
@@ -481,6 +442,10 @@ impl App {
     /// query becomes the status line; a successful state query updates the
     /// camera-state panel instead — mirrors the TUI's own `Report` impl.
     fn apply_outcome(&mut self, outcome: Outcome) {
+        let unanswered = worker::unanswered(&outcome);
+        if !unanswered && self.status.as_ref().is_some_and(|status| status.unanswered) {
+            self.status = None;
+        }
         let failed = match &outcome {
             Outcome::State(Ok(camera_state)) => {
                 self.camera_state = Some(*camera_state);
@@ -510,7 +475,10 @@ impl App {
             // ever noticing it came back.
             Outcome::State(Err(_)) => {
                 self.next_query_at = Some(Instant::now() + RETRY_INTERVAL);
-                self.status = Some(Status::ok(session::NO_ANSWER_HINT.to_string()));
+                self.status = Some(Status {
+                    unanswered: true,
+                    ..Status::ok(session::NO_ANSWER_HINT)
+                });
                 return;
             }
             // A camera that answers a syntax error to a title command hasn't
@@ -526,10 +494,7 @@ impl App {
             Outcome::Done(intent, Err(Error::SyntaxError)) if worker::is_title(*intent) => {
                 self.titles_supported = false;
                 self.shown_title = None;
-                self.status = Some(Status {
-                    text: NO_TITLES_HINT.to_string(),
-                    failed: true,
-                });
+                self.status = Some(Status::failed(NO_TITLES_HINT));
                 return;
             }
             // A drive that worked was already visible before its completion
@@ -540,6 +505,7 @@ impl App {
         self.status = Some(Status {
             text: worker::describe_outcome(&outcome),
             failed,
+            unanswered,
         });
     }
 
@@ -838,28 +804,15 @@ impl App {
         }
     }
 
-    /// What the keys currently held down are asking for, having first sent a
-    /// step for every arrow that was tapped rather than held.
+    /// What the keys currently held down are asking for.
     ///
     /// Nothing, while a description field has the keyboard: a "1" typed there
     /// is a digit, not a preset, and an arrow key is a cursor.
-    fn keyboard_drives(&mut self, ui: &Ui) -> Drives {
+    fn keyboard_drives(&self, ui: &Ui) -> Drives {
         if typing(ui) {
             return Drives::STOPPED;
         }
-        let (steps, held) = ui.input(|input| {
-            (
-                keyboard_steps(input),
-                held_drives(|key| input.key_down(key), input.modifiers.shift),
-            )
-        });
-        // A step is a movement like any other, so a camera that won't take a
-        // drive won't take one of these either.
-        if !self.asleep() {
-            for step in steps {
-                self.send_intent(Intent::Nudge(step));
-            }
-        }
+        let held = ui.input(|input| held_drives(|key| input.key_down(key), input.modifiers.shift));
         self.drivable(held)
     }
 
@@ -874,7 +827,6 @@ impl App {
             .controller
             .as_mut()
             .and_then(|controller| controller.poll());
-        self.in_hand = read.is_some();
         self.stick = read.unwrap_or_default();
         let Some(pad) = read else {
             return (Drives::STOPPED, Vec::new());
@@ -1310,88 +1262,38 @@ fn typing(ui: &Ui) -> bool {
 /// is down.
 ///
 /// The bindings are the shared ones, so the same fingers work in either front
-/// end — here and in the terminal:
-/// shift and the arrows pan and tilt, `[`/`]` or `-`/`=` zoom, `,`/`.` focus,
-/// and shift means full speed on the two controls it hasn't been spent on.
-/// Page up/down zoom as well, which is what the camera's older Windows control
-/// panel used.
+/// end — here and in the terminal: the arrows pan and tilt, `[`/`]` or
+/// `-`/`=` zoom, `,`/`.` focus. Every one of them works the same way: it
+/// drives for as long as it is held, and shift makes it faster. Page up/down
+/// zoom as well, which is what the camera's older Windows control panel used.
 fn held_drives(down: impl Fn(Key) -> bool, shift: bool) -> Drives {
-    let deflection = if shift {
-        FAST_KEY_DEFLECTION
-    } else {
-        KEY_DEFLECTION
-    };
-    // The framing pace whatever the modifiers say, unlike zoom and focus:
-    // shift is what tells an arrow to drive rather than step, so it is already
-    // spoken for and can't also mean "faster".
-    let axis = |negative: Key, positive: Key| match (down(negative), down(positive)) {
-        (true, false) => -KEY_DEFLECTION,
-        (false, true) => KEY_DEFLECTION,
-        _ => 0.0,
-    };
+    let (aim, deflection) = key_deflections(shift);
 
+    // egui names a key by the character it types, so with shift held `[` is
+    // `{`, and `=` is `+`. (Shift and `-` types `_`, which egui has no name
+    // for; it falls back to the key, which is `-` again.)
     let zoom = opposed(
-        down(Key::OpenBracket) || down(Key::Minus) || down(Key::PageDown),
-        down(Key::CloseBracket) || down(Key::Equals) || down(Key::PageUp),
+        down(Key::OpenBracket)
+            || down(Key::OpenCurlyBracket)
+            || down(Key::Minus)
+            || down(Key::PageDown),
+        down(Key::CloseBracket)
+            || down(Key::CloseCurlyBracket)
+            || down(Key::Equals)
+            || down(Key::Plus)
+            || down(Key::PageUp),
         deflection,
     );
     let focus = opposed(down(Key::Comma), down(Key::Period), deflection);
 
     Drives {
-        // Only with shift, and always at the framing pace. Unmodified, an
-        // arrow steps the camera instead — see `keyboard_steps` — so shift is
-        // spent saying "drive" and has none left over to also say "faster".
-        pan_tilt: if shift {
-            pan_tilt::velocity_from_axes(
-                axis(Key::ArrowLeft, Key::ArrowRight),
-                axis(Key::ArrowDown, Key::ArrowUp),
-            )
-        } else {
-            Velocity::STOP
-        },
+        pan_tilt: pan_tilt::velocity_from_axes(
+            opposed(down(Key::ArrowLeft), down(Key::ArrowRight), aim),
+            opposed(down(Key::ArrowDown), down(Key::ArrowUp), aim),
+        ),
         zoom: ZoomDrive::from_deflection(zoom),
         focus: FocusDrive::from_deflection(focus),
     }
-}
-
-/// The steps the arrow keys were just pressed for.
-///
-/// Read from the frame's key events rather than from what is held down, so
-/// that one press is one step however long the key stays there. Repeats are
-/// skipped for the same reason: a finger resting on an arrow is not asking
-/// the camera to walk away, and there is no other way to say "no, just the
-/// one" once the terminal or the window has started repeating.
-///
-/// Nothing here needs to time how long a key was down, which is the point.
-/// The pad and the stick drive; the arrows step; neither has to guess which
-/// of the two the hand meant.
-fn keyboard_steps(input: &egui::InputState) -> Vec<Step> {
-    input
-        .events
-        .iter()
-        .filter_map(|event| match event {
-            egui::Event::Key {
-                key,
-                pressed: true,
-                repeat: false,
-                modifiers,
-                ..
-            } if !modifiers.shift => step_for(*key),
-            _ => None,
-        })
-        .collect()
-}
-
-/// The step an arrow key asks for, if it is one.
-fn step_for(key: Key) -> Option<Step> {
-    let direction = match key {
-        Key::ArrowUp => PanTiltDirection::Up,
-        Key::ArrowDown => PanTiltDirection::Down,
-        Key::ArrowLeft => PanTiltDirection::Left,
-        Key::ArrowRight => PanTiltDirection::Right,
-        _ => return None,
-    };
-    Some(Step::towards(direction))
 }
 
 /// How far two opposed keys push the rocker they share, which is nowhere when
@@ -1487,15 +1389,15 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         self.draw(ui);
 
-        // Keep polling for worker results / the debounced state query at
-        // the same cadence the session loop's own event poll uses — and far
-        // more often than that while there is a stick to read, since nothing
-        // wakes the window when one moves.
-        ui.ctx().request_repaint_after(if self.in_hand {
-            CONTROLLER_INTERVAL
-        } else {
-            POLL_INTERVAL
-        });
+        // Nothing to poll for: the camera's worker and the controller's
+        // watcher both wake the window when they have something. The one
+        // thing that only time brings is the state query waiting for the
+        // controls to settle, which can't go while something is being driven
+        // — and stopping a drive is an input, which draws a frame anyway.
+        if let Some(at) = self.next_query_at.filter(|_| !self.driving()) {
+            ui.ctx()
+                .request_repaint_after(at.saturating_duration_since(Instant::now()));
+        }
     }
 
     // The graphics context comes with the OpenGL backend's version of this
@@ -1553,7 +1455,9 @@ fn main() -> std::process::ExitCode {
             cc.egui_ctx.set_zoom_factor(INTERFACE_SCALE);
 
             let mut app = App::with_config(config::default_path().ok());
-            app.controller = pad::Attached::open().map(|attached| Box::new(attached) as Box<_>);
+            let wake = cc.egui_ctx.clone();
+            app.controller = pad::Attached::open(move || wake.request_repaint())
+                .map(|attached| Box::new(attached) as Box<_>);
             Ok(Box::new(app))
         }),
     );
@@ -1579,6 +1483,7 @@ mod tests {
         camera::PanTiltPosition, command::PanTiltDirection, types::FocusPosition,
         types::ZoomPosition,
     };
+    use viscous::keymap::{ARROW_DEFLECTION, FAST_KEY_DEFLECTION, KEY_DEFLECTION};
     use viscous::{focus::FocusDirection, zoom::ZoomDirection};
 
     /// An app already connected to a camera, plus the receiving end of the
@@ -1606,8 +1511,12 @@ mod tests {
         let (_, results) = mpsc::channel();
         Worker {
             link: "COM3 at 9600 baud".to_string(),
-            summary: "Sony".to_string(),
-            details: "vendor=Sony (0x0020) model=0x040F".to_string(),
+            version: grafton_visca::command::VersionInfo {
+                vendor: 0x0020,
+                model: 0x040F,
+                rom_version: 0,
+                max_socket: 2,
+            },
             titles: true,
             intents,
             results,
@@ -1708,23 +1617,28 @@ mod tests {
     }
 
     #[test]
-    fn shift_and_the_arrow_keys_drive_pan_and_tilt() {
+    fn the_arrow_keys_drive_pan_and_tilt_at_a_creep() {
+        assert_eq!(
+            held(&[Key::ArrowUp]).pan_tilt,
+            pan_tilt::velocity_from_axes(0.0, ARROW_DEFLECTION)
+        );
+        assert_eq!(
+            held(&[Key::ArrowLeft, Key::ArrowDown]).pan_tilt,
+            pan_tilt::velocity_from_axes(-ARROW_DEFLECTION, -ARROW_DEFLECTION)
+        );
+        assert_eq!(held(&[Key::ArrowRight]).pan_tilt.pan_speed, 1);
+    }
+
+    #[test]
+    fn shift_drives_the_arrows_faster_as_it_does_zoom_and_focus() {
         assert_eq!(
             shifted(&[Key::ArrowUp]).pan_tilt,
             pan_tilt::velocity_from_axes(0.0, KEY_DEFLECTION)
         );
-        assert_eq!(
-            shifted(&[Key::ArrowLeft, Key::ArrowDown]).pan_tilt,
-            pan_tilt::velocity_from_axes(-KEY_DEFLECTION, -KEY_DEFLECTION)
+        assert!(
+            shifted(&[Key::ArrowRight]).pan_tilt.pan_speed
+                > held(&[Key::ArrowRight]).pan_tilt.pan_speed
         );
-    }
-
-    #[test]
-    fn an_arrow_key_on_its_own_drives_nothing() {
-        // It steps instead, which is `keyboard_steps`' business — and if it
-        // drove as well, one press would both step and start a slew.
-        assert!(held(&[Key::ArrowUp]).pan_tilt.is_stop());
-        assert!(held(&[Key::ArrowLeft, Key::ArrowDown]).pan_tilt.is_stop());
     }
 
     #[test]
@@ -1777,6 +1691,26 @@ mod tests {
     }
 
     #[test]
+    fn shifted_brackets_zoom_though_egui_calls_them_braces() {
+        // What the window actually sees with shift down: the character typed.
+        let out = shifted(&[Key::OpenCurlyBracket])
+            .zoom
+            .expect("shift+[ zooms");
+        let r#in = shifted(&[Key::CloseCurlyBracket])
+            .zoom
+            .expect("shift+] zooms");
+        let plus = shifted(&[Key::Plus]).zoom.expect("shift+= zooms");
+
+        assert_eq!(out.direction, ZoomDirection::Out);
+        assert_eq!(r#in.direction, ZoomDirection::In);
+        assert_eq!(plus.direction, ZoomDirection::In);
+        assert_eq!(
+            Some(out.speed),
+            shifted(&[Key::OpenBracket]).zoom.map(|d| d.speed)
+        );
+    }
+
+    #[test]
     fn a_drag_and_a_held_key_drive_different_controls_at_once() {
         let dragging = Drives {
             pan_tilt: pan_tilt::velocity_from_axes(1.0, 0.0),
@@ -1807,61 +1741,7 @@ mod tests {
     }
 
     #[test]
-    fn a_held_shifted_arrow_key_drives_the_camera_and_releasing_it_stops() {
-        let (app, sent) = connected_app(None);
-        let mut harness = ui_harness(app);
-
-        harness.key_down_modifiers(egui::Modifiers::SHIFT, Key::ArrowRight);
-        harness.run();
-        let driving = commands(&sent);
-
-        assert_eq!(
-            driving.first(),
-            Some(&Intent::DrivePanTilt(pan_tilt::velocity_from_axes(
-                KEY_DEFLECTION,
-                0.0
-            ))),
-            "shift and an arrow should drive"
-        );
-        assert!(
-            !driving
-                .iter()
-                .any(|intent| matches!(intent, Intent::Nudge(_))),
-            "and should not also step: one press is one gesture"
-        );
-        // The stop that follows in the same batch is the harness rather than
-        // the app: kittest puts the modifiers back to none right after the
-        // event it decorated, since it is built for chords like ctrl+C rather
-        // than for a modifier somebody is leaning on. A window gets the real
-        // modifier state with every frame.
-        assert_eq!(
-            driving.last(),
-            Some(&Intent::DrivePanTilt(Velocity::STOP)),
-            "letting go of shift should stop the camera, as letting go does"
-        );
-    }
-
-    #[test]
-    fn pressing_an_arrow_key_steps_the_camera_without_driving_it() {
-        let (app, sent) = connected_app(None);
-        let mut harness = ui_harness(app);
-
-        harness.key_down(Key::ArrowRight);
-        harness.run();
-        harness.key_up(Key::ArrowRight);
-        harness.run();
-
-        assert_eq!(
-            commands(&sent),
-            vec![Intent::Nudge(Step::towards(PanTiltDirection::Right))],
-            "an arrow on its own should be one step and no drive at all"
-        );
-    }
-
-    #[test]
-    fn holding_an_arrow_key_down_steps_once_rather_than_walking_away() {
-        // The property that replaced the timing window: a finger left resting
-        // on an arrow has asked for one step, and asking again is a new press.
+    fn a_held_arrow_key_drives_the_camera_and_releasing_it_stops() {
         let (app, sent) = connected_app(None);
         let mut harness = ui_harness(app);
 
@@ -1869,11 +1749,18 @@ mod tests {
         for _ in 0..5 {
             harness.run();
         }
-
         assert_eq!(
             commands(&sent),
-            vec![Intent::Nudge(Step::towards(PanTiltDirection::Right))]
+            vec![Intent::DrivePanTilt(pan_tilt::velocity_from_axes(
+                ARROW_DEFLECTION,
+                0.0
+            ))],
+            "one drive for as long as the key is down, not one per frame"
         );
+
+        harness.key_up(Key::ArrowRight);
+        harness.run();
+        assert_eq!(commands(&sent), vec![Intent::DrivePanTilt(Velocity::STOP)]);
     }
 
     #[test]
@@ -1892,7 +1779,7 @@ mod tests {
 
         assert!(
             commands(&sent).is_empty(),
-            "a camera drawn as asleep shouldn't be stepped either"
+            "a camera drawn as asleep shouldn't be driven"
         );
     }
 
@@ -1928,12 +1815,59 @@ mod tests {
     }
 
     #[test]
+    fn saying_the_camera_did_not_answer_lasts_only_until_it_does() {
+        let (mut app, _sent) = connected_app(None);
+        let step = Intent::Nudge(Step::towards(PanTiltDirection::Up));
+
+        app.apply_outcome(Outcome::Done(step, Err(grafton_visca::Error::Timeout)));
+        assert!(app.status.as_ref().is_some_and(|status| status.unanswered));
+
+        // A step that worked says nothing of its own, but it is the camera
+        // answering, so the line saying it wasn't comes down.
+        app.apply_outcome(Outcome::Done(step, Ok(())));
+        assert!(app.status.is_none(), "{:?}", app.status.map(|s| s.text));
+    }
+
+    #[test]
+    fn waiting_for_a_waking_camera_ends_when_it_reports_its_state() {
+        let (mut app, _sent) = connected_app(None);
+
+        app.apply_outcome(Outcome::State(Err(grafton_visca::Error::Timeout)));
+        assert_eq!(
+            app.status.as_ref().map(|status| status.text.as_str()),
+            Some(session::NO_ANSWER_HINT)
+        );
+
+        app.apply_outcome(Outcome::State(Ok(CameraState {
+            power_on: true,
+            lens: None,
+        })));
+        assert!(app.status.is_none());
+    }
+
+    #[test]
+    fn the_camera_answering_leaves_other_messages_alone() {
+        let (mut app, _sent) = connected_app(None);
+        app.apply_outcome(Outcome::Done(Intent::RecallPreset(2), Ok(())));
+
+        app.apply_outcome(Outcome::Done(
+            Intent::Nudge(Step::towards(PanTiltDirection::Up)),
+            Ok(()),
+        ));
+
+        assert_eq!(
+            app.status.map(|status| status.text),
+            Some("OK: recall preset 2".to_string())
+        );
+    }
+
+    #[test]
     fn a_drive_that_failed_is_reported_as_a_failure() {
         let (mut app, _sent) = connected_app(None);
 
         app.apply_outcome(Outcome::Done(
             Intent::DrivePanTilt(Velocity::STOP),
-            Err(grafton_visca::Error::Timeout),
+            Err(grafton_visca::Error::CommandBufferFull),
         ));
 
         let status = app.status.expect("a failed drive should be reported");
@@ -1967,7 +1901,10 @@ mod tests {
 
         assert_eq!(
             commands(&sent),
-            vec![Intent::Nudge(Step::towards(PanTiltDirection::Right))],
+            vec![Intent::DrivePanTilt(pan_tilt::velocity_from_axes(
+                ARROW_DEFLECTION,
+                0.0
+            ))],
             "a description field should let go of the keyboard on escape"
         );
     }

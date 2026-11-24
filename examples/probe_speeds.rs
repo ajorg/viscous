@@ -55,16 +55,88 @@ use std::{
 
 use grafton_visca::{
     CameraId, Error,
-    command::{FocusMode, FocusSpeed, PanTiltDirection, ViscaCommand},
+    camera::PanTiltPosition,
+    command::{
+        FocusMode, FocusModeInquiry, FocusPositionInquiry, FocusSpeed, InquiryData,
+        PanTiltDirection, PanTiltPositionInquiry, VersionInfo, ViscaCommand, ZoomPositionInquiry,
+    },
     timeout::CommandCategory,
     types::ZoomSpeed,
 };
+use tokio::runtime::Runtime;
 use viscous::{
-    connection::{self, Camera, Target},
+    connection::{self, Session, Target},
     focus::{self, FocusDirection, FocusDrive},
     pan_tilt::{self, MAX_PAN_SPEED, MAX_TILT_SPEED, Velocity},
+    wire,
     zoom::{self, ZoomDirection, ZoomDrive},
 };
+
+/// The camera, one exchange at a time: a measurement wants each answer before
+/// deciding what to ask next, which is exactly what the app's own worker is
+/// built not to do.
+struct Camera {
+    runtime: Runtime,
+    session: Session,
+}
+
+impl Camera {
+    /// The camera at `target`, how it was reached, and what it said it is.
+    fn open(target: &Target) -> Result<(Self, String, VersionInfo), String> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| error.to_string())?;
+        let connection::Opened {
+            session,
+            link,
+            version,
+        } = runtime.block_on(connection::open(target))?;
+        Ok((Self { runtime, session }, link, version))
+    }
+
+    fn execute(&self, command: impl ViscaCommand) -> Result<(), Error> {
+        self.runtime
+            .block_on(wire::execute(self.session.camera(), command))
+    }
+
+    fn ask(&self, inquiry: impl ViscaCommand) -> Result<InquiryData, Error> {
+        self.runtime
+            .block_on(wire::ask(self.session.camera(), inquiry))
+    }
+
+    fn pan_tilt_position(&self) -> Result<PanTiltPosition, Error> {
+        match self.ask(PanTiltPositionInquiry)? {
+            InquiryData::PanTiltPosition { pan, tilt } => Ok(PanTiltPosition { pan, tilt }),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    fn zoom_position(&self) -> Result<u16, Error> {
+        match self.ask(ZoomPositionInquiry)? {
+            InquiryData::ZoomPosition { position } => Ok(position),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    fn focus_position(&self) -> Result<u16, Error> {
+        match self.ask(FocusPositionInquiry)? {
+            InquiryData::FocusPosition { position } => Ok(position),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    fn focus_mode(&self) -> Result<FocusMode, Error> {
+        match self.ask(FocusModeInquiry)? {
+            InquiryData::FocusMode { mode } => Ok(mode),
+            other => Err(unexpected(other)),
+        }
+    }
+}
+
+fn unexpected(answer: InquiryData) -> Error {
+    Error::ParseError(format!("an answer to some other question: {answer:?}").into())
+}
 
 /// How far from home a drive is allowed to carry the head before it is
 /// stopped, in the camera's units. Both inside what this camera has already
@@ -150,17 +222,17 @@ fn main() -> ExitCode {
     }
     let wanted = |part: &str| parts.is_empty() || parts.iter().any(|named| named == part);
 
-    let connected = match connection::connect(&Target::from(target.as_str())) {
-        Ok(connected) => connected,
+    let (camera, link, version) = match Camera::open(&Target::from(target.as_str())) {
+        Ok(opened) => opened,
         Err(message) => {
             eprintln!("{message}");
             return ExitCode::FAILURE;
         }
     };
-    println!("{}", connected.link);
-    println!("{}", connection::format_version(&connected.version));
+    println!("{link}");
+    println!("{}", connection::format_version(&version));
 
-    let camera = &connected.camera;
+    let camera = &camera;
     let outcome = (|| -> Result<(), Failure> {
         if wanted("pan") {
             let runs = pan_or_tilt(camera, Axis::Pan)?;
@@ -190,9 +262,11 @@ fn main() -> ExitCode {
         Err(error) => {
             // Whatever was running is still running as far as the camera
             // knows; none of these can be left to drive into an end stop.
-            let _ = pan_tilt::drive(camera, Velocity::STOP);
-            let _ = zoom::drive_zoom(camera, None);
-            let _ = focus::drive_focus(camera, None);
+            if let Ok(stop) = pan_tilt::drive(Velocity::STOP) {
+                let _ = camera.execute(stop);
+            }
+            let _ = camera.execute(zoom::drive_zoom(None));
+            let _ = camera.execute(focus::drive_focus(None));
             eprintln!("stopped: {error}");
             ExitCode::FAILURE
         }
@@ -214,7 +288,7 @@ fn during<T>(what: &str, result: Result<T, Error>) -> Result<T, Failure> {
 /// it has arrived: [`at_rest`] waits for the head to stop either way, so a
 /// completion that comes late or never is only worth a note.
 fn go_home(camera: &Camera) {
-    if let Err(error) = pan_tilt::home(camera) {
+    if let Err(error) = camera.execute(pan_tilt::HOME) {
         println!("(home: {error} — waiting for the head to stop instead)");
     }
 }
@@ -262,8 +336,8 @@ fn pan_or_tilt(camera: &Camera, axis: Axis) -> Result<Vec<Run>, Failure> {
             from,
             far_enough,
             PAN_TILT_LONG_ENOUGH,
-            || pan_tilt::drive(camera, velocity),
-            || pan_tilt::drive(camera, Velocity::STOP),
+            || camera.execute(pan_tilt::drive(velocity)?),
+            || camera.execute(pan_tilt::drive(Velocity::STOP)?),
             position,
         )?;
         note(name, speed, &drive);
@@ -325,16 +399,16 @@ fn zoom_runs(camera: &Camera) -> Result<Vec<Run>, Failure> {
             speed: ZoomSpeed::new(speed).expect("a zoom speed from 0 to 7"),
         })
     };
-    let position = || camera.zoom_position().map(|zoom| i32::from(zoom.value()));
+    let position = || camera.zoom_position().map(i32::from);
     let rewind = || -> Result<(), Failure> {
         during(
             "zoom back to wide, starting",
-            zoom::drive_zoom(camera, drive(ZoomDirection::Out, 7)),
+            camera.execute(zoom::drive_zoom(drive(ZoomDirection::Out, 7))),
         )?;
         thread::sleep(REWIND);
         during(
             "zoom back to wide, stopping",
-            zoom::drive_zoom(camera, None),
+            camera.execute(zoom::drive_zoom(None)),
         )
     };
 
@@ -348,8 +422,8 @@ fn zoom_runs(camera: &Camera) -> Result<Vec<Run>, Failure> {
             from,
             i32::MAX,
             LENS_LONG_ENOUGH,
-            || zoom::drive_zoom(camera, drive(ZoomDirection::In, speed)),
-            || zoom::drive_zoom(camera, None),
+            || camera.execute(zoom::drive_zoom(drive(ZoomDirection::In, speed))),
+            || camera.execute(zoom::drive_zoom(None)),
             position,
         )?;
         note("zoom", speed, &drive);
@@ -372,16 +446,12 @@ fn focus_runs(camera: &Camera) -> Result<Vec<Run>, Failure> {
             speed: FocusSpeed::new(speed).expect("a focus speed from 0 to 7"),
         })
     };
-    let position = || {
-        camera
-            .focus_position()
-            .map(|focus| i32::from(focus.value()))
-    };
+    let position = || camera.focus_position().map(i32::from);
 
     let was_auto = during("focus mode inquiry", camera.focus_mode())? == FocusMode::Auto;
     during(
         "switch to manual focus",
-        focus::set_auto_focus(camera, false),
+        camera.execute(focus::set_auto_focus(false)),
     )?;
 
     println!();
@@ -390,12 +460,12 @@ fn focus_runs(camera: &Camera) -> Result<Vec<Run>, Failure> {
         for speed in 0..=7 {
             during(
                 "focus back to far, starting",
-                focus::drive_focus(camera, drive(FocusDirection::Far, 7)),
+                camera.execute(focus::drive_focus(drive(FocusDirection::Far, 7))),
             )?;
             thread::sleep(REWIND);
             during(
                 "focus back to far, stopping",
-                focus::drive_focus(camera, None),
+                camera.execute(focus::drive_focus(None)),
             )?;
             let from = at_rest("focus position at far", position)?;
             let drive = watched(
@@ -403,8 +473,8 @@ fn focus_runs(camera: &Camera) -> Result<Vec<Run>, Failure> {
                 from,
                 i32::MAX,
                 LENS_LONG_ENOUGH,
-                || focus::drive_focus(camera, drive(FocusDirection::Near, speed)),
-                || focus::drive_focus(camera, None),
+                || camera.execute(focus::drive_focus(drive(FocusDirection::Near, speed))),
+                || camera.execute(focus::drive_focus(None)),
                 position,
             )?;
             note("focus", speed, &drive);
@@ -418,10 +488,10 @@ fn focus_runs(camera: &Camera) -> Result<Vec<Run>, Failure> {
     })();
 
     if was_auto {
-        let _ = focus::drive_focus(camera, None);
+        let _ = camera.execute(focus::drive_focus(None));
         during(
             "switch back to autofocus",
-            focus::set_auto_focus(camera, true),
+            camera.execute(focus::set_auto_focus(true)),
         )?;
     }
     measured

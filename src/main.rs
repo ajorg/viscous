@@ -1,13 +1,11 @@
 use std::io;
 use std::process::ExitCode;
-use std::sync::mpsc::channel;
-use std::thread;
 
 use viscous::{
     app, cli,
-    connection::{self, Connected, Target, format_camera, format_version},
+    connection::{Target, format_camera, format_version},
     ui::Connection,
-    worker,
+    worker::{self, Worker},
 };
 
 /// Parses `viscous-tui [--cli] <target>`, returning whether bare CLI mode was
@@ -31,29 +29,26 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     };
 
-    let Connected {
-        camera,
+    // The worker's thread isn't joined on the way out: a command already fully
+    // written to the wire is already executing on the camera regardless of
+    // whether we stick around for its reply, so there's nothing to gain by
+    // blocking process exit on an in-flight command's round trip (which, for a
+    // preset recall, can be tens of seconds).
+    let Worker {
         link,
         version,
-    } = match connection::connect(&Target::from(target.as_str())) {
-        Ok(connected) => connected,
+        intents,
+        results,
+        ..
+    // No waking needed: the terminal session already wakes to check for
+    // results between keystrokes.
+    } = match worker::start(Target::from(target.as_str()), || {}) {
+        Ok(worker) => worker,
         Err(error) => {
             eprintln!("{error}");
             return ExitCode::FAILURE;
         }
     };
-
-    let (intent_tx, intent_rx) = channel::<worker::Intent>();
-    let (result_tx, result_rx) = channel::<worker::Outcome>();
-
-    // Not joined on the way out: a command already fully written to the
-    // wire is already executing on the camera regardless of whether we
-    // stick around for its reply, so there's nothing to gain by blocking
-    // process exit on an in-flight command's ack/completion round trip
-    // (which, for a preset recall, can be tens of seconds).
-    thread::spawn(move || {
-        worker::run(&camera, &intent_rx, &result_tx);
-    });
 
     // The transcript has room for the whole version reply; the TUI's one-line
     // header does not, and says who made the camera instead.
@@ -62,14 +57,14 @@ fn main() -> ExitCode {
     let app_result = if cli_requested {
         let stdout = io::stdout();
         let mut stdout = stdout.lock();
-        cli::run(&mut stdout, &connection_summary, &intent_tx, &result_rx)
+        cli::run(&mut stdout, &connection_summary, &intents, &results)
     } else {
         let connection = Connection::Connected {
             link,
             version: format_camera(&version),
         };
         let mut terminal = ratatui::init();
-        let result = app::run(&mut terminal, connection, &intent_tx, &result_rx);
+        let result = app::run(&mut terminal, connection, &intents, &results);
         ratatui::restore();
         result
     };

@@ -16,16 +16,15 @@
 //! deliberately left behind. Nothing here contradicts that: a step per keypress
 //! made a *held* control queue up hops that all had to play out after release,
 //! because each one only reports finishing once it physically has. Taps are
-//! what a step was always for, and a distance is the one thing that can be
-//! added up — see [`Step`], which is what keeps that queue from forming again.
+//! what a step was always for, and that queue can't form from taps: a step is
+//! sent once per press of the controller's d-pad, however long it is held, so
+//! steps arrive no faster than a hand makes them. (The arrow keys stepped too,
+//! for a while; they drive now, like every other key.)
 
 use std::ops::Add;
 
 use grafton_visca::{
-    BlockingClient, Error,
-    camera::profiles::GenericVisca,
     command::{PanTilt, PanTiltDirection},
-    transport::{BlockingTransport, HasTransportConfig},
     types::{PanSpeed, TiltSpeed},
 };
 
@@ -51,14 +50,9 @@ const STEP_SPEED: u8 = 1;
 /// How far to move, in the camera's own position units, as an offset from
 /// wherever it is pointing now.
 ///
-/// A distance rather than a direction, which is the property the whole design
-/// rests on: **two steps add up into one**. Three taps to the right while the
-/// camera is busy answering the first are not three commands to be queued and
-/// played out one after another — that was the failure that took relative
-/// moves out of this program once — nor three taps of which two get dropped,
-/// which would make a tap something you can't count on. They are one move of
-/// three units, which arrives in the same place, in one round trip, without
-/// stopping twice on the way.
+/// A distance rather than a direction. Steps can be added together, but the
+/// worker deliberately doesn't do it to queued taps: three taps are sent as
+/// the three steps that were asked for (see `a8d8e4a`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Step {
     pub pan: i16,
@@ -127,7 +121,8 @@ impl Step {
     }
 }
 
-/// Moves the camera by `step`, or does nothing at all if it goes nowhere.
+/// The command that moves the camera by `step`, or nothing at all if it goes
+/// nowhere.
 ///
 /// Sent in the camera's own units rather than in degrees, which is not a
 /// micro-optimisation: grafton-visca converts degrees using the *profile's*
@@ -136,75 +131,55 @@ impl Step {
 /// never met. A step asked for in degrees would therefore be off by whatever
 /// that guess misses this camera by, silently and on every step. Units have
 /// nothing to convert and so nothing to get wrong.
-pub fn nudge<T>(camera: &BlockingClient<GenericVisca, T>, step: Step) -> Result<(), Error>
-where
-    T: BlockingTransport + HasTransportConfig + 'static,
-{
+pub fn nudge(step: Step) -> Option<PanTilt> {
     if step.is_still() {
-        return Ok(());
+        return None;
     }
-    camera.execute(PanTilt::RelativePositionRaw {
+    Some(PanTilt::RelativePositionRaw {
         // Two's complement, which is how VISCA reads a relative move's
         // position: the command carries a signed distance in a field the
         // library types as unsigned.
         pan_u16: step.pan as u16,
         tilt_u16: step.tilt as u16,
-        pan_speed: PanSpeed::new(STEP_SPEED)?,
-        tilt_speed: TiltSpeed::new(STEP_SPEED)?,
+        pan_speed: PanSpeed::new(STEP_SPEED).expect("the slowest pan speed is a pan speed"),
+        tilt_speed: TiltSpeed::new(STEP_SPEED).expect("the slowest tilt speed is a tilt speed"),
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use grafton_visca::testing::testkit::{ScriptedBlockingTransport, Step as Scripted, helpers};
+    use crate::wire::encoded;
 
-    /// A camera that answers one command, and a handle on what it was sent.
-    fn scripted_camera() -> (
-        BlockingClient<GenericVisca, ScriptedBlockingTransport>,
-        ScriptedBlockingTransport,
-    ) {
-        let transport = ScriptedBlockingTransport::new(vec![helpers::standard_command_response(1)]);
-        let camera = grafton_visca::CameraBuilder::new()
-            .build_blocking::<GenericVisca, _>(transport.clone())
-            .expect("camera should build from a scripted transport");
-        (camera, transport)
+    fn sent(step: Step) -> Vec<u8> {
+        encoded(&nudge(step).expect("a step somewhere is a command"))
     }
 
     #[test]
     fn a_step_goes_out_as_a_relative_move_of_one_unit_at_the_slowest_speed() {
-        let (camera, transport) = scripted_camera();
-
-        nudge(&camera, Step::towards(PanTiltDirection::Right))
-            .expect("the camera should take a step");
-
         // 81 01 06 03 VV WW 0P 0P 0P 0P 0T 0T 0T 0T FF: a relative move, pan
         // and tilt speed both 1, pan +1 and tilt 0 spread over four nibbles
         // each.
         assert_eq!(
-            transport.sent(),
-            vec![vec![
+            sent(Step::towards(PanTiltDirection::Right)),
+            [
                 0x81, 0x01, 0x06, 0x03, 0x01, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
                 0xFF
-            ]]
+            ]
         );
     }
 
     #[test]
     fn a_step_the_other_way_is_the_same_distance_backwards() {
-        let (camera, transport) = scripted_camera();
-
-        nudge(&camera, Step::towards(PanTiltDirection::Left))
-            .expect("the camera should take a step");
-
         // -1 in two's complement is 0xFFFF, which is 0F 0F 0F 0F on the wire.
-        assert_eq!(transport.sent()[0][6..10], [0x0F, 0x0F, 0x0F, 0x0F]);
+        assert_eq!(
+            sent(Step::towards(PanTiltDirection::Left))[6..10],
+            [0x0F, 0x0F, 0x0F, 0x0F]
+        );
     }
 
     #[test]
     fn steps_the_same_way_add_up_into_one_longer_move() {
-        // The property the worker relies on to keep a run of taps from ever
-        // becoming a queue.
         let three = Step::towards(PanTiltDirection::Right)
             + Step::towards(PanTiltDirection::Right)
             + Step::towards(PanTiltDirection::Right);
@@ -273,15 +248,8 @@ mod tests {
 
     #[test]
     fn a_step_nowhere_is_not_sent_at_all() {
-        let transport = ScriptedBlockingTransport::new(Vec::<Scripted>::new());
-        let camera = grafton_visca::CameraBuilder::new()
-            .build_blocking::<GenericVisca, _>(transport.clone())
-            .expect("camera should build from a scripted transport");
-
-        nudge(&camera, Step::STILL).expect("a step nowhere should be no work");
-
         assert!(
-            transport.sent().is_empty(),
+            nudge(Step::STILL).is_none(),
             "a step going nowhere should cost the camera nothing"
         );
     }

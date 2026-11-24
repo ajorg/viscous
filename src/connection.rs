@@ -1,11 +1,16 @@
 //! Establishing a camera connection and identifying what's on the other end.
 
+use std::time::Duration;
+
 use grafton_visca::{
-    BlockingClient, Error,
-    camera::{Connect, profiles::GenericVisca},
-    command::VersionInfo,
-    transport::{BlockingTransport, BlockingTransportHandle, HasTransportConfig},
+    Error, TokioRuntime, TransportHandle,
+    camera::{CameraConfig, CameraSession, profiles::GenericVisca},
+    command::{InquiryData, VersionInfo, VersionInquiry},
+    mode::Async,
+    transport::{BackoffStrategy, RetryConfig},
 };
+
+use crate::wire::{self, Wire};
 
 /// The prefix that marks a target as VISCA over IP rather than a serial port.
 const TCP_SCHEME: &str = "tcp://";
@@ -36,17 +41,17 @@ impl From<&str> for Target {
     }
 }
 
-/// A camera client over whichever transport [`connect`] used.
+/// A camera session over whichever transport [`open`] used.
 ///
-/// All of grafton-visca's blocking transports hand back the same handle type,
-/// so nothing downstream of the connection has to know which one it got.
-pub type Camera = BlockingClient<GenericVisca, BlockingTransportHandle>;
+/// All of grafton-visca's Tokio transports hand back the same handle type, so
+/// nothing downstream of the connection has to know which one it got.
+pub type Session = CameraSession<Async, GenericVisca, TransportHandle<TokioRuntime>, TokioRuntime>;
 
-/// A live connection, ready to hand to a worker thread.
-pub struct Connected {
-    /// The connected camera client.
-    pub camera: Camera,
-    /// How the connection was made, phrased for display ("Connected at 9600
+/// A live connection.
+pub struct Opened {
+    /// The camera session, which the worker owns from here on.
+    pub session: Session,
+    /// How the connection was made, phrased for display ("COM4 at 9600
     /// baud").
     pub link: String,
     /// The camera's reply to the version inquiry that proved the link works.
@@ -55,59 +60,83 @@ pub struct Connected {
 
 /// Connects to `target` and identifies the camera on the other end, returning
 /// a message fit to show the user if that doesn't work out.
-pub fn connect(target: &Target) -> Result<Connected, String> {
+///
+/// Must run inside a Tokio runtime, which goes on serving the session.
+pub async fn open(target: &Target) -> Result<Opened, String> {
+    let runtime = TokioRuntime::from_current()
+        .map_err(|error| format!("No runtime to connect in: {error}"))?;
     match target {
-        Target::Serial(port) => connect_serial(port),
-        Target::Tcp(address) => connect_tcp(address),
+        Target::Serial(port) => open_serial(port, runtime).await,
+        Target::Tcp(address) => open_tcp(address, runtime).await,
     }
 }
 
 /// Connects over serial, which means discovering the baud rate first.
-fn connect_serial(port: &str) -> Result<Connected, String> {
-    let outcome = discover_baud_rate(DEFAULT_CAMERA_BAUD_RATES, |baud_rate| {
-        let camera = Connect::open_serial_blocking::<GenericVisca>(port, baud_rate)?;
-        query_version(&camera)
-    });
-
-    let ProbeOutcome::Connected { baud_rate, version } = outcome else {
-        return Err(format!(
-            "No response from camera on {port} at any of the candidate baud rates: \
-             {DEFAULT_CAMERA_BAUD_RATES:?}"
-        ));
-    };
-
-    // Discovery already proved a camera answers at `baud_rate`; reconnect once
-    // more for a client the worker thread can hold onto, since the discovery
-    // closure's client only lived for the duration of that probe.
-    let camera =
-        Connect::open_serial_blocking::<GenericVisca>(port, baud_rate).map_err(|error| {
-            format!("Connected during discovery but the follow-up connection failed: {error}")
-        })?;
-
-    Ok(Connected {
-        camera,
-        link: format!("{port} at {baud_rate} baud"),
-        version,
-    })
+async fn open_serial(port: &str, runtime: TokioRuntime) -> Result<Opened, String> {
+    for &baud_rate in DEFAULT_CAMERA_BAUD_RATES {
+        // A wrong baud rate surfaces as a version inquiry that goes
+        // unanswered, since the camera's replies won't frame, rather than as
+        // a failure to open the port; either way, on to the next.
+        let Ok(session) = CameraConfig::<GenericVisca>::serial(port, baud_rate)
+            .retry_config(NEVER_RESEND)
+            .open_serial_async(runtime.clone())
+            .await
+        else {
+            continue;
+        };
+        match query_version(session.camera()).await {
+            Ok(version) => {
+                return Ok(Opened {
+                    session,
+                    link: format!("{port} at {baud_rate} baud"),
+                    version,
+                });
+            }
+            // Let go of the port before opening it again at the next rate.
+            Err(_) => drop(session.close().await),
+        }
+    }
+    Err(format!(
+        "No response from camera on {port} at any of the candidate baud rates: \
+         {DEFAULT_CAMERA_BAUD_RATES:?}"
+    ))
 }
 
 /// Connects over TCP, which needs no discovery — there's no baud rate to
 /// guess, so one connection and one version inquiry settles whether a camera
 /// is really there.
-fn connect_tcp(address: &str) -> Result<Connected, String> {
-    let camera = Connect::open_tcp_blocking::<GenericVisca>(address)
+async fn open_tcp(address: &str, runtime: TokioRuntime) -> Result<Opened, String> {
+    let session = CameraConfig::<GenericVisca>::tcp(address)
+        .retry_config(NEVER_RESEND)
+        .open_async(runtime)
+        .await
         .map_err(|error| format!("Could not reach {address} over TCP: {error}"))?;
 
-    let version = query_version(&camera).map_err(|error| {
+    let version = query_version(session.camera()).await.map_err(|error| {
         format!("Connected to {address}, but it didn't answer a version inquiry: {error}")
     })?;
 
-    Ok(Connected {
-        camera,
+    Ok(Opened {
+        session,
         link: format!("{address} over TCP"),
         version,
     })
 }
+
+/// The library left to resend nothing that moves the camera.
+///
+/// The worker stops waiting for a command that goes unanswered and gets on
+/// with the next, and the library, left to itself, would send the abandoned
+/// one again later — a drive resent after the stop that followed it leaves
+/// the camera moving with nobody asking it to. A command the operator still
+/// wants is one they ask for again. (The library still repeats unanswered
+/// questions, which is harmless: asking twice changes nothing.)
+pub(crate) const NEVER_RESEND: RetryConfig = RetryConfig {
+    max_retries: 0,
+    base_retry_delay: Duration::from_millis(100),
+    max_retry_duration: Duration::from_secs(10),
+    backoff_strategy: BackoffStrategy::Exponential,
+};
 
 /// Candidate baud rates to try when a camera's serial configuration isn't
 /// known ahead of time, most likely first.
@@ -116,46 +145,24 @@ fn connect_tcp(address: &str) -> Result<Connected, String> {
 /// VISCA-compatible cameras support configurable rates up to 38400.
 pub const DEFAULT_CAMERA_BAUD_RATES: &[u32] = &[9600, 38400];
 
-/// The result of probing a camera across one or more candidate baud rates.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProbeOutcome {
-    /// A candidate baud rate produced a valid version-inquiry reply.
-    Connected {
-        /// The baud rate that produced a response.
-        baud_rate: u32,
-        /// The camera's parsed version-inquiry reply.
-        version: VersionInfo,
-    },
-    /// None of the candidate baud rates produced a response.
-    NoResponse,
-}
-
-/// Queries a connected camera for its VISCA version-inquiry reply.
-pub fn query_version<T>(camera: &BlockingClient<GenericVisca, T>) -> Result<VersionInfo, Error>
-where
-    T: BlockingTransport + HasTransportConfig + 'static,
-{
-    camera.system().version()
-}
-
-/// Tries each candidate baud rate in order, returning the first one whose
-/// connection attempt succeeds.
-///
-/// `attempt` performs one connection and version-inquiry at the given baud
-/// rate. A wrong baud rate is expected to surface as an `Err` (typically a
-/// timeout, since the camera's replies won't frame correctly) rather than a
-/// failure to open the port, so any error simply moves on to the next
-/// candidate.
-pub fn discover_baud_rate(
-    candidates: &[u32],
-    mut attempt: impl FnMut(u32) -> Result<VersionInfo, Error>,
-) -> ProbeOutcome {
-    for &baud_rate in candidates {
-        if let Ok(version) = attempt(baud_rate) {
-            return ProbeOutcome::Connected { baud_rate, version };
-        }
+/// Asks a connected camera for its VISCA version-inquiry reply.
+pub async fn query_version(camera: &impl Wire) -> Result<VersionInfo, Error> {
+    match wire::ask(camera, VersionInquiry).await? {
+        InquiryData::Version {
+            vendor,
+            model,
+            rom_version,
+            max_socket,
+        } => Ok(VersionInfo {
+            vendor,
+            model,
+            rom_version,
+            max_socket,
+        }),
+        other => Err(Error::ParseError(
+            format!("asked for the version, got {other:?}").into(),
+        )),
     }
-    ProbeOutcome::NoResponse
 }
 
 /// Known VISCA vendor IDs, for naming a vendor instead of just showing its
@@ -241,51 +248,6 @@ mod tests {
     }
 
     #[test]
-    fn discover_baud_rate_returns_first_successful_candidate() {
-        let outcome = discover_baud_rate(&[9600, 38400], |baud_rate| {
-            if baud_rate == 9600 {
-                Ok(sample_version())
-            } else {
-                panic!("should not try a second candidate after the first succeeds")
-            }
-        });
-
-        assert_eq!(
-            outcome,
-            ProbeOutcome::Connected {
-                baud_rate: 9600,
-                version: sample_version(),
-            }
-        );
-    }
-
-    #[test]
-    fn discover_baud_rate_falls_back_to_next_candidate_on_error() {
-        let outcome = discover_baud_rate(&[9600, 38400], |baud_rate| {
-            if baud_rate == 9600 {
-                Err(Error::Timeout)
-            } else {
-                Ok(sample_version())
-            }
-        });
-
-        assert_eq!(
-            outcome,
-            ProbeOutcome::Connected {
-                baud_rate: 38400,
-                version: sample_version(),
-            }
-        );
-    }
-
-    #[test]
-    fn discover_baud_rate_reports_no_response_when_all_candidates_fail() {
-        let outcome = discover_baud_rate(&[9600, 38400], |_| Err(Error::Timeout));
-
-        assert_eq!(outcome, ProbeOutcome::NoResponse);
-    }
-
-    #[test]
     fn a_tcp_url_names_a_network_target() {
         assert_eq!(
             Target::from("tcp://192.168.1.5:5678"),
@@ -334,25 +296,26 @@ mod tests {
         (address, served)
     }
 
-    #[test]
-    fn connecting_over_tcp_identifies_the_camera_that_answers() {
+    #[tokio::test]
+    async fn connecting_over_tcp_identifies_the_camera_that_answers() {
         let (address, served) = serve_one_version_inquiry();
 
-        let connected =
-            connect(&Target::Tcp(address.clone())).expect("the loopback camera should answer");
+        let Ok(opened) = open(&Target::Tcp(address.clone())).await else {
+            panic!("the loopback camera should answer");
+        };
 
-        assert_eq!(connected.version, sample_version());
-        assert_eq!(connected.link, format!("{address} over TCP"));
+        assert_eq!(opened.version, sample_version());
+        assert_eq!(opened.link, format!("{address} over TCP"));
         served.join().expect("the loopback camera should not panic");
     }
 
-    #[test]
-    fn connecting_over_tcp_to_nothing_reports_where_it_failed() {
+    #[tokio::test]
+    async fn connecting_over_tcp_to_nothing_reports_where_it_failed() {
         // Port 1 on loopback: privileged, so nothing this test could race with
         // is listening there.
-        let error = connect(&Target::Tcp("127.0.0.1:1".to_string()))
-            .err()
-            .expect("connecting to a closed port should fail");
+        let Err(error) = open(&Target::Tcp("127.0.0.1:1".to_string())).await else {
+            panic!("connecting to a closed port should fail");
+        };
 
         assert!(
             error.contains("127.0.0.1:1"),
@@ -360,21 +323,18 @@ mod tests {
         );
     }
 
-    #[test]
-    fn query_version_reads_a_scripted_camera_reply() {
-        use grafton_visca::testing::testkit::{ScriptedBlockingTransport, helpers};
+    #[tokio::test]
+    async fn query_version_reads_a_scripted_camera_reply() {
+        use crate::wire::scripted::{self, answer};
 
-        let request = vec![0x81, 0x09, 0x00, 0x02, 0xFF];
-        let response = vec![0x90, 0x50, 0x00, 0x01, 0x00, 0x02, 0x03, 0x04, 0x02, 0xFF];
-        let transport =
-            ScriptedBlockingTransport::new(vec![helpers::inquiry_response(request, 1, response)]);
+        let (camera, transport) =
+            scripted::camera(vec![answer(&[0x00, 0x01, 0x00, 0x02, 0x03, 0x04, 0x02])]).await;
 
-        let camera = grafton_visca::CameraBuilder::new()
-            .build_blocking::<GenericVisca, _>(transport)
-            .expect("camera should build from a scripted transport");
-
-        let version = query_version(&camera).expect("scripted camera should reply");
+        let version = query_version(&camera)
+            .await
+            .expect("scripted camera should reply");
 
         assert_eq!(version, sample_version());
+        assert_eq!(transport.sent(), [[0x81, 0x09, 0x00, 0x02, 0xFF]]);
     }
 }

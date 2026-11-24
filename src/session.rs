@@ -85,6 +85,13 @@ pub trait Report {
 
     /// A fresh camera-state snapshot arrived.
     fn camera_state(&mut self, text: &str) -> io::Result<()>;
+
+    /// What the status line last said is no longer true. Nothing, where the
+    /// status is a transcript rather than a line, since a transcript's past
+    /// lines are history rather than claims about now.
+    fn clear_status(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 /// The movement key currently held down, and the drive it started.
@@ -117,6 +124,9 @@ struct Session<'a, R: Report> {
     /// Whether the camera said it was awake, or `None` until it has said. A
     /// camera in standby ignores every movement key there is.
     power_on: Option<bool>,
+    /// Whether the status line is saying the camera isn't answering, which
+    /// it stops being true the moment the camera answers anything.
+    saying_unanswered: bool,
 }
 
 impl<'a, R: Report> Session<'a, R> {
@@ -131,7 +141,14 @@ impl<'a, R: Report> Session<'a, R> {
             held: None,
             auto_focus: None,
             power_on: None,
+            saying_unanswered: false,
         }
+    }
+
+    /// Puts `text` on the status line, in place of whatever was there.
+    fn say(&mut self, text: &str) -> io::Result<()> {
+        self.saying_unanswered = false;
+        self.report.status(text)
     }
 
     /// Sends a camera command, showing it as in progress right away — the
@@ -145,7 +162,7 @@ impl<'a, R: Report> Session<'a, R> {
         if worker::is_movement(intent) {
             return Ok(());
         }
-        self.report.status(&worker::describe_busy(intent))
+        self.say(&worker::describe_busy(intent))
     }
 
     /// Applies one key event. Returns whether the user asked to quit.
@@ -163,7 +180,7 @@ impl<'a, R: Report> Session<'a, R> {
                 // step just as it refuses a drive, so say so rather than
                 // spending a round trip to be told.
                 if worker::is_movement(intent) && self.power_on == Some(false) {
-                    self.report.status(STANDBY_HINT)?;
+                    self.say(STANDBY_HINT)?;
                 } else {
                     self.send(intent)?;
                 }
@@ -223,12 +240,12 @@ impl<'a, R: Report> Session<'a, R> {
         // A camera in standby has parked its lens and will refuse the drive;
         // starting one anyway spends a round trip to be told so.
         if self.power_on == Some(false) {
-            return self.report.status(STANDBY_HINT);
+            return self.say(STANDBY_HINT);
         }
         // A camera focusing for itself ignores a manual focus drive, so say
         // so rather than starting one that visibly does nothing.
         if matches!(hold, Hold::Focus(_)) && self.auto_focus == Some(true) {
-            return self.report.status(AUTO_FOCUS_HINT);
+            return self.say(AUTO_FOCUS_HINT);
         }
 
         // Taking over from a key on the same control just re-aims it: the new
@@ -273,50 +290,63 @@ impl<'a, R: Report> Session<'a, R> {
     fn drain(&mut self) -> io::Result<bool> {
         loop {
             match self.results.try_recv() {
-                Ok(outcome) => match &outcome {
-                    Outcome::State(Ok(camera_state)) => {
-                        self.power_on = Some(camera_state.power_on);
-                        // A camera that isn't reporting its lens hasn't told
-                        // us how it's focusing either, so stop claiming to
-                        // know rather than holding the last answer.
-                        self.auto_focus = camera_state.lens.map(|lens| lens.auto_focus);
-                        // An awake camera that isn't answering for its lens
-                        // yet is one still coming up, so keep asking until it
-                        // does. A sleeping one has nothing more to say and is
-                        // left alone until the operator asks for something.
-                        if camera_state.power_on && camera_state.lens.is_none() {
-                            self.next_query_at = Some(Instant::now() + RETRY_INTERVAL);
-                        }
-                        self.report
-                            .camera_state(&worker::describe_outcome(&outcome))?;
-                    }
-                    // A confirmed switch is the camera's own word on what it
-                    // is doing, and better than waiting for the next inquiry
-                    // to come round to it.
-                    Outcome::Done(Intent::SetPower(on), Ok(())) => {
-                        self.power_on = Some(*on);
-                        // Whichever way it went, the lens is no longer where
-                        // it was: it has just parked or is about to unpark.
-                        self.auto_focus = None;
-                        self.report.status(&worker::describe_outcome(&outcome))?;
-                    }
-                    // A camera that didn't answer is usually one that is busy
-                    // waking up, so ask again rather than reporting a fault
-                    // and giving up on ever noticing it came back.
-                    Outcome::State(Err(_)) => {
-                        self.next_query_at = Some(Instant::now() + RETRY_INTERVAL);
-                        self.report.status(NO_ANSWER_HINT)?;
-                    }
-                    // A drive that worked was already visible before its
-                    // completion arrived; one that failed is the only kind
-                    // worth interrupting the legend for.
-                    Outcome::Done(intent, Ok(())) if worker::is_movement(*intent) => {}
-                    _ => self.report.status(&worker::describe_outcome(&outcome))?,
-                },
+                Ok(outcome) => self.apply(&outcome)?,
                 Err(TryRecvError::Empty) => return Ok(true),
                 Err(TryRecvError::Disconnected) => return Ok(false),
             }
         }
+    }
+
+    /// Reports one result from the worker.
+    fn apply(&mut self, outcome: &Outcome) -> io::Result<()> {
+        let unanswered = worker::unanswered(outcome);
+        if !unanswered && self.saying_unanswered {
+            self.saying_unanswered = false;
+            self.report.clear_status()?;
+        }
+        match outcome {
+            Outcome::State(Ok(camera_state)) => {
+                self.power_on = Some(camera_state.power_on);
+                // A camera that isn't reporting its lens hasn't told
+                // us how it's focusing either, so stop claiming to
+                // know rather than holding the last answer.
+                self.auto_focus = camera_state.lens.map(|lens| lens.auto_focus);
+                // An awake camera that isn't answering for its lens
+                // yet is one still coming up, so keep asking until it
+                // does. A sleeping one has nothing more to say and is
+                // left alone until the operator asks for something.
+                if camera_state.power_on && camera_state.lens.is_none() {
+                    self.next_query_at = Some(Instant::now() + RETRY_INTERVAL);
+                }
+                self.report
+                    .camera_state(&worker::describe_outcome(outcome))?;
+            }
+            // A confirmed switch is the camera's own word on what it
+            // is doing, and better than waiting for the next inquiry
+            // to come round to it.
+            Outcome::Done(Intent::SetPower(on), Ok(())) => {
+                self.power_on = Some(*on);
+                // Whichever way it went, the lens is no longer where
+                // it was: it has just parked or is about to unpark.
+                self.auto_focus = None;
+                self.say(&worker::describe_outcome(outcome))?;
+            }
+            // A camera that didn't answer is usually one that is busy
+            // waking up, so ask again rather than reporting a fault
+            // and giving up on ever noticing it came back.
+            Outcome::State(Err(_)) => {
+                self.next_query_at = Some(Instant::now() + RETRY_INTERVAL);
+                self.say(NO_ANSWER_HINT)?;
+            }
+            // A drive that worked was already visible before its
+            // completion arrived; one that failed is the only kind
+            // worth interrupting the legend for.
+            Outcome::Done(intent, Ok(())) if worker::is_movement(*intent) => {}
+            _ => self.say(&worker::describe_outcome(outcome))?,
+        }
+        // After the match, since saying anything clears it.
+        self.saying_unanswered = unanswered;
+        Ok(())
     }
 
     /// Fires the debounced state query once the most recent command has had
@@ -429,9 +459,15 @@ mod tests {
         refreshes: usize,
         statuses: Vec<String>,
         camera_states: Vec<String>,
+        clears: usize,
     }
 
     impl Report for Recorder {
+        fn clear_status(&mut self) -> io::Result<()> {
+            self.clears += 1;
+            Ok(())
+        }
+
         fn refresh(&mut self) -> io::Result<()> {
             self.refreshes += 1;
             Ok(())
@@ -482,29 +518,10 @@ mod tests {
 
     /// A key event for the drive tests below, which are about the lifetime of
     /// a held drive rather than about which key starts one.
-    ///
-    /// Arrows carry shift, because that is what a pan/tilt drive is now: an
-    /// arrow on its own steps the camera once and holds nothing. Every other
-    /// key means what it always did.
     fn key(code: KeyCode, kind: KeyEventKind) -> KeyEvent {
-        let modifiers = match code {
-            KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right => KeyModifiers::SHIFT,
-            _ => KeyModifiers::NONE,
-        };
-        let mut event = KeyEvent::new(code, modifiers);
-        event.kind = kind;
-        event
-    }
-
-    /// An arrow key with nothing on it, which steps rather than driving.
-    fn unshifted(code: KeyCode, kind: KeyEventKind) -> KeyEvent {
         let mut event = KeyEvent::new(code, KeyModifiers::NONE);
         event.kind = kind;
         event
-    }
-
-    fn tap(code: KeyCode) -> KeyEvent {
-        unshifted(code, KeyEventKind::Press)
     }
 
     fn press(code: KeyCode) -> KeyEvent {
@@ -568,49 +585,13 @@ mod tests {
     }
 
     #[test]
-    fn tapping_an_arrow_key_steps_the_camera_and_holds_nothing() {
-        let mut harness = Harness::new();
-        let held = {
-            let mut session = harness.session();
-            session.handle_key(tap(KeyCode::Right)).unwrap();
-            session.held.is_some()
-        };
-
-        assert_eq!(
-            harness.sent(),
-            vec![Intent::Nudge(crate::nudge::Step::towards(
-                PanTiltDirection::Right
-            ))]
-        );
-        assert!(!held, "a step is over the moment it is asked for");
-    }
-
-    #[test]
-    fn a_repeated_arrow_key_steps_once_rather_than_walking_away() {
-        // Terminals without the enhancement protocol report a held key as
-        // repeats, and a step per repeat would send the shot off across the
-        // room. One press is one step, as it is for a preset.
-        let mut harness = Harness::new();
-        let mut session = harness.session();
-
-        session.handle_key(tap(KeyCode::Right)).unwrap();
-        for _ in 0..5 {
-            session
-                .handle_key(unshifted(KeyCode::Right, KeyEventKind::Repeat))
-                .unwrap();
-        }
-
-        assert_eq!(harness.sent().len(), 1);
-    }
-
-    #[test]
-    fn a_step_at_a_sleeping_camera_says_so_instead_of_being_sent() {
+    fn an_arrow_at_a_sleeping_camera_says_so_instead_of_being_sent() {
         let mut harness = Harness::new();
         harness.outcomes.send(Outcome::State(Ok(asleep()))).unwrap();
         let mut session = harness.session();
         session.drain().unwrap();
 
-        session.handle_key(tap(KeyCode::Right)).unwrap();
+        session.handle_key(press(KeyCode::Right)).unwrap();
 
         assert!(harness.sent().is_empty(), "a sleeping camera won't move");
         assert!(harness.report.statuses.contains(&STANDBY_HINT.to_string()));
@@ -650,13 +631,40 @@ mod tests {
     }
 
     #[test]
+    fn saying_the_camera_did_not_answer_lasts_only_until_it_does() {
+        let mut harness = Harness::new();
+        let step = Intent::Nudge(crate::nudge::Step::towards(PanTiltDirection::Up));
+        let unanswered = || Outcome::Done(step, Err(grafton_visca::Error::Timeout));
+        for outcome in [
+            unanswered(),
+            // The camera answering: the line saying it wasn't comes down.
+            Outcome::Done(step, Ok(())),
+            unanswered(),
+            // Comes down again, and something else goes up in its place...
+            Outcome::Done(Intent::RecallPreset(1), Ok(())),
+            // ...which the camera answering again is no reason to take down.
+            Outcome::Done(step, Ok(())),
+        ] {
+            harness.outcomes.send(outcome).unwrap();
+        }
+
+        harness.session().drain().unwrap();
+
+        assert_eq!(harness.report.clears, 2);
+        assert_eq!(
+            harness.report.statuses.last().map(String::as_str),
+            Some("OK: recall preset 1")
+        );
+    }
+
+    #[test]
     fn a_drive_that_failed_is_still_worth_saying() {
         let mut harness = Harness::new();
         harness
             .outcomes
             .send(Outcome::Done(
                 Intent::DrivePanTilt(Velocity::STOP),
-                Err(grafton_visca::Error::Timeout),
+                Err(grafton_visca::Error::CommandBufferFull),
             ))
             .unwrap();
 

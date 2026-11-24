@@ -6,12 +6,7 @@
 //! command to start, one to stop, and however long the user holds the
 //! control in between.
 
-use grafton_visca::{
-    BlockingClient, Error,
-    camera::profiles::GenericVisca,
-    transport::{BlockingTransport, HasTransportConfig},
-    types::ZoomSpeed,
-};
+use grafton_visca::{command::Zoom, types::ZoomSpeed};
 
 use crate::deflection;
 
@@ -82,37 +77,21 @@ impl ZoomDrive {
     }
 }
 
-/// Starts `drive`, or stops the zoom when it's `None`.
-pub fn drive_zoom<T>(
-    camera: &BlockingClient<GenericVisca, T>,
-    drive: Option<ZoomDrive>,
-) -> Result<(), Error>
-where
-    T: BlockingTransport + HasTransportConfig + 'static,
-{
+/// The command that starts `drive`, or stops the zoom when it's `None`.
+pub fn drive_zoom(drive: Option<ZoomDrive>) -> Zoom {
     match drive {
-        Some(drive) => {
-            let speed = Some(drive.speed);
-            match drive.direction {
-                ZoomDirection::In => camera.zoom_tele(speed),
-                ZoomDirection::Out => camera.zoom_wide(speed),
-            }
-        }
-        None => camera.zoom_stop(),
+        Some(drive) => match drive.direction {
+            ZoomDirection::In => Zoom::TeleVariable(drive.speed),
+            ZoomDirection::Out => Zoom::WideVariable(drive.speed),
+        },
+        None => Zoom::Stop,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use grafton_visca::testing::testkit::{ScriptedBlockingTransport, helpers};
-
-    fn scripted_camera() -> BlockingClient<GenericVisca, ScriptedBlockingTransport> {
-        let transport = ScriptedBlockingTransport::new(vec![helpers::standard_command_response(1)]);
-        grafton_visca::CameraBuilder::new()
-            .build_blocking::<GenericVisca, _>(transport)
-            .expect("camera should build from a scripted transport")
-    }
+    use crate::wire::encoded;
 
     fn drive(direction: ZoomDirection) -> Option<ZoomDrive> {
         Some(ZoomDrive {
@@ -122,11 +101,16 @@ mod tests {
     }
 
     #[test]
-    fn drive_zoom_starts_a_drive_in_each_direction() {
-        drive_zoom(&scripted_camera(), drive(ZoomDirection::In))
-            .expect("scripted camera should ack and complete zoom in");
-        drive_zoom(&scripted_camera(), drive(ZoomDirection::Out))
-            .expect("scripted camera should ack and complete zoom out");
+    fn drive_zoom_starts_a_drive_in_each_direction_at_its_speed() {
+        // 81 01 04 07 2p FF zooms in at speed p, 3p out.
+        assert_eq!(
+            encoded(&drive_zoom(drive(ZoomDirection::In))),
+            [0x81, 0x01, 0x04, 0x07, 0x24, 0xFF]
+        );
+        assert_eq!(
+            encoded(&drive_zoom(drive(ZoomDirection::Out))),
+            [0x81, 0x01, 0x04, 0x07, 0x34, 0xFF]
+        );
     }
 
     #[test]
@@ -173,7 +157,9 @@ mod tests {
 
     #[test]
     fn drive_zoom_stops_the_drive_when_given_no_direction() {
-        drive_zoom(&scripted_camera(), None)
-            .expect("scripted camera should ack and complete the stop");
+        assert_eq!(
+            encoded(&drive_zoom(None)),
+            [0x81, 0x01, 0x04, 0x07, 0x00, 0xFF]
+        );
     }
 }

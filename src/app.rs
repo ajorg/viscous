@@ -45,6 +45,11 @@ where
         self.state.camera_state = Some(text.to_string());
         Ok(())
     }
+
+    fn clear_status(&mut self) -> io::Result<()> {
+        self.state.status = None;
+        Ok(())
+    }
 }
 
 /// Runs the interactive TUI until the user quits or the worker thread goes

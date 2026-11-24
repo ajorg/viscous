@@ -2,12 +2,16 @@
 //! itself beyond the one-time version reply.
 
 use grafton_visca::{
-    BlockingClient, Error,
-    camera::{PanTiltPosition, profiles::GenericVisca},
-    command::FocusMode,
-    transport::{BlockingTransport, HasTransportConfig},
+    Error,
+    camera::PanTiltPosition,
+    command::{
+        FocusMode, FocusModeInquiry, FocusPositionInquiry, InquiryData, PanTiltPositionInquiry,
+        PowerInquiry, ZoomPositionInquiry,
+    },
     types::{FocusPosition, ZoomPosition},
 };
+
+use crate::wire::{self, Wire};
 
 /// A snapshot of what the camera says about itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,29 +52,50 @@ pub struct Lens {
 /// and time out, and a camera part-way through waking up does whichever it
 /// feels like. None of those are worth telling the operator apart, and keying
 /// on any of them would be keying on the model rather than on the protocol.
-pub fn query_state<T>(camera: &BlockingClient<GenericVisca, T>) -> Result<CameraState, Error>
-where
-    T: BlockingTransport + HasTransportConfig + 'static,
-{
-    let power_on = camera.power_state()?;
-    Ok(CameraState {
-        power_on,
-        // Nothing to ask a sleeping camera: it has parked its lens, and every
-        // inquiry is a round trip spent being refused.
-        lens: power_on.then(|| query_lens(camera).ok()).flatten(),
+pub async fn query_state(camera: &impl Wire) -> Result<CameraState, Error> {
+    let power_on = match wire::ask(camera, PowerInquiry).await? {
+        InquiryData::Power { on } => on,
+        other => return Err(unexpected("power", other)),
+    };
+    // Nothing to ask a sleeping camera: it has parked its lens, and every
+    // inquiry is a round trip spent being refused.
+    let lens = if power_on {
+        query_lens(camera).await.ok()
+    } else {
+        None
+    };
+    Ok(CameraState { power_on, lens })
+}
+
+async fn query_lens(camera: &impl Wire) -> Result<Lens, Error> {
+    let pan_tilt = match wire::ask(camera, PanTiltPositionInquiry).await? {
+        InquiryData::PanTiltPosition { pan, tilt } => PanTiltPosition { pan, tilt },
+        other => return Err(unexpected("pan/tilt position", other)),
+    };
+    let zoom = match wire::ask(camera, ZoomPositionInquiry).await? {
+        InquiryData::ZoomPosition { position } => ZoomPosition::try_from(position)
+            .map_err(|error| Error::ParseError(error.to_string().into()))?,
+        other => return Err(unexpected("zoom position", other)),
+    };
+    let focus = match wire::ask(camera, FocusPositionInquiry).await? {
+        InquiryData::FocusPosition { position } => FocusPosition::new(position),
+        other => return Err(unexpected("focus position", other)),
+    };
+    let auto_focus = match wire::ask(camera, FocusModeInquiry).await? {
+        InquiryData::FocusMode { mode } => mode == FocusMode::Auto,
+        other => return Err(unexpected("focus mode", other)),
+    };
+    Ok(Lens {
+        pan_tilt,
+        zoom,
+        focus,
+        auto_focus,
     })
 }
 
-fn query_lens<T>(camera: &BlockingClient<GenericVisca, T>) -> Result<Lens, Error>
-where
-    T: BlockingTransport + HasTransportConfig + 'static,
-{
-    Ok(Lens {
-        pan_tilt: camera.pan_tilt_position()?,
-        zoom: camera.zoom_position()?,
-        focus: camera.focus_position()?,
-        auto_focus: camera.focus_mode()? == FocusMode::Auto,
-    })
+/// The error for an answer that isn't to the question asked.
+fn unexpected(asked: &str, answer: InquiryData) -> Error {
+    Error::ParseError(format!("asked for {asked}, got {answer:?}").into())
 }
 
 /// Formats where the camera is pointing, zoomed and focused.
@@ -111,60 +136,66 @@ pub fn format_state(state: &CameraState) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use grafton_visca::testing::testkit::{
-        ScriptedBlockingTransport, Step,
-        helpers::{self, not_executable},
-    };
+    use crate::wire::scripted::{self, answer, power, refused};
 
-    fn scripted_camera(
-        replies: Vec<Step>,
-    ) -> BlockingClient<GenericVisca, ScriptedBlockingTransport> {
-        grafton_visca::CameraBuilder::new()
-            .build_blocking::<GenericVisca, _>(ScriptedBlockingTransport::new(replies))
-            .expect("camera should build from a scripted transport")
+    #[tokio::test]
+    async fn an_awake_camera_reports_where_its_lens_is() {
+        let (camera, transport) = scripted::camera(vec![
+            power(true),
+            // pan -2, tilt 0x12
+            answer(&[0x0F, 0x0F, 0x0F, 0x0E, 0x00, 0x00, 0x01, 0x02]),
+            answer(&[0x01, 0x00, 0x00, 0x00]),
+            answer(&[0x02, 0x00, 0x00, 0x00]),
+            answer(&[0x02]),
+        ])
+        .await;
+
+        let state = query_state(&camera).await.expect("every question answered");
+
+        let lens = state.lens.expect("an awake camera has a lens to report");
+        assert_eq!((lens.pan_tilt.pan, lens.pan_tilt.tilt), (-2, 0x12));
+        assert_eq!(lens.zoom.value(), 0x1000);
+        assert_eq!(lens.focus.value(), 0x2000);
+        assert!(lens.auto_focus);
+        assert_eq!(transport.sent().len(), 5);
     }
 
-    /// The reply a camera gives to something it won't do in its current state.
-    fn refusal() -> Step {
-        Step::OnSend {
-            matches: None,
-            responses: vec![not_executable(1)],
-        }
-    }
+    #[tokio::test]
+    async fn a_sleeping_camera_reports_its_power_and_is_not_asked_anything_else() {
+        let (camera, transport) = scripted::camera(vec![power(false)]).await;
 
-    #[test]
-    fn a_sleeping_camera_reports_its_power_and_is_not_asked_anything_else() {
-        // One scripted reply, so a lens inquiry would find nothing to answer
-        // it: the camera is in standby and there is nothing there to ask.
-        let camera = scripted_camera(vec![helpers::power_inquiry_response(false)]);
-
-        let state = query_state(&camera).expect("standby is an answer, not a failure");
+        let state = query_state(&camera)
+            .await
+            .expect("standby is an answer, not a failure");
 
         assert!(!state.power_on);
         assert!(state.lens.is_none());
+        assert_eq!(transport.sent().len(), 1, "only power was asked about");
     }
 
-    #[test]
-    fn a_camera_that_will_not_answer_for_its_lens_yet_still_reports_its_power() {
+    #[tokio::test]
+    async fn a_camera_that_will_not_answer_for_its_lens_yet_still_reports_its_power() {
         // What waking up looks like: power answers, the lens refuses. The
         // power reading is the one that decides what the switch offers, so it
         // has to survive the lens failing beside it.
-        let camera = scripted_camera(vec![helpers::power_inquiry_response(true), refusal()]);
+        let (camera, _) = scripted::camera(vec![power(true), refused()]).await;
 
-        let state = query_state(&camera).expect("a refused lens inquiry is not a failed snapshot");
+        let state = query_state(&camera)
+            .await
+            .expect("a refused lens inquiry is not a failed snapshot");
 
         assert!(state.power_on);
         assert!(state.lens.is_none());
     }
 
-    #[test]
-    fn a_camera_that_answers_nothing_at_all_is_a_failed_snapshot() {
+    #[tokio::test]
+    async fn a_camera_that_answers_nothing_at_all_is_a_failed_snapshot() {
         // The distinction the front ends need: a lens that won't answer is
         // reported, but a camera that won't answer for its own power is not
         // something to make up a state for.
-        let camera = scripted_camera(vec![refusal()]);
+        let (camera, _) = scripted::camera(vec![refused()]).await;
 
-        assert!(query_state(&camera).is_err());
+        assert!(query_state(&camera).await.is_err());
     }
 
     fn sample_lens() -> Lens {
